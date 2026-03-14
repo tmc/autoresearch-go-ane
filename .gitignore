@@ -1,0 +1,5 @@
+results.tsv
+run.log
+*.bin
+autoresearch-go-ane
+bench_*.txt

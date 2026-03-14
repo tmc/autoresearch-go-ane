@@ -1,0 +1,4 @@
+github.com/tmc/apple v0.0.0-20260314211304-99e9c42d77ed h1:waiCVmHS9q/LLVFg/Wg+X6cTHDzZ6PJFZ0/5yjCZDjw=
+github.com/tmc/apple v0.0.0-20260314211304-99e9c42d77ed/go.mod h1:3sxc4uX+aUMt7sgfFNpRWtmcpAq+Bv4r+yBAk3JBrYc=
+github.com/tmc/purego v0.10.0-alpha.2.0.20260130081008-0b23e28544a2 h1:aSmdsilkZRFqN29tsxRte/Jr0hHRIc0VWKLHBU8dMTc=
+github.com/tmc/purego v0.10.0-alpha.2.0.20260130081008-0b23e28544a2/go.mod h1:iIjxzd6CiRiOG0UyXP+V1+jWqUXVjPKLAI0mRfJZTmQ=
