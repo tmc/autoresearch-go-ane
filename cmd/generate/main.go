@@ -92,8 +92,8 @@ func main() {
 	var promptTokens []int32
 	if *rawTokens {
 		promptTokens = parseRawTokens(*prompt)
-	} else if hfTok != nil && *hfModelID != "" {
-		// Use Python-backed encoding for the prompt (one-shot, acceptable latency).
+	} else if hfTok != nil {
+		// Go-native BPE encoding — no Python needed.
 		promptTokens, err = hfTok.Encode(*prompt)
 		if err != nil {
 			log.Fatalf("encode prompt: %v", err)
