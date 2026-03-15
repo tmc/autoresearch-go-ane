@@ -834,7 +834,12 @@ func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
 	cur := e.x
 	next := e.tmpHidden
 	for i := range useLayers {
-		if err := useLayers[i].run(next, cur); err != nil {
+		lf := useLayers[i]
+		if lf.inferScaled && lf.dynamic && i+1 < len(useLayers) {
+			if err := lf.runDynamicInferPipelined(next, cur, i, useLayers); err != nil {
+				return fmt.Errorf("storiesane eval logits: layer %d: %w", i, err)
+			}
+		} else if err := lf.run(next, cur); err != nil {
 			return fmt.Errorf("storiesane eval logits: layer %d: %w", i, err)
 		}
 		cur, next = next, cur

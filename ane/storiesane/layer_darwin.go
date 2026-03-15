@@ -44,7 +44,8 @@ type layerForward struct {
 
 	rmsAtt      []float32
 	rmsFFN      []float32
-	inferScaled bool // Wo and W2 pre-scaled by layerResidualScale
+	inferScaled   bool // Wo and W2 pre-scaled by layerResidualScale
+	attInputReady bool // Attention input already staged by previous layer
 
 	qkvOut []float32
 	attOut []float32
