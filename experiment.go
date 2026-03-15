@@ -16,7 +16,7 @@ import (
 
 const (
 	SequenceLength = 256
-	AccumSteps     = 4
+	AccumSteps     = 8
 	LearningRate   = 3e-4
 	AdamBeta1      = 0.9
 	AdamBeta2      = 0.999
