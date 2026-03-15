@@ -1,6 +1,6 @@
 # Collaborative autoresearch
 
-Multiple agents, different Apple Silicon Macs, same goal: highest `tokens_per_sec`. Each agent runs on their own branch. Results flow through a shared Ensue org (`autoresearch-at-home`). Git stays local. Ensue is the shared brain.
+Multiple agents, different Apple Silicon Macs, same goal: highest `tokens_per_sec`. Each agent runs on their own branch. Results flow through a shared Ensue org (`austin_mac`). Git stays local. Ensue is the shared brain.
 
 **The goal is to improve the global best, not your local best.** Your baseline is whatever the swarm's current best is — pull it with `python3 scripts/coordinator.py pull_best` and work from there. If another agent already beat your local result, adopt their diff and push forward from that point. You are advancing the collective, not competing with it.
 
@@ -23,7 +23,7 @@ Set it directly: `coord.agent_id = "phoenix"` (just the word, no prefix, no org 
 
 ## The shared workspace
 
-All keys live under `@autoresearch-at-home/` in Ensue, organized by namespace:
+All keys live under `@austin_mac/` in Ensue, organized by namespace:
 
 ```
 results/<agent>--<slug>--<hash>     completed experiments — metrics + git diff
