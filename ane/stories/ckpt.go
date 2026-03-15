@@ -13,11 +13,12 @@ const (
 	ckptVersionV2 int32 = 2
 	ckptVersionV3 int32 = 3
 	ckptVersionV4 int32 = 4
+	ckptVersionV5 int32 = 5
 )
 
 type LayerOptimState struct {
 	Wq, Wk, Wv, Wo AdamState
-	W1, W2, W3     AdamState
+	W1, W2         AdamState
 	VEEmbed        AdamState
 	VEGate         AdamState
 }
@@ -63,7 +64,6 @@ func NewOptimState(vocab int) *OptimState {
 			Wo: NewAdamState(WOSize),
 			W1: NewAdamState(W1Size),
 			W2: NewAdamState(W2Size),
-			W3: NewAdamState(W3Size),
 		}
 		if IsVELayer(i) {
 			los.VEEmbed = NewAdamState(VEEmbedSize(vocab))
@@ -75,7 +75,7 @@ func NewOptimState(vocab int) *OptimState {
 }
 
 func SaveCheckpoint(path string, meta TrainMeta, mw *ModelWeights, opt *OptimState) error {
-	return saveCheckpoint(path, ckptVersionV4, meta, mw, opt)
+	return saveCheckpoint(path, ckptVersionV5, meta, mw, opt)
 }
 
 func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights, opt *OptimState) error {
@@ -157,10 +157,10 @@ func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights
 		}
 	}
 
-	// V4: per-layer weights (no RMS)
+	// V5: per-layer weights (no RMS, no W3)
 	for i := range mw.Layers {
 		l := &mw.Layers[i]
-		for _, vals := range [][]float32{l.Wq, l.Wk, l.Wv, l.Wo, l.W1, l.W2, l.W3} {
+		for _, vals := range [][]float32{l.Wq, l.Wk, l.Wv, l.Wo, l.W1, l.W2} {
 			if err := writeF32s(f, vals); err != nil {
 				return err
 			}
@@ -173,7 +173,7 @@ func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights
 		}
 	}
 
-	// V4: per-layer optimizer state
+	// V5: per-layer optimizer state
 	for i := range mw.Layers {
 		layerOpt := zeroLayerOptimState(i)
 		if opt != nil && i < len(opt.Layers) {
@@ -184,7 +184,7 @@ func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights
 		}
 	}
 
-	// V4: model-level weights + optim
+	// V5: model-level weights + optim
 	embedOpt := NewAdamState(len(mw.Embed))
 	residLambdasOpt := NewAdamState(NLayers)
 	x0LambdasOpt := NewAdamState(NLayers)
@@ -306,7 +306,7 @@ func loadCheckpointFile(f *os.File, mw *ModelWeights, opt *OptimState) (TrainMet
 	if err != nil {
 		return TrainMeta{}, err
 	}
-	if magic != ckptMagic || (ver != ckptVersionV2 && ver != ckptVersionV3 && ver != ckptVersionV4) {
+	if magic != ckptMagic || (ver != ckptVersionV2 && ver != ckptVersionV3 && ver != ckptVersionV4 && ver != ckptVersionV5) {
 		return TrainMeta{}, fmt.Errorf("bad checkpoint header magic=%x version=%d", magic, ver)
 	}
 	step, err := readI32()
@@ -395,39 +395,81 @@ func loadCheckpointFile(f *os.File, mw *ModelWeights, opt *OptimState) (TrainMet
 		AdamT:      int(adamT),
 	}
 
+	if ver == ckptVersionV5 {
+		return loadCheckpointV5(f, mw, opt, meta)
+	}
 	if ver == ckptVersionV4 {
 		return loadCheckpointV4(f, mw, opt, meta)
 	}
 	return loadCheckpointV3(f, mw, opt, meta, ver)
 }
 
+func loadCheckpointV5(f *os.File, mw *ModelWeights, opt *OptimState, meta TrainMeta) (TrainMeta, error) {
+	return loadCheckpointV4V5(f, mw, opt, meta, true)
+}
+
 func loadCheckpointV4(f *os.File, mw *ModelWeights, opt *OptimState, meta TrainMeta) (TrainMeta, error) {
+	return loadCheckpointV4V5(f, mw, opt, meta, false)
+}
+
+// v4VEGateSize is the VEGate size used in V4 checkpoints (was Dim).
+const v4VEGateSize = Dim
+
+// v4W3Size is the W3 weight size in V4 checkpoints (Hidden*Dim).
+const v4W3Size = Hidden * Dim
+
+func loadCheckpointV4V5(f *os.File, mw *ModelWeights, opt *OptimState, meta TrainMeta, isV5 bool) (TrainMeta, error) {
 	// Per-layer weights
 	for i := range mw.Layers {
 		l := &mw.Layers[i]
-		for _, vals := range []*[]float32{&l.Wq, &l.Wk, &l.Wv, &l.Wo, &l.W1, &l.W2, &l.W3} {
+		for _, vals := range []*[]float32{&l.Wq, &l.Wk, &l.Wv, &l.Wo, &l.W1, &l.W2} {
 			if err := readF32s(f, *vals); err != nil {
+				return TrainMeta{}, err
+			}
+		}
+		if !isV5 {
+			// V4 had W3; skip it.
+			if err := skipF32(f, v4W3Size); err != nil {
 				return TrainMeta{}, err
 			}
 		}
 		if err := readF32s(f, l.VEEmbed); err != nil {
 			return TrainMeta{}, err
 		}
-		if err := readF32s(f, l.VEGate); err != nil {
-			return TrainMeta{}, err
+		if isV5 {
+			if err := readF32s(f, l.VEGate); err != nil {
+				return TrainMeta{}, err
+			}
+		} else if IsVELayer(i) {
+			// V4 had Dim-sized VEGate; skip it, leave VEGate zero-initialized.
+			if err := skipF32(f, v4VEGateSize); err != nil {
+				return TrainMeta{}, err
+			}
 		}
 	}
 
 	// Per-layer optim
 	for i := range mw.Layers {
 		if opt == nil || i >= len(opt.Layers) {
-			if err := skipLayerOptimState(f, i); err != nil {
-				return TrainMeta{}, err
+			if isV5 {
+				if err := skipLayerOptimState(f, i); err != nil {
+					return TrainMeta{}, err
+				}
+			} else {
+				if err := skipLayerOptimStateV4(f, i); err != nil {
+					return TrainMeta{}, err
+				}
 			}
 			continue
 		}
-		if err := readLayerOptimState(f, &opt.Layers[i]); err != nil {
-			return TrainMeta{}, err
+		if isV5 {
+			if err := readLayerOptimState(f, &opt.Layers[i]); err != nil {
+				return TrainMeta{}, err
+			}
+		} else {
+			if err := readLayerOptimStateV4(f, &opt.Layers[i], i); err != nil {
+				return TrainMeta{}, err
+			}
 		}
 	}
 
@@ -536,6 +578,49 @@ func loadCheckpointV4(f *os.File, mw *ModelWeights, opt *OptimState, meta TrainM
 	return meta, nil
 }
 
+// readLayerOptimStateV4 reads V4 format optim state which had W3 and Dim-sized VEGate.
+func readLayerOptimStateV4(r io.Reader, st *LayerOptimState, layer int) error {
+	for _, vals := range [][]float32{
+		st.Wq.M, st.Wq.V,
+		st.Wk.M, st.Wk.V,
+		st.Wv.M, st.Wv.V,
+		st.Wo.M, st.Wo.V,
+		st.W1.M, st.W1.V,
+		st.W2.M, st.W2.V,
+	} {
+		if err := readF32s(r, vals); err != nil {
+			return err
+		}
+	}
+	// V4 had W3 optim; skip it.
+	if err := skipF32(r, 2*v4W3Size); err != nil {
+		return err
+	}
+	// V4 had VEEmbed optim.
+	if err := readF32s(r, st.VEEmbed.M); err != nil {
+		return err
+	}
+	if err := readF32s(r, st.VEEmbed.V); err != nil {
+		return err
+	}
+	// V4 had Dim-sized VEGate optim; skip it.
+	if IsVELayer(layer) {
+		if err := skipF32(r, 2*v4VEGateSize); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// skipLayerOptimStateV4 skips V4 format layer optim state (has W3 and Dim-sized VEGate).
+func skipLayerOptimStateV4(r io.Reader, layer int) error {
+	n := 6*WQSize + 2*WOSize + 2*W1Size + 2*W2Size + 2*v4W3Size
+	if IsVELayer(layer) {
+		n += 2*VEEmbedSize(Vocab) + 2*v4VEGateSize
+	}
+	return skipF32(r, n)
+}
+
 func loadCheckpointV3(f *os.File, mw *ModelWeights, opt *OptimState, meta TrainMeta, ver int32) (TrainMeta, error) {
 	// V3/V2 format has RMS weights in layers; skip them into temp buffers.
 	rmsSkip := make([]float32, Dim)
@@ -560,7 +645,8 @@ func loadCheckpointV3(f *os.File, mw *ModelWeights, opt *OptimState, meta TrainM
 		if err := readF32s(f, l.W2); err != nil {
 			return TrainMeta{}, err
 		}
-		if err := readF32s(f, l.W3); err != nil {
+		// V3 had W3; skip it.
+		if err := skipF32(f, v4W3Size); err != nil {
 			return TrainMeta{}, err
 		}
 		// Skip RMSAtt, RMSFFN
@@ -639,8 +725,6 @@ func zeroOptimState(opt *OptimState) {
 		clear(opt.Layers[i].W1.V)
 		clear(opt.Layers[i].W2.M)
 		clear(opt.Layers[i].W2.V)
-		clear(opt.Layers[i].W3.M)
-		clear(opt.Layers[i].W3.V)
 		clear(opt.Layers[i].VEEmbed.M)
 		clear(opt.Layers[i].VEEmbed.V)
 		clear(opt.Layers[i].VEGate.M)
@@ -668,7 +752,6 @@ func zeroLayerOptimState(layer int) LayerOptimState {
 		Wo: NewAdamState(WOSize),
 		W1: NewAdamState(W1Size),
 		W2: NewAdamState(W2Size),
-		W3: NewAdamState(W3Size),
 	}
 	if IsVELayer(layer) {
 		los.VEEmbed = NewAdamState(VEEmbedSize(Vocab))
@@ -685,7 +768,6 @@ func writeLayerOptimState(w io.Writer, st LayerOptimState) error {
 		st.Wo.M, st.Wo.V,
 		st.W1.M, st.W1.V,
 		st.W2.M, st.W2.V,
-		st.W3.M, st.W3.V,
 		st.VEEmbed.M, st.VEEmbed.V,
 		st.VEGate.M, st.VEGate.V,
 	} {
@@ -704,7 +786,6 @@ func writeZeroLayerOptimState(w io.Writer, layer int) error {
 		WOSize, WOSize,
 		W1Size, W1Size,
 		W2Size, W2Size,
-		W3Size, W3Size,
 	}
 	if IsVELayer(layer) {
 		veEmbedN := VEEmbedSize(Vocab)
@@ -727,7 +808,6 @@ func readLayerOptimState(r io.Reader, st *LayerOptimState) error {
 		st.Wo.M, st.Wo.V,
 		st.W1.M, st.W1.V,
 		st.W2.M, st.W2.V,
-		st.W3.M, st.W3.V,
 		st.VEEmbed.M, st.VEEmbed.V,
 		st.VEGate.M, st.VEGate.V,
 	} {
@@ -748,11 +828,14 @@ func readLayerOptimStateV3(r io.Reader, st *LayerOptimState) error {
 		st.Wo.M, st.Wo.V,
 		st.W1.M, st.W1.V,
 		st.W2.M, st.W2.V,
-		st.W3.M, st.W3.V,
 	} {
 		if err := readF32s(r, vals); err != nil {
 			return err
 		}
+	}
+	// V3 had W3 optim; skip it.
+	if err := skipF32(r, 2*v4W3Size); err != nil {
+		return err
 	}
 	// Skip RMSAtt and RMSFFN optim (4*Dim floats)
 	if err := skipF32(r, 4*Dim); err != nil {
@@ -763,16 +846,16 @@ func readLayerOptimStateV3(r io.Reader, st *LayerOptimState) error {
 }
 
 func skipLayerOptimState(r io.Reader, layer int) error {
-	n := 6*WQSize + 2*WOSize + 2*W1Size + 2*W2Size + 2*W3Size
+	n := 6*WQSize + 2*WOSize + 2*W1Size + 2*W2Size
 	if IsVELayer(layer) {
 		n += 2*VEEmbedSize(Vocab) + 2*VEGateSize()
 	}
 	return skipF32(r, n)
 }
 
-// skipLayerOptimStateV3 skips V3-format layer optim (includes RMS Adam, no VE).
+// skipLayerOptimStateV3 skips V3-format layer optim (includes W3, RMS Adam, no VE).
 func skipLayerOptimStateV3(r io.Reader, _ int) error {
-	return skipF32(r, 6*WQSize+2*WOSize+2*W1Size+2*W2Size+2*W3Size+4*Dim)
+	return skipF32(r, 6*WQSize+2*WOSize+2*W1Size+2*W2Size+2*v4W3Size+4*Dim)
 }
 
 func writeF32s(w io.Writer, vals []float32) error {

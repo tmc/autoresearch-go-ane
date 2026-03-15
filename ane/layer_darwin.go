@@ -17,7 +17,6 @@ type layerForwardWeights struct {
 	Wo []float32
 	W1 []float32
 	W2 []float32
-	W3 []float32
 }
 
 type layerForward struct {
@@ -55,7 +54,6 @@ func compileStoriesLayerForward(layer stories.LayerWeights, seq int) (*layerForw
 		Wo: layer.Wo,
 		W1: layer.W1,
 		W2: layer.W2,
-		W3: layer.W3,
 	})
 }
 
@@ -106,11 +104,6 @@ func compileLayerForward(dim, hidden, heads, seq int, w layerForwardWeights) (_ 
 	if err != nil {
 		return nil, fmt.Errorf("compile layer forward: w2 blob: %w", err)
 	}
-	w3Blob, err := mil.BuildWeightBlob(w.W3, hidden, dim)
-	if err != nil {
-		return nil, fmt.Errorf("compile layer forward: w3 blob: %w", err)
-	}
-
 	preferCompact := seq > stories.SeqDefault
 	attWeights := []model.WeightFile{
 		{Path: "@model_path/weights/rms1.bin", Blob: rmsAttBlob},
@@ -151,7 +144,6 @@ func compileLayerForward(dim, hidden, heads, seq int, w layerForwardWeights) (_ 
 		{Path: "@model_path/weights/rms2.bin", Blob: rmsFFNBlob},
 		{Path: "@model_path/weights/w1.bin", Blob: w1Blob},
 		{Path: "@model_path/weights/w2.bin", Blob: w2Blob},
-		{Path: "@model_path/weights/w3.bin", Blob: w3Blob},
 	}
 	ffn, ffnTaps, ffnOutCh, err := compileLayerForwardFFN(dim, hidden, seq, ffnWeights, preferCompact)
 	if err != nil {
@@ -302,9 +294,8 @@ func (lf *layerForward) runWithTaps(out, x []float32, cache *layerCache) error {
 		if lf.ffnTaps {
 			hiddenSpan := lf.hidden * lf.seq
 			copy(cache.h1, lf.ffnOut[want:want+hiddenSpan])
-			copy(cache.h3, lf.ffnOut[want+hiddenSpan:want+2*hiddenSpan])
 			for i := range cache.gate {
-				cache.gate[i] = reluSquared32(cache.h1[i]) * cache.h3[i]
+				cache.gate[i] = reluSquared32(cache.h1[i])
 			}
 			rmsNormNoWeightCF(cache.x2Norm, cache.x2, lf.dim, lf.seq)
 			cache.ffnTapsReady = true
@@ -407,9 +398,6 @@ func validateLayerWeights(dim, hidden int, w layerForwardWeights) error {
 		return err
 	}
 	if err := check("w2", len(w.W2), dim*hidden); err != nil {
-		return err
-	}
-	if err := check("w3", len(w.W3), hidden*dim); err != nil {
 		return err
 	}
 	return nil

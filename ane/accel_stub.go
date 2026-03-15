@@ -18,14 +18,13 @@ func addSliceAccel(dst, src []float32) {
 	}
 }
 
-func reluSquaredBackwardAccel(dh1, dh3, dGate, h1, h3 []float32) {
+func reluSquaredBackwardSimple(dh1, dGate, h1 []float32) {
 	for i := range dh1 {
 		r := h1[i]
 		if r < 0 {
 			r = 0
 		}
-		dh1[i] = dGate[i] * h3[i] * 2 * r
-		dh3[i] = dGate[i] * r * r
+		dh1[i] = dGate[i] * 2 * r
 	}
 }
 

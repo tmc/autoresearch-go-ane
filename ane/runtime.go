@@ -153,7 +153,6 @@ func (e *Engine) refreshLayerWeights() error {
 			Wo: e.mw.Layers[i].Wo,
 			W1: e.mw.Layers[i].W1,
 			W2: e.mw.Layers[i].W2,
-			W3: e.mw.Layers[i].W3,
 		})
 		return struct{}{}, err
 	}, func(struct{}) {})

@@ -116,7 +116,6 @@ type Engine struct {
 	gX0              []float32 // [dim*seq] accumulated x0 gradient
 	gradGate         []float32
 	gradH1           []float32
-	gradH3           []float32
 	gradXNorm        []float32
 	gradX2           []float32
 	gradAtt          []float32
@@ -268,7 +267,6 @@ func Open(opts Options) (*Engine, error) {
 		gX0:                     make([]float32, stories.Dim*seq),
 		gradGate:                make([]float32, stories.Hidden*seq),
 		gradH1:                  make([]float32, stories.Hidden*seq),
-		gradH3:                  make([]float32, stories.Hidden*seq),
 		gradXNorm:               make([]float32, stories.Dim*seq),
 		gradX2:                  make([]float32, stories.Dim*seq),
 		gradAtt:                 make([]float32, stories.Dim*seq),
@@ -541,7 +539,6 @@ func (e *Engine) Close() {
 	e.gX0 = nil
 	e.gradGate = nil
 	e.gradH1 = nil
-	e.gradH3 = nil
 	e.gradXNorm = nil
 	e.gradX2 = nil
 	e.gradAtt = nil
@@ -686,9 +683,9 @@ func (e *Engine) loadTrailer(path string) error {
 
 func storiesCheckpointSize() int {
 	const headerBytes = 96
-	// V4 format: per-layer weights (no RMS), VE, per-layer optim, model-level.
-	layerWeights := stories.NLayers * (stories.WQSize*3 + stories.WOSize + stories.W1Size + stories.W2Size + stories.W3Size)
-	layerOpt := stories.NLayers * (stories.WQSize*6 + stories.WOSize*2 + stories.W1Size*2 + stories.W2Size*2 + stories.W3Size*2)
+	// V5 format: per-layer weights (no RMS, no W3), VE, per-layer optim, model-level.
+	layerWeights := stories.NLayers * (stories.WQSize*3 + stories.WOSize + stories.W1Size + stories.W2Size)
+	layerOpt := stories.NLayers * (stories.WQSize*6 + stories.WOSize*2 + stories.W1Size*2 + stories.W2Size*2)
 	veEmbedN := stories.VEEmbedSize(stories.Vocab)
 	veGateN := stories.VEGateSize()
 	for i := 0; i < stories.NLayers; i++ {
@@ -731,7 +728,7 @@ func writeModelGrad(w io.Writer, g *modelGrad) error {
 		layer := &g.Layers[i]
 		for _, vals := range [][]float32{
 			layer.Wq, layer.Wk, layer.Wv, layer.Wo,
-			layer.W1, layer.W2, layer.W3,
+			layer.W1, layer.W2,
 			layer.VEEmbed, layer.VEGate,
 		} {
 			if err := writeF32Slice(w, vals); err != nil {
@@ -762,7 +759,7 @@ func readModelGrad(r io.Reader, g *modelGrad) error {
 		layer := &g.Layers[i]
 		for _, vals := range [][]float32{
 			layer.Wq, layer.Wk, layer.Wv, layer.Wo,
-			layer.W1, layer.W2, layer.W3,
+			layer.W1, layer.W2,
 			layer.VEEmbed, layer.VEGate,
 		} {
 			if err := readF32Slice(r, vals); err != nil {
@@ -879,11 +876,10 @@ func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 	attOut := make([]float32, stories.Dim*e.seq)
 	x2 := make([]float32, stories.Dim*e.seq)
 	h1 := make([]float32, stories.Hidden*e.seq)
-	h3 := make([]float32, stories.Hidden*e.seq)
 	gate := make([]float32, stories.Hidden*e.seq)
 	ffOut := make([]float32, stories.Dim*e.seq)
 	veScr := make([]float32, stories.Dim*e.seq)
-	veGateAct := make([]float32, e.seq)
+	veGateAct := make([]float32, stories.Heads*e.seq)
 
 	stories.EmbedLookup(x, e.mw.Embed, tokens, stories.Dim, e.seq)
 	rmsNormNoWeightCF(x, x, stories.Dim, e.seq)
@@ -918,9 +914,8 @@ func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 		}
 		rmsNormNoWeightCF(xNorm, x2, stories.Dim, e.seq)
 		linearCF(h1, layer.W1, xNorm, stories.Hidden, stories.Dim, e.seq)
-		linearCF(h3, layer.W3, xNorm, stories.Hidden, stories.Dim, e.seq)
 		for j := range gate {
-			gate[j] = reluSquared32(h1[j]) * h3[j]
+			gate[j] = reluSquared32(h1[j])
 		}
 		linearCF(ffOut, layer.W2, gate, stories.Dim, stories.Hidden, e.seq)
 		for j := 0; j < stories.Dim*e.seq; j++ {
