@@ -242,6 +242,8 @@ func Open(opts Options) (*Engine, error) {
 	}
 
 	dim := cfg.Dim
+	qDim := cfg.QDim()
+	kvDim := cfg.KVDim()
 	hidden := cfg.Hidden
 	vocab := cfg.Vocab
 
@@ -292,10 +294,10 @@ func Open(opts Options) (*Engine, error) {
 		gradPrev:                make([]float32, dim*seq),
 		ropeCos:                 ropeCos,
 		ropeSin:                 ropeSin,
-		cpuQF:                   make([]float32, dim*seq),
-		cpuKF:                   make([]float32, dim*seq),
-		cpuVF:                   make([]float32, dim*seq),
-		cpuAttO:                 make([]float32, dim*seq),
+		cpuQF:                   make([]float32, qDim*seq),
+		cpuKF:                   make([]float32, kvDim*seq),
+		cpuVF:                   make([]float32, kvDim*seq),
+		cpuAttO:                 make([]float32, qDim*seq),
 		cpuX2:                   make([]float32, dim*seq),
 		cpuH1:                   make([]float32, hidden*seq),
 		cpuH3:                   make([]float32, hidden*seq),
@@ -914,8 +916,11 @@ func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
 
 func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 	dim := e.cfg.Dim
+	qDim := e.cfg.QDim()
+	kvDim := e.cfg.KVDim()
 	hidden := e.cfg.Hidden
 	heads := e.cfg.Heads
+	kvHeads := e.cfg.EffectiveKVHeads()
 	headDim := e.cfg.HeadDim()
 	vocab := e.cfg.Vocab
 
@@ -937,13 +942,13 @@ func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 	for i := range e.mw.Layers {
 		layer := e.mw.Layers[i]
 		rmsNormCF(xNorm, cur, layer.RMSAtt, dim, e.seq)
-		linearCF(qf, layer.Wq, xNorm, dim, dim, e.seq)
-		linearCF(kf, layer.Wk, xNorm, dim, dim, e.seq)
+		linearCF(qf, layer.Wq, xNorm, qDim, dim, e.seq)
+		linearCF(kf, layer.Wk, xNorm, kvDim, dim, e.seq)
 		applyRoPECFInPlace(qf, heads, headDim, e.seq, e.ropeCos, e.ropeSin)
-		applyRoPECFInPlace(kf, heads, headDim, e.seq, e.ropeCos, e.ropeSin)
-		linearCF(vf, layer.Wv, xNorm, dim, dim, e.seq)
-		causalAttentionCF(attOut, qf, kf, vf, heads, headDim, e.seq)
-		linearCF(x2, layer.Wo, attOut, dim, dim, e.seq)
+		applyRoPECFInPlace(kf, kvHeads, headDim, e.seq, e.ropeCos, e.ropeSin)
+		linearCF(vf, layer.Wv, xNorm, kvDim, dim, e.seq)
+		gqaCausalAttentionCF(attOut, qf, kf, vf, heads, kvHeads, headDim, e.seq)
+		linearCF(x2, layer.Wo, attOut, dim, qDim, e.seq)
 		addScaledResidual(x2, cur, x2)
 		rmsNormCF(xNorm, x2, layer.RMSFFN, dim, e.seq)
 		linearCF(h1, layer.W1, xNorm, hidden, dim, e.seq)
