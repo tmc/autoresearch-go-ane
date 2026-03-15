@@ -41,7 +41,7 @@ import requests
 # Configuration
 # ---------------------------------------------------------------------------
 
-HUB_ORG = "autoresearch-at-home"
+HUB_ORG = "austin_mac"
 API_URL = "https://api.ensue-network.ai/"
 KEY_FILE = ".autoresearch-key"
 NAMESPACE = "autoresearch-go-ane-infer"
