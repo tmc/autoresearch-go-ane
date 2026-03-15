@@ -139,23 +139,48 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 	if err != nil {
 		return nil, fmt.Errorf("compile layer forward dynamic: ffn: %w", err)
 	}
-	lf := &layerForward{
-		dim:     dim,
-		hidden:  hidden,
-		heads:   heads,
-		seq:     seq,
-		att:     att,
-		ffn:     ffn,
-		dynamic: true,
-		attTaps: true,
-		ffnTaps: true,
-		rmsAtt:  layer.RMSAtt,
-		rmsFFN:  layer.RMSFFN,
-		attOut:  make([]float32, 5*dim*seq),
-		ffnOut:  make([]float32, (dim+2*hidden)*seq),
-		x2:      make([]float32, dim*seq),
+	// Compile inference-only kernels with residual scale baked in.
+	residualScale := float64(layerResidualScale)
+	inferAtt, inferAttErr := model.Compile(model.CompileOptions{
+		MILText:     mil.GenStoriesSDPAForwardInference(dim, heads, seq, residualScale),
+		SharedModel: true,
+		WeightFiles: []model.WeightFile{
+			{Path: "@model_path/weights/mask.bin", Blob: spec.maskBlob},
+			{Path: "@model_path/weights/rope_cos.bin", Blob: spec.ropeCosBlob},
+			{Path: "@model_path/weights/rope_sin.bin", Blob: spec.ropeSinBlob},
+		},
+	})
+	var inferFFN *model.Kernel
+	var inferFFNErr error
+	if inferAttErr == nil {
+		inferFFN, inferFFNErr = model.Compile(model.CompileOptions{
+			MILText:     mil.GenStoriesFFNForwardInference(dim, hidden, seq, residualScale),
+			SharedModel: true,
+		})
+		if inferFFNErr != nil {
+			inferAtt.Close()
+			inferAtt = nil
+		}
 	}
-	if err := lf.stageDynamicWeights(layerForwardWeights{
+	lf := &layerForward{
+		dim:      dim,
+		hidden:   hidden,
+		heads:    heads,
+		seq:      seq,
+		att:      att,
+		ffn:      ffn,
+		inferAtt: inferAtt,
+		inferFFN: inferFFN,
+		dynamic:  true,
+		attTaps:  true,
+		ffnTaps:  true,
+		rmsAtt:   layer.RMSAtt,
+		rmsFFN:   layer.RMSFFN,
+		attOut:   make([]float32, 5*dim*seq),
+		ffnOut:   make([]float32, (dim+2*hidden)*seq),
+		x2:       make([]float32, dim*seq),
+	}
+	w := layerForwardWeights{
 		RMSAtt: layer.RMSAtt,
 		Wq:     layer.Wq,
 		Wk:     layer.Wk,
@@ -165,9 +190,31 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		W1:     layer.W1,
 		W2:     layer.W2,
 		W3:     layer.W3,
-	}); err != nil {
+	}
+	if err := lf.stageDynamicWeights(w); err != nil {
 		lf.close()
 		return nil, err
+	}
+	// Stage weights for inference kernels (same layout).
+	if lf.inferAtt != nil {
+		if err := stageStoriesAttentionForwardWeights(lf.inferAtt, lf.seq, w); err != nil {
+			lf.inferAtt.Close()
+			lf.inferAtt = nil
+			if lf.inferFFN != nil {
+				lf.inferFFN.Close()
+				lf.inferFFN = nil
+			}
+		}
+	}
+	if lf.inferFFN != nil {
+		if err := stageStoriesFFNForwardWeights(lf.inferFFN, lf.seq, lf.hidden, w); err != nil {
+			lf.inferFFN.Close()
+			lf.inferFFN = nil
+			if lf.inferAtt != nil {
+				lf.inferAtt.Close()
+				lf.inferAtt = nil
+			}
+		}
 	}
 	return lf, nil
 }
@@ -322,14 +369,43 @@ func (lb *layerBackward) stageDynamicWeights(layer stories.LayerWeights) error {
 	return nil
 }
 
-// runDynamicInferenceOnly reads only dim*seq output channels, skipping taps.
+// runDynamicInferenceOnly uses inference-only kernels with residual scale baked in
+// when available, eliminating CPU-side residual ops and reducing IOSurface round-trips.
 func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
-	if lf == nil || lf.att == nil || lf.ffn == nil {
+	if lf == nil {
 		return fmt.Errorf("run layer forward dynamic: layer is closed")
 	}
 	want := lf.dim * lf.seq
 	if len(x) != want || len(out) != want {
 		return fmt.Errorf("run layer forward dynamic: len mismatch in=%d out=%d want=%d", len(x), len(out), want)
+	}
+	// Use inference-only kernels if available (residual scale baked in, no taps).
+	if lf.inferAtt != nil && lf.inferFFN != nil {
+		if err := writeStoriesAttentionForwardActs(lf.inferAtt, lf.seq, x); err != nil {
+			return fmt.Errorf("run layer forward dynamic: write infer attention input: %w", err)
+		}
+		if err := evalKernelTracked(lf.metrics, lf.inferAtt); err != nil {
+			return fmt.Errorf("run layer forward dynamic: eval infer attention: %w", err)
+		}
+		// Output is already x + scale*Wo@attn — no CPU residual needed.
+		if err := readOutputFP16ChannelsFast(lf.inferAtt, 0, 0, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward dynamic: read infer attention output: %w", err)
+		}
+		if err := writeStoriesFFNForwardActs(lf.inferFFN, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward dynamic: write infer ffn input: %w", err)
+		}
+		if err := evalKernelTracked(lf.metrics, lf.inferFFN); err != nil {
+			return fmt.Errorf("run layer forward dynamic: eval infer ffn: %w", err)
+		}
+		// Output is already x2 + scale*ff — no CPU residual needed.
+		if err := readOutputFP16ChannelsFast(lf.inferFFN, 0, 0, lf.seq, out); err != nil {
+			return fmt.Errorf("run layer forward dynamic: read infer ffn output: %w", err)
+		}
+		return nil
+	}
+	// Fallback: use training kernels with CPU-side residual.
+	if lf.att == nil || lf.ffn == nil {
+		return fmt.Errorf("run layer forward dynamic: layer is closed")
 	}
 	if err := writeStoriesAttentionForwardActs(lf.att, lf.seq, x); err != nil {
 		return fmt.Errorf("run layer forward dynamic: write attention input: %w", err)

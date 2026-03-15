@@ -32,6 +32,10 @@ type layerForward struct {
 	att *model.Kernel
 	ffn *model.Kernel
 
+	// Inference-only kernels with residual scale baked in (no taps output).
+	inferAtt *model.Kernel
+	inferFFN *model.Kernel
+
 	metrics  *aneStepMetrics
 	dynamic  bool
 	attSplit bool
@@ -191,9 +195,13 @@ func (lf *layerForward) close() {
 	closeKernel(lf.qkv)
 	closeKernel(lf.att)
 	closeKernel(lf.ffn)
+	closeKernel(lf.inferAtt)
+	closeKernel(lf.inferFFN)
 	lf.qkv = nil
 	lf.att = nil
 	lf.ffn = nil
+	lf.inferAtt = nil
+	lf.inferFFN = nil
 	lf.rmsAtt = nil
 	lf.rmsFFN = nil
 	lf.qkvOut = nil
