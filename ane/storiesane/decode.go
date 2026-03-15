@@ -41,7 +41,7 @@ func (e *Engine) Decode(tok *stories.Tokenizer, opts stories.DecodeOptions) (sto
 		prompt = prompt[len(prompt)-e.seq:]
 	}
 	for i, t := range prompt {
-		if t < 0 || t >= stories.Vocab {
+		if t < 0 || t >= e.cfg.Vocab {
 			return stories.DecodeResult{}, fmt.Errorf("storiesane decode: prompt token[%d]=%d out of range", i, t)
 		}
 	}
@@ -57,8 +57,8 @@ func (e *Engine) Decode(tok *stories.Tokenizer, opts stories.DecodeOptions) (sto
 			return stories.DecodeResult{}, err
 		}
 		last := len(window) - 1
-		row := make([]float32, stories.Vocab)
-		for v := 0; v < stories.Vocab; v++ {
+		row := make([]float32, e.cfg.Vocab)
+		for v := 0; v < e.cfg.Vocab; v++ {
 			row[v] = logits[v*e.seq+last]
 		}
 		next := sampleFromLogits(rng, row, temp)

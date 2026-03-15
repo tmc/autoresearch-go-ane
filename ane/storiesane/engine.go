@@ -236,7 +236,7 @@ func Open(opts Options) (*Engine, error) {
 	if len(opts.Tokens) > 0 {
 		opt = stories.NewOptimStateFromConfig(cfg)
 		if opts.AccumSteps > 1 {
-			accum = newModelGrad(cfg.Vocab)
+			accum = newModelGradFromConfig(cfg)
 		}
 	}
 
@@ -260,7 +260,7 @@ func Open(opts Options) (*Engine, error) {
 	ropeCos, ropeSin := buildRoPETables(seq, cfg.HeadDim())
 	applyGrads := make([]stories.LayerWeights, cfg.NLayers)
 	for i := range applyGrads {
-		applyGrads[i] = newLayerGrad()
+		applyGrads[i] = newLayerGradFromConfig(cfg)
 	}
 
 	dim := cfg.Dim

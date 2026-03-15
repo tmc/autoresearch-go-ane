@@ -134,6 +134,34 @@ func (c ModelConfig) EffectiveSeq() int {
 	return c.Seq
 }
 
+// Qwen3_4BConfig returns the ModelConfig for Qwen3-4B (dense, 4B parameters).
+func Qwen3_4BConfig() ModelConfig {
+	return ModelConfig{
+		Dim:        2560,
+		Hidden:     6912,
+		Heads:      32,
+		KVHeads:    8,
+		NLayers:    36,
+		Vocab:      151936,
+		Seq:        4096,
+		HeadDimOvr: 128,
+	}
+}
+
+// Qwen3_0_6BConfig returns the ModelConfig for Qwen3-0.6B (dense, 0.6B parameters).
+func Qwen3_0_6BConfig() ModelConfig {
+	return ModelConfig{
+		Dim:        1024,
+		Hidden:     3072,
+		Heads:      16,
+		KVHeads:    8,
+		NLayers:    28,
+		Vocab:      151936,
+		Seq:        4096,
+		HeadDimOvr: 128,
+	}
+}
+
 // ConfigFromLlama2 converts a Llama2Config header to a ModelConfig.
 func ConfigFromLlama2(cfg Llama2Config) ModelConfig {
 	vocab := int(cfg.VocabSize)

@@ -312,7 +312,7 @@ func compileGQALayerForwardInference(cfg stories.ModelConfig, layer stories.Laye
 		lf.close()
 		return nil, fmt.Errorf("compile gqa layer forward inference: stage attention: %w", err)
 	}
-	if err := stageStoriesFFNForwardWeights(lf.ffn, seq, hidden, w); err != nil {
+	if err := stageFFNForwardWeights(lf.ffn, seq, dim, hidden, w); err != nil {
 		lf.close()
 		return nil, fmt.Errorf("compile gqa layer forward inference: stage ffn: %w", err)
 	}
@@ -842,21 +842,25 @@ func writeStoriesAttentionForwardActs(k *model.Kernel, seq int, x []float32) err
 	})
 }
 
-func stageStoriesFFNForwardWeights(k *model.Kernel, seq, hidden int, w layerForwardWeights) error {
+func stageFFNForwardWeights(k *model.Kernel, seq, dim, hidden int, w layerForwardWeights) error {
 	width := seq + 1 + 3*hidden
 	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
-		if err := requireFP16InputLayout("stage stories ffn forward weights", layout, stories.Dim, width); err != nil {
+		if err := requireFP16InputLayout("stage ffn forward weights", layout, dim, width); err != nil {
 			return err
 		}
-		for d := 0; d < stories.Dim; d++ {
+		for d := 0; d < dim; d++ {
 			row := inputRowFP16(data, layout, d)
 			row[seq] = mil.Float32ToFP16(w.RMSFFN[d])
 		}
-		writeTransposedMatrixFP16(data, layout, 0, seq+1, hidden, stories.Dim, w.W1)
-		writeTransposedMatrixFP16(data, layout, 0, seq+1+hidden, hidden, stories.Dim, w.W3)
-		writeMatrixRowsFP16(data, layout, 0, seq+1+2*hidden, stories.Dim, hidden, w.W2)
+		writeTransposedMatrixFP16(data, layout, 0, seq+1, hidden, dim, w.W1)
+		writeTransposedMatrixFP16(data, layout, 0, seq+1+hidden, hidden, dim, w.W3)
+		writeMatrixRowsFP16(data, layout, 0, seq+1+2*hidden, dim, hidden, w.W2)
 		return nil
 	})
+}
+
+func stageStoriesFFNForwardWeights(k *model.Kernel, seq, hidden int, w layerForwardWeights) error {
+	return stageFFNForwardWeights(k, seq, stories.Dim, hidden, w)
 }
 
 func writeStoriesFFNForwardActs(k *model.Kernel, seq int, x []float32) error {

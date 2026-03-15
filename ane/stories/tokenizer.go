@@ -12,8 +12,13 @@ type Tokenizer struct {
 	vocab []string
 }
 
-// LoadTokenizer loads tokenizer metadata from tokenizer.bin.
+// LoadTokenizer loads tokenizer metadata from tokenizer.bin using the default Vocab size.
 func LoadTokenizer(path string) (*Tokenizer, error) {
+	return LoadTokenizerVocab(path, Vocab)
+}
+
+// LoadTokenizerVocab loads tokenizer metadata from tokenizer.bin for the given vocab size.
+func LoadTokenizerVocab(path string, vocabSize int) (*Tokenizer, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -28,8 +33,8 @@ func LoadTokenizer(path string) (*Tokenizer, error) {
 		return nil, fmt.Errorf("bad tokenizer header: max token len=%d", maxTokenLen)
 	}
 
-	vocab := make([]string, Vocab)
-	for i := 0; i < Vocab; i++ {
+	vocab := make([]string, vocabSize)
+	for i := 0; i < vocabSize; i++ {
 		var score float32
 		if err := binary.Read(f, binary.LittleEndian, &score); err != nil {
 			if err == io.EOF {

@@ -81,6 +81,7 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 
 	cur := e.cacheX
 	next := e.cacheNext
+	residualScale := float32(e.cfg.ResidualScale())
 
 	// --- Transformer layers ---
 	for li := range e.mw.Layers {
@@ -124,7 +125,7 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 		linearSingle(e.cacheX2, layer.Wo, e.cacheAttOut, dim, qDim)
 
 		// Residual connection: x2 = cur + scale * x2
-		addScaledResidualSingle(e.cacheX2, cur, e.cacheX2, dim)
+		addScaledResidualSingle(e.cacheX2, cur, e.cacheX2, residualScale)
 
 		// FFN sub-block: RMSNorm → W1+W3 fused → SiLU → W2 → residual
 		rmsNormSingle(e.cacheXNorm, e.cacheX2, layer.RMSFFN, dim)
@@ -137,7 +138,7 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 		linearSingle(e.cacheH1H3, e.fusedW1W3[li], e.cacheXNorm, 2*hidden, dim)
 		siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
 		linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
-		addScaledResidualSingle(next, e.cacheX2, e.cacheFFOut, dim)
+		addScaledResidualSingle(next, e.cacheX2, e.cacheFFOut, residualScale)
 
 		cur, next = next, cur
 	}
@@ -223,9 +224,9 @@ func applyRoPESinglePos(x []float32, nHeads, headDim, pos int, ropeCos, ropeSin 
 	}
 }
 
-// addScaledResidualSingle: dst[i] = base[i] + layerResidualScale * branch[i]
-func addScaledResidualSingle(dst, base, branch []float32, dim int) {
-	addScaledResidualAccel(dst, base, branch, layerResidualScale)
+// addScaledResidualSingle: dst[i] = base[i] + scale * branch[i]
+func addScaledResidualSingle(dst, base, branch []float32, scale float32) {
+	addScaledResidualAccel(dst, base, branch, scale)
 }
 
 // singleQueryGQAAttention computes attention for a single query position

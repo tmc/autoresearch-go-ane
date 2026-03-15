@@ -94,6 +94,32 @@ func newModelGrad(vocab int) *modelGrad {
 	return g
 }
 
+func newLayerGradFromConfig(cfg stories.ModelConfig) stories.LayerWeights {
+	return stories.LayerWeights{
+		Wq:     make([]float32, cfg.WqSize()),
+		Wk:     make([]float32, cfg.WkSize()),
+		Wv:     make([]float32, cfg.WvSize()),
+		Wo:     make([]float32, cfg.WoSize()),
+		W1:     make([]float32, cfg.W1Size()),
+		W2:     make([]float32, cfg.W2Size()),
+		W3:     make([]float32, cfg.W3Size()),
+		RMSAtt: make([]float32, cfg.Dim),
+		RMSFFN: make([]float32, cfg.Dim),
+	}
+}
+
+func newModelGradFromConfig(cfg stories.ModelConfig) *modelGrad {
+	g := &modelGrad{
+		Layers:   make([]stories.LayerWeights, cfg.NLayers),
+		RMSFinal: make([]float32, cfg.Dim),
+		Embed:    make([]float32, cfg.Vocab*cfg.Dim),
+	}
+	for i := range g.Layers {
+		g.Layers[i] = newLayerGradFromConfig(cfg)
+	}
+	return g
+}
+
 func clearLayerGrad(g *stories.LayerWeights) {
 	clear(g.Wq)
 	clear(g.Wk)

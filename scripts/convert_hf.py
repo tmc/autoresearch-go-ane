@@ -175,7 +175,7 @@ def verify_output(path: str, config, state_dict: dict):
 
     dim = config.hidden_size
     n_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-    head_dim = dim // config.num_attention_heads
+    head_dim = getattr(config, "head_dim", dim // config.num_attention_heads)
     kv_dim = n_kv_heads * head_dim
 
     with open(path, "rb") as f:
