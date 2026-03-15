@@ -21,7 +21,7 @@ const (
 	// Acceleration dispatch flags.
 	UseMetal    = false // Metal GPU matmul for large layers
 	UseBNNS     = false // BNNS fp16-weight GEMV
-	UseANE      = true  // Apple Neural Engine acceleration
+	UseANE      = false // Apple Neural Engine acceleration
 	TileSize    = 0     // tiled layer dimension (0 = auto)
 
 	// Buffer management.
