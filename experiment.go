@@ -11,7 +11,7 @@ package main
 import (
 	"math"
 
-	"github.com/tmc/autoresearch-go-ane/ane/storiesane"
+	"github.com/tmc/autoresearch-go-ane/ane"
 )
 
 const (
@@ -31,8 +31,8 @@ const (
 
 const warmupFraction = 0.05
 
-func experimentConfig(modelPath string, tokens []uint16) storiesane.Options {
-	return storiesane.Options{
+func experimentConfig(modelPath string, tokens []uint16) ane.Options {
+	return ane.Options{
 		ModelPath:      modelPath,
 		Tokens:         tokens,
 		Seq:            SequenceLength,

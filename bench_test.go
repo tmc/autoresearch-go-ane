@@ -7,11 +7,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/tmc/autoresearch-go-ane/ane/storiesane"
+	"github.com/tmc/autoresearch-go-ane/ane"
 )
 
 var (
-	testEngine *storiesane.Engine
+	testEngine *ane.Engine
 	testTokens []uint16
 )
 
@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 
 	fmt.Fprintf(os.Stderr, "opening engine with %s...\n", modelPath)
 	opts := experimentConfig(modelPath, testTokens)
-	testEngine, err = storiesane.Open(opts)
+	testEngine, err = ane.Open(opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open engine: %v\n", err)
 		os.Exit(1)
@@ -79,7 +79,7 @@ func BenchmarkStep(b *testing.B) {
 	}
 
 	tokensPerStep := int64(SequenceLength) * int64(AccumSteps)
-	var lastRes storiesane.StepResult
+	var lastRes ane.StepResult
 
 	b.SetBytes(tokensPerStep * 2) // uint16 tokens
 	b.ResetTimer()
