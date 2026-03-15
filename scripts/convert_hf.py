@@ -44,12 +44,14 @@ def load_model(model_id: str):
     model_path = snapshot_download(model_id, allow_patterns=["*.safetensors", "*.json"])
     model_path = Path(model_path)
 
-    # Load all safetensor files
+    # Load all safetensor files.
+    # Use torch framework to handle bfloat16, then convert to float32 numpy.
+    import torch
     state_dict = {}
     for sf_path in sorted(model_path.glob("*.safetensors")):
-        with safe_open(str(sf_path), framework="numpy") as f:
+        with safe_open(str(sf_path), framework="pt") as f:
             for key in f.keys():
-                state_dict[key] = f.get_tensor(key)
+                state_dict[key] = f.get_tensor(key).to(torch.float32).numpy()
 
     return config, state_dict
 
@@ -68,12 +70,14 @@ def convert(model_id: str, output_path: str, verify: bool = False):
     vocab_size = config.vocab_size
     seq_len = getattr(config, "max_position_embeddings", 4096)
 
-    head_dim = dim // n_heads
-    kv_dim = n_kv_heads * head_dim
+    # head_dim may be explicitly set (Qwen3) or derived from dim/heads
+    head_dim = getattr(config, "head_dim", dim // n_heads)
+    q_dim = n_heads * head_dim      # Q projection output dim
+    kv_dim = n_kv_heads * head_dim  # K/V projection output dim
 
     print(f"Config: dim={dim}, hidden={hidden}, layers={n_layers}, "
           f"heads={n_heads}, kv_heads={n_kv_heads}, vocab={vocab_size}, "
-          f"seq={seq_len}, head_dim={head_dim}, kv_dim={kv_dim}")
+          f"seq={seq_len}, head_dim={head_dim}, q_dim={q_dim}, kv_dim={kv_dim}")
 
     # Map weight names
     def get(name: str) -> np.ndarray:
@@ -107,15 +111,15 @@ def convert(model_id: str, output_path: str, verify: bool = False):
             w = get(f"model.layers.{i}.input_layernorm.weight")
             f.write(w.tobytes())
 
-        # 2. Wq for all layers [dim, dim]
+        # 2. Wq for all layers [q_dim, dim]
         for i in range(n_layers):
-            w = get(f"model.layers.{i}.self_attn.q_proj.weight")  # [dim, dim]
-            assert w.shape == (dim, dim), f"Wq shape mismatch: {w.shape} expected ({dim}, {dim})"
+            w = get(f"model.layers.{i}.self_attn.q_proj.weight")
+            assert w.shape == (q_dim, dim), f"Wq shape mismatch: {w.shape} expected ({q_dim}, {dim})"
             f.write(w.tobytes())
 
         # 3. Wk for all layers [kv_dim, dim]
         for i in range(n_layers):
-            w = get(f"model.layers.{i}.self_attn.k_proj.weight")  # [kv_dim, dim]
+            w = get(f"model.layers.{i}.self_attn.k_proj.weight")
             assert w.shape == (kv_dim, dim), f"Wk shape mismatch: {w.shape} expected ({kv_dim}, {dim})"
             f.write(w.tobytes())
 
@@ -125,10 +129,10 @@ def convert(model_id: str, output_path: str, verify: bool = False):
             assert w.shape == (kv_dim, dim), f"Wv shape mismatch: {w.shape} expected ({kv_dim}, {dim})"
             f.write(w.tobytes())
 
-        # 5. Wo for all layers [dim, dim]
+        # 5. Wo for all layers [dim, q_dim] (projects attention output back to hidden dim)
         for i in range(n_layers):
             w = get(f"model.layers.{i}.self_attn.o_proj.weight")
-            assert w.shape == (dim, dim), f"Wo shape mismatch: {w.shape} expected ({dim}, {dim})"
+            assert w.shape == (dim, q_dim), f"Wo shape mismatch: {w.shape} expected ({dim}, {q_dim})"
             f.write(w.tobytes())
 
         # 6. RMSFFN for all layers

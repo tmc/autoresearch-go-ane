@@ -58,6 +58,9 @@ func NewModelWeightsFromConfig(cfg ModelConfig) *ModelWeights {
 
 // LoadPretrainedAny loads a .bin pretrained model with any architecture.
 // Returns the model weights with the Config field populated from the file header.
+//
+// For models where head_dim != dim/heads (e.g., Qwen3), the file size is used
+// to detect the actual head_dim after reading the 7-field Llama2Config header.
 func LoadPretrainedAny(path string) (*ModelWeights, ModelConfig, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -70,61 +73,107 @@ func LoadPretrainedAny(path string) (*ModelWeights, ModelConfig, error) {
 		return nil, ModelConfig{}, fmt.Errorf("read config: %w", err)
 	}
 	cfg := ConfigFromLlama2(hdr)
+
+	// Detect explicit head_dim by checking file size.
+	// The Llama2 header assumes head_dim = dim/heads, but models like Qwen3
+	// have an explicit head_dim (e.g., 128) that differs from dim/heads (e.g., 64).
+	// We detect this by comparing the expected file size against the actual size.
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, cfg, fmt.Errorf("stat model file: %w", err)
+	}
+	fileSize := fi.Size()
+	expectedSize := pretrainedFileSize(cfg)
+	if fileSize != expectedSize && cfg.Heads > 0 {
+		// Try doubling head_dim (common pattern: Qwen3 uses 2x head_dim).
+		cfg2 := cfg
+		cfg2.HeadDimOvr = (cfg.Dim / cfg.Heads) * 2
+		if pretrainedFileSize(cfg2) == fileSize {
+			cfg = cfg2
+		} else {
+			// Brute-force search for head_dim that matches file size.
+			for hd := cfg.Dim / cfg.Heads; hd <= cfg.Dim; hd++ {
+				cfg2.HeadDimOvr = hd
+				if pretrainedFileSize(cfg2) == fileSize {
+					cfg = cfg2
+					break
+				}
+			}
+		}
+	}
+
 	mw := NewModelWeightsFromConfig(cfg)
 	mw.SharedCL = hdr.VocabSize > 0
 
+	if err := readPretrainedWeights(f, mw); err != nil {
+		return nil, cfg, err
+	}
+	return mw, cfg, nil
+}
+
+// pretrainedFileSize returns the expected .bin file size for a given config.
+func pretrainedFileSize(cfg ModelConfig) int64 {
+	const headerBytes = 7 * 4 // Llama2Config: 7 x int32
+	perLayer := cfg.WqSize() + cfg.WkSize() + cfg.WvSize() + cfg.WoSize() +
+		cfg.W1Size() + cfg.W2Size() + cfg.W3Size() + cfg.Dim*2
+	total := headerBytes + (cfg.Vocab*cfg.Dim + cfg.NLayers*perLayer + cfg.Dim) * 4
+	return int64(total)
+}
+
+// readPretrainedWeights reads weight data from a .bin file into pre-allocated ModelWeights.
+func readPretrainedWeights(f *os.File, mw *ModelWeights) error {
 	if err := readF32s(f, mw.Embed); err != nil {
-		return nil, cfg, fmt.Errorf("read embed: %w", err)
+		return fmt.Errorf("read embed: %w", err)
 	}
 	for i := range mw.Layers {
 		if err := readF32s(f, mw.Layers[i].RMSAtt); err != nil {
-			return nil, cfg, fmt.Errorf("read rms_att[%d]: %w", i, err)
+			return fmt.Errorf("read rms_att[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
 		if err := readF32s(f, mw.Layers[i].Wq); err != nil {
-			return nil, cfg, fmt.Errorf("read wq[%d]: %w", i, err)
+			return fmt.Errorf("read wq[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
 		if err := readF32s(f, mw.Layers[i].Wk); err != nil {
-			return nil, cfg, fmt.Errorf("read wk[%d]: %w", i, err)
+			return fmt.Errorf("read wk[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
 		if err := readF32s(f, mw.Layers[i].Wv); err != nil {
-			return nil, cfg, fmt.Errorf("read wv[%d]: %w", i, err)
+			return fmt.Errorf("read wv[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
 		if err := readF32s(f, mw.Layers[i].Wo); err != nil {
-			return nil, cfg, fmt.Errorf("read wo[%d]: %w", i, err)
+			return fmt.Errorf("read wo[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
 		if err := readF32s(f, mw.Layers[i].RMSFFN); err != nil {
-			return nil, cfg, fmt.Errorf("read rms_ffn[%d]: %w", i, err)
+			return fmt.Errorf("read rms_ffn[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
 		if err := readF32s(f, mw.Layers[i].W1); err != nil {
-			return nil, cfg, fmt.Errorf("read w1[%d]: %w", i, err)
+			return fmt.Errorf("read w1[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
 		if err := readF32s(f, mw.Layers[i].W2); err != nil {
-			return nil, cfg, fmt.Errorf("read w2[%d]: %w", i, err)
+			return fmt.Errorf("read w2[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
 		if err := readF32s(f, mw.Layers[i].W3); err != nil {
-			return nil, cfg, fmt.Errorf("read w3[%d]: %w", i, err)
+			return fmt.Errorf("read w3[%d]: %w", i, err)
 		}
 	}
 	if err := readF32s(f, mw.RMSFinal); err != nil {
-		return nil, cfg, fmt.Errorf("read rms_final: %w", err)
+		return fmt.Errorf("read rms_final: %w", err)
 	}
-	return mw, cfg, nil
+	return nil
 }
 
 // LoadPretrained loads a .bin pretrained model, validating it matches the legacy 110M config.

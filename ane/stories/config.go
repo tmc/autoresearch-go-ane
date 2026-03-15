@@ -39,11 +39,12 @@ type Llama2Config struct {
 type ModelConfig struct {
 	Dim     int // hidden_size (embedding dimension)
 	Hidden  int // intermediate_size (FFN hidden dimension)
-	Heads   int // num_attention_heads
-	KVHeads int // num_key_value_heads (for GQA; 0 means KVHeads == Heads)
-	NLayers int // num_hidden_layers
-	Vocab   int // vocab_size
-	Seq     int // max sequence length (0 = use SeqDefault)
+	Heads      int // num_attention_heads
+	KVHeads    int // num_key_value_heads (for GQA; 0 means KVHeads == Heads)
+	NLayers    int // num_hidden_layers
+	Vocab      int // vocab_size
+	Seq        int // max sequence length (0 = use SeqDefault)
+	HeadDimOvr int // explicit head_dim override (0 = Dim / Heads)
 }
 
 // DefaultConfig returns the ModelConfig matching the legacy 110M constants.
@@ -67,12 +68,23 @@ func (c ModelConfig) EffectiveKVHeads() int {
 	return c.KVHeads
 }
 
-// HeadDim returns the per-head dimension: Dim / Heads.
+// HeadDim returns the per-head dimension.
+// Uses HeadDimOvr if set (e.g. Qwen3 where head_dim != dim/heads),
+// otherwise falls back to Dim / Heads.
 func (c ModelConfig) HeadDim() int {
+	if c.HeadDimOvr > 0 {
+		return c.HeadDimOvr
+	}
 	if c.Heads <= 0 {
 		return 0
 	}
 	return c.Dim / c.Heads
+}
+
+// QDim returns the total Q projection dimension: Heads * HeadDim.
+// This may differ from Dim when HeadDim is explicitly set.
+func (c ModelConfig) QDim() int {
+	return c.Heads * c.HeadDim()
 }
 
 // KVDim returns the total KV projection dimension: KVHeads * HeadDim.
@@ -85,8 +97,8 @@ func (c ModelConfig) IsGQA() bool {
 	return c.EffectiveKVHeads() < c.Heads
 }
 
-// WqSize returns the Q projection weight count: Dim * Dim.
-func (c ModelConfig) WqSize() int { return c.Dim * c.Dim }
+// WqSize returns the Q projection weight count: QDim * Dim.
+func (c ModelConfig) WqSize() int { return c.QDim() * c.Dim }
 
 // WkSize returns the K projection weight count: KVDim * Dim.
 func (c ModelConfig) WkSize() int { return c.KVDim() * c.Dim }
@@ -94,8 +106,8 @@ func (c ModelConfig) WkSize() int { return c.KVDim() * c.Dim }
 // WvSize returns the V projection weight count: KVDim * Dim.
 func (c ModelConfig) WvSize() int { return c.KVDim() * c.Dim }
 
-// WoSize returns the O projection weight count: Dim * Dim.
-func (c ModelConfig) WoSize() int { return c.Dim * c.Dim }
+// WoSize returns the O projection weight count: Dim * QDim.
+func (c ModelConfig) WoSize() int { return c.Dim * c.QDim() }
 
 // W1Size returns the FFN gate projection weight count: Hidden * Dim.
 func (c ModelConfig) W1Size() int { return c.Hidden * c.Dim }
