@@ -8,68 +8,190 @@ import (
 	"math/rand"
 	"os"
 	"unsafe"
+
+	xane "github.com/tmc/apple/x/ane"
 )
 
 type LayerWeights struct {
 	Wq, Wk, Wv, Wo []float32
-	W1, W2         []float32
-	VEEmbed        []float32 // [vocab*dim] embedding table, VE layers only
-	VEGate         []float32 // [Heads*VEGateChannels] per-head gate weight, VE layers only
+	W1, W2, W3     []float32
+	RMSAtt, RMSFFN []float32
 }
-
-// IsVELayer reports whether layer i uses value embeddings.
-// Matches nanochat: alternating, last layer always included.
-func IsVELayer(i int) bool { return i%2 == (NLayers-1)%2 }
-
-// VEEmbedSize returns the number of float32s in a VE embedding table.
-func VEEmbedSize(vocab int) int { return vocab * Dim }
-
-// VEGateChannels is the number of input channels each per-head gate dot-products.
-const VEGateChannels = 12
-
-// VEGateSize returns the number of float32s in a VE gate vector.
-func VEGateSize() int { return Heads * VEGateChannels }
 
 type ModelWeights struct {
-	Layers        []LayerWeights
-	Embed         []float32 // [vocab, dim] row-major
-	ResidLambdas  []float32 // [NLayers] per-layer residual scale
-	X0Lambdas     []float32 // [NLayers] per-layer x0 scale
-	SmearGate     []float32 // [Dim*Dim] linear projection for bigram gating
-	SmearLambda   []float32 // [1] scalar gate strength
-	BackoutLambda []float32 // [1] mid-layer residual subtraction strength
-	SharedCL      bool
+	Config   ModelConfig
+	Layers   []LayerWeights
+	RMSFinal []float32
+	Embed    []float32 // [vocab, dim] row-major
+	SharedCL bool
+
+	// FP16 compressed weights for memory-bandwidth-bound inference.
+	// When non-nil, these are used instead of the fp32 Layers for matmuls.
+	FP16Layers []LayerWeightsFP16
+	EmbedFP16  []uint16 // [vocab*dim] fp16
 }
 
+// LayerWeightsFP16 holds per-layer weight matrices in fp16 (uint16).
+// RMS norm weights remain in fp32 since they are tiny.
+type LayerWeightsFP16 struct {
+	Wq, Wk, Wv, Wo []uint16
+	W1, W2, W3     []uint16
+	RMSAtt, RMSFFN []float32 // kept in fp32 (tiny)
+}
+
+// NewModelWeights allocates weights for the legacy 110M model.
 func NewModelWeights(vocab int) *ModelWeights {
+	cfg := DefaultConfig()
+	cfg.Vocab = vocab
+	return NewModelWeightsFromConfig(cfg)
+}
+
+// NewModelWeightsFromConfig allocates weights for an arbitrary model config.
+func NewModelWeightsFromConfig(cfg ModelConfig) *ModelWeights {
 	mw := &ModelWeights{
-		Layers:        make([]LayerWeights, NLayers),
-		Embed:         make([]float32, vocab*Dim),
-		ResidLambdas:  make([]float32, NLayers),
-		X0Lambdas:     make([]float32, NLayers),
-		SmearGate:     make([]float32, Dim*Dim),
-		SmearLambda:   make([]float32, 1),
-		BackoutLambda: make([]float32, 1),
-		SharedCL:      true,
+		Config:   cfg,
+		Layers:   make([]LayerWeights, cfg.NLayers),
+		RMSFinal: make([]float32, cfg.Dim),
+		Embed:    make([]float32, cfg.Vocab*cfg.Dim),
+		SharedCL: true,
 	}
 	for i := range mw.Layers {
-		lw := LayerWeights{
-			Wq: make([]float32, WQSize),
-			Wk: make([]float32, WQSize),
-			Wv: make([]float32, WQSize),
-			Wo: make([]float32, WOSize),
-			W1: make([]float32, W1Size),
-			W2: make([]float32, W2Size),
+		mw.Layers[i] = LayerWeights{
+			Wq:     make([]float32, cfg.WqSize()),
+			Wk:     make([]float32, cfg.WkSize()),
+			Wv:     make([]float32, cfg.WvSize()),
+			Wo:     make([]float32, cfg.WoSize()),
+			W1:     make([]float32, cfg.W1Size()),
+			W2:     make([]float32, cfg.W2Size()),
+			W3:     make([]float32, cfg.W3Size()),
+			RMSAtt: make([]float32, cfg.Dim),
+			RMSFFN: make([]float32, cfg.Dim),
 		}
-		if IsVELayer(i) {
-			lw.VEEmbed = make([]float32, VEEmbedSize(vocab))
-			lw.VEGate = make([]float32, VEGateSize())
-		}
-		mw.Layers[i] = lw
 	}
 	return mw
 }
 
+// LoadPretrainedAny loads a .bin pretrained model with any architecture.
+// Returns the model weights with the Config field populated from the file header.
+//
+// For models where head_dim != dim/heads (e.g., Qwen3), the file size is used
+// to detect the actual head_dim after reading the 7-field Llama2Config header.
+func LoadPretrainedAny(path string) (*ModelWeights, ModelConfig, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, ModelConfig{}, err
+	}
+	defer f.Close()
+
+	var hdr Llama2Config
+	if err := binary.Read(f, binary.LittleEndian, &hdr); err != nil {
+		return nil, ModelConfig{}, fmt.Errorf("read config: %w", err)
+	}
+	cfg := ConfigFromLlama2(hdr)
+
+	// Detect explicit head_dim by checking file size.
+	// The Llama2 header assumes head_dim = dim/heads, but models like Qwen3
+	// have an explicit head_dim (e.g., 128) that differs from dim/heads (e.g., 64).
+	// We detect this by comparing the expected file size against the actual size.
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, cfg, fmt.Errorf("stat model file: %w", err)
+	}
+	fileSize := fi.Size()
+	expectedSize := pretrainedFileSize(cfg)
+	if fileSize != expectedSize && cfg.Heads > 0 {
+		// Try doubling head_dim (common pattern: Qwen3 uses 2x head_dim).
+		cfg2 := cfg
+		cfg2.HeadDimOvr = (cfg.Dim / cfg.Heads) * 2
+		if pretrainedFileSize(cfg2) == fileSize {
+			cfg = cfg2
+		} else {
+			// Brute-force search for head_dim that matches file size.
+			for hd := cfg.Dim / cfg.Heads; hd <= cfg.Dim; hd++ {
+				cfg2.HeadDimOvr = hd
+				if pretrainedFileSize(cfg2) == fileSize {
+					cfg = cfg2
+					break
+				}
+			}
+		}
+	}
+
+	mw := NewModelWeightsFromConfig(cfg)
+	mw.SharedCL = hdr.VocabSize > 0
+
+	if err := readPretrainedWeights(f, mw); err != nil {
+		return nil, cfg, err
+	}
+	return mw, cfg, nil
+}
+
+// pretrainedFileSize returns the expected .bin file size for a given config.
+func pretrainedFileSize(cfg ModelConfig) int64 {
+	const headerBytes = 7 * 4 // Llama2Config: 7 x int32
+	perLayer := cfg.WqSize() + cfg.WkSize() + cfg.WvSize() + cfg.WoSize() +
+		cfg.W1Size() + cfg.W2Size() + cfg.W3Size() + cfg.Dim*2
+	total := headerBytes + (cfg.Vocab*cfg.Dim + cfg.NLayers*perLayer + cfg.Dim) * 4
+	return int64(total)
+}
+
+// readPretrainedWeights reads weight data from a .bin file into pre-allocated ModelWeights.
+func readPretrainedWeights(f *os.File, mw *ModelWeights) error {
+	if err := readF32s(f, mw.Embed); err != nil {
+		return fmt.Errorf("read embed: %w", err)
+	}
+	for i := range mw.Layers {
+		if err := readF32s(f, mw.Layers[i].RMSAtt); err != nil {
+			return fmt.Errorf("read rms_att[%d]: %w", i, err)
+		}
+	}
+	for i := range mw.Layers {
+		if err := readF32s(f, mw.Layers[i].Wq); err != nil {
+			return fmt.Errorf("read wq[%d]: %w", i, err)
+		}
+	}
+	for i := range mw.Layers {
+		if err := readF32s(f, mw.Layers[i].Wk); err != nil {
+			return fmt.Errorf("read wk[%d]: %w", i, err)
+		}
+	}
+	for i := range mw.Layers {
+		if err := readF32s(f, mw.Layers[i].Wv); err != nil {
+			return fmt.Errorf("read wv[%d]: %w", i, err)
+		}
+	}
+	for i := range mw.Layers {
+		if err := readF32s(f, mw.Layers[i].Wo); err != nil {
+			return fmt.Errorf("read wo[%d]: %w", i, err)
+		}
+	}
+	for i := range mw.Layers {
+		if err := readF32s(f, mw.Layers[i].RMSFFN); err != nil {
+			return fmt.Errorf("read rms_ffn[%d]: %w", i, err)
+		}
+	}
+	for i := range mw.Layers {
+		if err := readF32s(f, mw.Layers[i].W1); err != nil {
+			return fmt.Errorf("read w1[%d]: %w", i, err)
+		}
+	}
+	for i := range mw.Layers {
+		if err := readF32s(f, mw.Layers[i].W2); err != nil {
+			return fmt.Errorf("read w2[%d]: %w", i, err)
+		}
+	}
+	for i := range mw.Layers {
+		if err := readF32s(f, mw.Layers[i].W3); err != nil {
+			return fmt.Errorf("read w3[%d]: %w", i, err)
+		}
+	}
+	if err := readF32s(f, mw.RMSFinal); err != nil {
+		return fmt.Errorf("read rms_final: %w", err)
+	}
+	return nil
+}
+
+// LoadPretrained loads a .bin pretrained model, validating it matches the legacy 110M config.
 func LoadPretrained(path string) (*ModelWeights, Llama2Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -94,11 +216,9 @@ func LoadPretrained(path string) (*ModelWeights, Llama2Config, error) {
 	if err := readF32s(f, mw.Embed); err != nil {
 		return nil, cfg, fmt.Errorf("read embed: %w", err)
 	}
-	// Old Llama2 format has RMSAtt weights; skip them.
-	skip := make([]float32, Dim)
 	for i := range mw.Layers {
-		if err := readF32s(f, skip); err != nil {
-			return nil, cfg, fmt.Errorf("skip rms_att[%d]: %w", i, err)
+		if err := readF32s(f, mw.Layers[i].RMSAtt); err != nil {
+			return nil, cfg, fmt.Errorf("read rms_att[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
@@ -121,10 +241,9 @@ func LoadPretrained(path string) (*ModelWeights, Llama2Config, error) {
 			return nil, cfg, fmt.Errorf("read wo[%d]: %w", i, err)
 		}
 	}
-	// Old Llama2 format has RMSFFN weights; skip them.
 	for i := range mw.Layers {
-		if err := readF32s(f, skip); err != nil {
-			return nil, cfg, fmt.Errorf("skip rms_ffn[%d]: %w", i, err)
+		if err := readF32s(f, mw.Layers[i].RMSFFN); err != nil {
+			return nil, cfg, fmt.Errorf("read rms_ffn[%d]: %w", i, err)
 		}
 	}
 	for i := range mw.Layers {
@@ -137,69 +256,53 @@ func LoadPretrained(path string) (*ModelWeights, Llama2Config, error) {
 			return nil, cfg, fmt.Errorf("read w2[%d]: %w", i, err)
 		}
 	}
-	// Old Llama2 format has W3; skip it.
 	for i := range mw.Layers {
-		skip := make([]float32, W1Size)
-		if err := readF32s(f, skip); err != nil {
-			return nil, cfg, fmt.Errorf("skip w3[%d]: %w", i, err)
+		if err := readF32s(f, mw.Layers[i].W3); err != nil {
+			return nil, cfg, fmt.Errorf("read w3[%d]: %w", i, err)
 		}
 	}
-	// Old Llama2 format has RMSFinal weight; skip it.
-	if err := readF32s(f, skip); err != nil {
-		return nil, cfg, fmt.Errorf("skip rms_final: %w", err)
+	if err := readF32s(f, mw.RMSFinal); err != nil {
+		return nil, cfg, fmt.Errorf("read rms_final: %w", err)
 	}
-	initLambdasDefault(mw)
 	return mw, cfg, nil
 }
 
-func initLambdasDefault(mw *ModelWeights) {
-	for i := range mw.ResidLambdas {
-		mw.ResidLambdas[i] = 1.0
-	}
-	// X0Lambdas default to 0 (already zero-valued).
-	mw.SmearLambda[0] = 0
-	mw.BackoutLambda[0] = 0
-}
-
 func RandomInit(mw *ModelWeights, seed int64) {
+	cfg := mw.Config
 	r := rand.New(rand.NewSource(seed))
-	scaleD := float32(1.0 / math.Sqrt(Dim))
+	scaleD := float32(1.0 / math.Sqrt(float64(cfg.Dim)))
+	scaleH := float32(1.0 / math.Sqrt(float64(cfg.Hidden)))
 	for i := range mw.Layers {
-		s := float32(math.Pow(3, 0.5)) * scaleD // nanochat: 3^0.5 * dim^-0.5
 		for j := range mw.Layers[i].Wq {
-			mw.Layers[i].Wq[j] = s * (2*float32(r.Float64()) - 1)
-			mw.Layers[i].Wk[j] = s * (2*float32(r.Float64()) - 1)
-			mw.Layers[i].Wv[j] = s * (2*float32(r.Float64()) - 1)
+			mw.Layers[i].Wq[j] = scaleD * (2*float32(r.Float64()) - 1)
 		}
-		// Wo zero-init (nanochat: output projections start at zero)
+		for j := range mw.Layers[i].Wk {
+			mw.Layers[i].Wk[j] = scaleD * (2*float32(r.Float64()) - 1)
+		}
+		for j := range mw.Layers[i].Wv {
+			mw.Layers[i].Wv[j] = scaleD * (2*float32(r.Float64()) - 1)
+		}
+		for j := range mw.Layers[i].Wo {
+			mw.Layers[i].Wo[j] = scaleD * (2*float32(r.Float64()) - 1)
+		}
 		for j := range mw.Layers[i].W1 {
-			mw.Layers[i].W1[j] = s * (2*float32(r.Float64()) - 1)
+			mw.Layers[i].W1[j] = scaleH * (2*float32(r.Float64()) - 1)
+			mw.Layers[i].W3[j] = scaleH * (2*float32(r.Float64()) - 1)
 		}
-		// W2 zero-init (nanochat: FFN output projection starts at zero)
-		for j := range mw.Layers[i].VEEmbed {
-			mw.Layers[i].VEEmbed[j] = s * (2*float32(r.Float64()) - 1)
+		for j := range mw.Layers[i].W2 {
+			mw.Layers[i].W2[j] = scaleD * (2*float32(r.Float64()) - 1)
 		}
-		// VEGate: small positive init (nanochat: uniform 0..0.02)
-		for j := range mw.Layers[i].VEGate {
-			mw.Layers[i].VEGate[j] = 0.02 * float32(r.Float64())
+		for j := range mw.Layers[i].RMSAtt {
+			mw.Layers[i].RMSAtt[j] = 1
+			mw.Layers[i].RMSFFN[j] = 1
 		}
+	}
+	for i := range mw.RMSFinal {
+		mw.RMSFinal[i] = 1
 	}
 	for i := range mw.Embed {
-		mw.Embed[i] = float32(r.NormFloat64()) // nanochat: normal * 1.0
+		mw.Embed[i] = 0.02 * (2*float32(r.Float64()) - 1)
 	}
-	// ResidLambdas: uniform 1.0 (nanochat default)
-	for i := range mw.ResidLambdas {
-		mw.ResidLambdas[i] = 1.0
-	}
-	// X0Lambdas: uniform 0.1 (nanochat default)
-	for i := range mw.X0Lambdas {
-		mw.X0Lambdas[i] = 0.1
-	}
-	for i := range mw.SmearGate {
-		mw.SmearGate[i] = scaleD * (2*float32(r.Float64()) - 1)
-	}
-	mw.SmearLambda[0] = 0.01
-	mw.BackoutLambda[0] = 0.01
 }
 
 func readF32s(r io.Reader, dst []float32) error {
@@ -220,6 +323,36 @@ func readF32s(r io.Reader, dst []float32) error {
 		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[off : off+4]))
 	}
 	return nil
+}
+
+// CompressToFP16 populates FP16Layers and EmbedFP16 from the fp32 Layers.
+// This halves memory bandwidth for the KV-cached inference path.
+func (mw *ModelWeights) CompressToFP16() {
+	cfg := mw.Config
+	mw.FP16Layers = make([]LayerWeightsFP16, cfg.NLayers)
+	for i := range mw.Layers {
+		l := &mw.Layers[i]
+		mw.FP16Layers[i] = LayerWeightsFP16{
+			Wq:     convertSliceToFP16(l.Wq),
+			Wk:     convertSliceToFP16(l.Wk),
+			Wv:     convertSliceToFP16(l.Wv),
+			Wo:     convertSliceToFP16(l.Wo),
+			W1:     convertSliceToFP16(l.W1),
+			W2:     convertSliceToFP16(l.W2),
+			W3:     convertSliceToFP16(l.W3),
+			RMSAtt: l.RMSAtt,
+			RMSFFN: l.RMSFFN,
+		}
+	}
+	mw.EmbedFP16 = convertSliceToFP16(mw.Embed)
+}
+
+func convertSliceToFP16(src []float32) []uint16 {
+	dst := make([]uint16, len(src))
+	for i, v := range src {
+		dst[i] = xane.Float32ToFP16(v)
+	}
+	return dst
 }
 
 var nativeLittleEndian = func() bool {
