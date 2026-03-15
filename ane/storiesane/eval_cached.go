@@ -91,8 +91,6 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		e.cacheQKV = make([]float32, qDim+2*kvDim)
 		// Fused W1W3 buffer: [2*hidden] for one BLAS call instead of 2.
 		e.cacheH1H3 = make([]float32, 2*hidden)
-		// Pre-build fused weight matrices to avoid cold-start overhead.
-		e.ensureFusedWeights()
 		// Note: ANE dispatch overhead (~20ms/kernel) makes batch=1 ANE slower
 		// than CPU BLAS. ANE is only beneficial at batch>=32 or with fused
 		// multi-layer kernels. Keep CPU BLAS for single-token path.
@@ -155,39 +153,13 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		}
 		timings.RMSNorm += time.Since(tRMS)
 
-		// Fused QKV: one BLAS call instead of 3.
+		// Separate Q, K, V matmuls — avoids 15GB fused weight allocation for large models.
 		tQKV := time.Now()
-		qkvSize := (qDim + 2*kvDim) * dim
-		if useFP16 {
-			if e.fusedQKVFP16[li] == nil {
-				fp16L := e.mw.FP16Layers[li]
-				fused := make([]uint16, qkvSize)
-				copy(fused[0:], fp16L.Wq)
-				copy(fused[qDim*dim:], fp16L.Wk)
-				copy(fused[(qDim+kvDim)*dim:], fp16L.Wv)
-				e.fusedQKVFP16[li] = fused
-			}
-			tFP16 := time.Now()
-			convertFP16ToF32(e.fp16Scratch[:qkvSize], e.fusedQKVFP16[li])
-			timings.FP16Conv += time.Since(tFP16)
-			linearSingle(e.cacheQKV, e.fp16Scratch[:qkvSize], e.cacheXNorm, qDim+2*kvDim, dim)
-		} else {
-			if e.fusedQKVW == nil {
-				e.fusedQKVW = make([][]float32, cfg.NLayers)
-				e.fusedW1W3 = make([][]float32, cfg.NLayers)
-			}
-			if e.fusedQKVW[li] == nil {
-				fused := make([]float32, qkvSize)
-				copy(fused[0:], layer.Wq)
-				copy(fused[qDim*dim:], layer.Wk)
-				copy(fused[(qDim+kvDim)*dim:], layer.Wv)
-				e.fusedQKVW[li] = fused
-			}
-			linearSingle(e.cacheQKV, e.fusedQKVW[li], e.cacheXNorm, qDim+2*kvDim, dim)
-		}
+		linearSingle(e.cacheQKV[:qDim], layer.Wq, e.cacheXNorm, qDim, dim)
+		linearSingle(e.cacheQKV[qDim:qDim+kvDim], layer.Wk, e.cacheXNorm, kvDim, dim)
+		linearSingle(e.cacheQKV[qDim+kvDim:qDim+2*kvDim], layer.Wv, e.cacheXNorm, kvDim, dim)
 		timings.QKV += time.Since(tQKV)
 
-		// Use slices directly from fused output to avoid copies.
 		fusedQ := e.cacheQKV[:qDim]
 		fusedK := e.cacheQKV[qDim : qDim+kvDim]
 		fusedV := e.cacheQKV[qDim+kvDim:]
@@ -235,43 +207,12 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		}
 		timings.RMSNorm += time.Since(tRMS)
 
+		// Separate W1, W3 matmuls — avoids fused weight allocation.
 		tFFN := time.Now()
-		w1w3Size := 2 * hidden * dim
-		if useFP16 {
-			if e.fusedW1W3FP16[li] == nil {
-				fp16L := e.mw.FP16Layers[li]
-				fused := make([]uint16, w1w3Size)
-				copy(fused[0:], fp16L.W1)
-				copy(fused[hidden*dim:], fp16L.W3)
-				e.fusedW1W3FP16[li] = fused
-			}
-			tFP16 := time.Now()
-			convertFP16ToF32(e.fp16Scratch[:w1w3Size], e.fusedW1W3FP16[li])
-			timings.FP16Conv += time.Since(tFP16)
-			linearSingle(e.cacheH1H3, e.fp16Scratch[:w1w3Size], e.cacheXNorm, 2*hidden, dim)
-		} else {
-			if e.fusedW1W3 == nil {
-				e.fusedW1W3 = make([][]float32, cfg.NLayers)
-			}
-			if e.fusedW1W3[li] == nil {
-				fused := make([]float32, w1w3Size)
-				copy(fused[0:], layer.W1)
-				copy(fused[hidden*dim:], layer.W3)
-				e.fusedW1W3[li] = fused
-			}
-			linearSingle(e.cacheH1H3, e.fusedW1W3[li], e.cacheXNorm, 2*hidden, dim)
-		}
+		linearSingle(e.cacheH1H3[:hidden], layer.W1, e.cacheXNorm, hidden, dim)
+		linearSingle(e.cacheH1H3[hidden:], layer.W3, e.cacheXNorm, hidden, dim)
 		siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
-
-		if useFP16 {
-			w2Size := dim * hidden
-			tFP16 := time.Now()
-			convertFP16ToF32(e.fp16Scratch[:w2Size], e.mw.FP16Layers[li].W2)
-			timings.FP16Conv += time.Since(tFP16)
-			linearSingle(e.cacheFFOut, e.fp16Scratch[:w2Size], e.cacheGate, dim, hidden)
-		} else {
-			linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
-		}
+		linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
 		timings.FFN += time.Since(tFFN)
 
 		tRes = time.Now()

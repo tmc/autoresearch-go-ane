@@ -264,7 +264,7 @@ func linearSingleGEMV(out, weights, x []float32, outDim, inDim int) bool {
 		return false
 	}
 	// For large matmuls, parallel split is ~40% faster than single sgemv.
-	const splitThreshold = 4096
+	const splitThreshold = 2048
 	const nSplit = 4
 	if outDim > splitThreshold {
 		chunk := outDim / nSplit
