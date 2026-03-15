@@ -783,23 +783,6 @@ func (e *Engine) ensureLayers() error {
 		return e.layerInitErr
 	}
 	e.layers = layers
-	// Pre-scale Wo and W2 weights for inference (eliminates CPU residual blending).
-	for i, lf := range e.layers {
-		if lf != nil && lf.dynamic {
-			layer := e.mw.Layers[i]
-			_ = lf.PreScaleForInference(layerForwardWeights{
-				RMSAtt: layer.RMSAtt,
-				Wq:     layer.Wq,
-				Wk:     layer.Wk,
-				Wv:     layer.Wv,
-				Wo:     layer.Wo,
-				RMSFFN: layer.RMSFFN,
-				W1:     layer.W1,
-				W2:     layer.W2,
-				W3:     layer.W3,
-			})
-		}
-	}
 	return nil
 }
 
@@ -809,7 +792,12 @@ func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
 	cur := e.x
 	next := e.tmpHidden
 	for i := range e.layers {
-		if err := e.layers[i].run(next, cur); err != nil {
+		lf := e.layers[i]
+		if lf != nil && lf.dynamic {
+			if err := lf.runDynamicInferPipelined(next, cur, i, e.layers); err != nil {
+				return fmt.Errorf("storiesane eval logits: layer %d: %w", i, err)
+			}
+		} else if err := lf.run(next, cur); err != nil {
 			return fmt.Errorf("storiesane eval logits: layer %d: %w", i, err)
 		}
 		cur, next = next, cur
