@@ -103,7 +103,7 @@ func (t *HFTokenizer) DecodeTokens(ids []int) string {
 // Encode tokenizes text into token IDs using the Python tokenizer.
 // This shells out to Python for encoding, which is slower but correct.
 // For batch encoding (prompt at startup), this is acceptable.
-func (t *HFTokenizer) Encode(text string) ([]uint16, error) {
+func (t *HFTokenizer) Encode(text string) ([]int32, error) {
 	if t.modelID == "" {
 		return nil, fmt.Errorf("hf tokenizer: model ID not set, call SetModelID first")
 	}
@@ -117,7 +117,7 @@ func (t *HFTokenizer) Encode(text string) ([]uint16, error) {
 	}
 
 	parts := strings.Split(strings.TrimSpace(string(out)), ",")
-	tokens := make([]uint16, 0, len(parts))
+	tokens := make([]int32, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -127,7 +127,7 @@ func (t *HFTokenizer) Encode(text string) ([]uint16, error) {
 		if err != nil {
 			return nil, fmt.Errorf("hf tokenizer encode: parse token %q: %w", p, err)
 		}
-		tokens = append(tokens, uint16(v))
+		tokens = append(tokens, int32(v))
 	}
 	return tokens, nil
 }

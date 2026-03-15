@@ -13,7 +13,7 @@ import (
 // Options configures a pure-Go Stories training engine over .bin weights.
 type Options struct {
 	ModelPath         string
-	Tokens            []uint16
+	Tokens            []int32
 	Seq               int
 	AccumSteps        int
 	LR                float32
@@ -70,7 +70,7 @@ type Engine struct {
 	opt *stories.OptimState
 	off *offload
 
-	tokens            []uint16
+	tokens            []int32
 	seq               int
 	accumSteps        int
 	lr                float32
@@ -425,7 +425,7 @@ func (e *Engine) Step() (StepResult, error) {
 // The tokens slice must have length equal to the engine sequence length.
 // It uses ANE layer kernels when available and falls back to the CPU path
 // otherwise.
-func (e *Engine) EvalLogits(tokens []uint16) ([]float32, error) {
+func (e *Engine) EvalLogits(tokens []int32) ([]float32, error) {
 	if e == nil || e.mw == nil {
 		return nil, fmt.Errorf("storiesane eval logits: engine is closed")
 	}
@@ -820,7 +820,7 @@ func (e *Engine) nextFloat64() float64 {
 	return float64(e.rng) / float64(uint64(1)<<48)
 }
 
-func (e *Engine) evalLogitsInto(tokens []uint16, logits []float32) error {
+func (e *Engine) evalLogitsInto(tokens []int32, logits []float32) error {
 	if len(logits) != e.cfg.Vocab*e.seq {
 		return fmt.Errorf("storiesane eval logits: logits len=%d want=%d", len(logits), e.cfg.Vocab*e.seq)
 	}
@@ -915,7 +915,7 @@ func (e *Engine) ensureInferLayers() error {
 	return nil
 }
 
-func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
+func (e *Engine) evalLogitsANEInto(tokens []int32, logits []float32) error {
 	dim := e.cfg.Dim
 	vocab := e.cfg.Vocab
 	e.ensureOffload()
@@ -961,7 +961,7 @@ func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
 	return nil
 }
 
-func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
+func (e *Engine) evalLogitsCPUInto(tokens []int32, logits []float32) error {
 	dim := e.cfg.Dim
 	qDim := e.cfg.QDim()
 	kvDim := e.cfg.KVDim()

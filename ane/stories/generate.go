@@ -11,7 +11,7 @@ type GenerateOptions struct {
 	MaxTokens  int       // maximum number of tokens to generate (excluding prompt)
 	Temperature float32  // sampling temperature; 0 = greedy argmax
 	TopP       float32   // nucleus sampling threshold; 0 = disabled
-	StopTokens []uint16  // tokens that end generation (e.g., EOS)
+	StopTokens []int32   // tokens that end generation (e.g., EOS)
 }
 
 // SampleToken samples a single token from logits using the specified strategy.
@@ -19,7 +19,7 @@ type GenerateOptions struct {
 // If temp == 0: greedy argmax.
 // If topP > 0: nucleus (top-p) sampling after temperature scaling.
 // Otherwise: temperature-scaled softmax sampling.
-func SampleToken(logits []float32, vocab int, temp float32, topP float32, rng *rand.Rand) uint16 {
+func SampleToken(logits []float32, vocab int, temp float32, topP float32, rng *rand.Rand) int32 {
 	if vocab <= 0 {
 		return 0
 	}
@@ -37,7 +37,7 @@ func SampleToken(logits []float32, vocab int, temp float32, topP float32, rng *r
 				best = i
 			}
 		}
-		return uint16(best)
+		return int32(best)
 	}
 
 	// Compute temperature-scaled log-probabilities.
@@ -64,10 +64,10 @@ func SampleToken(logits []float32, vocab int, temp float32, topP float32, rng *r
 	for i := 0; i < vocab; i++ {
 		acc += math.Exp((float64(logits[i]) - float64(maxVal)) * invT)
 		if acc >= target {
-			return uint16(i)
+			return int32(i)
 		}
 	}
-	return uint16(vocab - 1)
+	return int32(vocab - 1)
 }
 
 // tokenProb pairs a token index with its probability for sorting.
@@ -76,7 +76,7 @@ type tokenProb struct {
 	prob float64
 }
 
-func sampleNucleus(logits []float32, vocab int, maxVal float32, invT float64, topP float32, rng *rand.Rand) uint16 {
+func sampleNucleus(logits []float32, vocab int, maxVal float32, invT float64, topP float32, rng *rand.Rand) int32 {
 	// Build probability distribution.
 	probs := make([]tokenProb, vocab)
 	total := 0.0
@@ -118,10 +118,10 @@ func sampleNucleus(logits []float32, vocab int, maxVal float32, invT float64, to
 	for i := 0; i < cutoff; i++ {
 		acc += probs[i].prob
 		if acc >= target {
-			return uint16(probs[i].idx)
+			return int32(probs[i].idx)
 		}
 	}
-	return uint16(probs[cutoff-1].idx)
+	return int32(probs[cutoff-1].idx)
 }
 
 // TopKLogits returns a copy of logits with all entries outside the top-k set to -Inf.

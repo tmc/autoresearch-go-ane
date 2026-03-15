@@ -197,7 +197,7 @@ func main() {
 
 // --- token loading ---
 
-func loadTokens(path string) ([]uint16, error) {
+func loadTokens(path string) ([]int32, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read tokens: %w", err)
@@ -206,9 +206,9 @@ func loadTokens(path string) ([]uint16, error) {
 		return nil, fmt.Errorf("read tokens: file size %d is not even", len(data))
 	}
 	n := len(data) / 2
-	tokens := make([]uint16, n)
+	tokens := make([]int32, n)
 	for i := range tokens {
-		tokens[i] = binary.LittleEndian.Uint16(data[i*2:])
+		tokens[i] = int32(binary.LittleEndian.Uint16(data[i*2:]))
 	}
 	return tokens, nil
 }
@@ -220,7 +220,7 @@ const (
 	evalSeqLen = 256
 )
 
-func evalLoss(engine *storiesane.Engine, tokens []uint16) (float64, error) {
+func evalLoss(engine *storiesane.Engine, tokens []int32) (float64, error) {
 	if len(tokens) < evalTokens+evalSeqLen {
 		return 0, fmt.Errorf("eval: need at least %d tokens, got %d", evalTokens+evalSeqLen, len(tokens))
 	}

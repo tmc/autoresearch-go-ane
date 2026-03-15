@@ -12,7 +12,7 @@ import (
 
 var (
 	testEngine *storiesane.Engine
-	testTokens []uint16
+	testTokens []int32
 )
 
 func TestMain(m *testing.M) {
@@ -81,7 +81,7 @@ func BenchmarkStep(b *testing.B) {
 	tokensPerStep := int64(SequenceLength) * int64(AccumSteps)
 	var lastRes storiesane.StepResult
 
-	b.SetBytes(tokensPerStep * 2) // uint16 tokens
+	b.SetBytes(tokensPerStep * 4) // int32 tokens
 	b.ResetTimer()
 	for b.Loop() {
 		res, err := testEngine.Step()
@@ -108,7 +108,7 @@ func BenchmarkEvalLogits(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	b.SetBytes(int64(evalSeqLen) * 2)
+	b.SetBytes(int64(evalSeqLen) * 4)
 	b.ResetTimer()
 	for b.Loop() {
 		if _, err := testEngine.EvalLogits(window); err != nil {

@@ -31,7 +31,7 @@ const (
 
 const warmupFraction = 0.05
 
-func experimentConfig(modelPath string, tokens []uint16) storiesane.Options {
+func experimentConfig(modelPath string, tokens []int32) storiesane.Options {
 	return storiesane.Options{
 		ModelPath:      modelPath,
 		Tokens:         tokens,

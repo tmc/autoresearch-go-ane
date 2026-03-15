@@ -377,7 +377,7 @@ func (e *Engine) disableLayerForward(err error) {
 	e.layerInitErr = err
 }
 
-func (e *Engine) forwardTraining(input []uint16) ([]float32, error) {
+func (e *Engine) forwardTraining(input []int32) ([]float32, error) {
 	// Wait for any pending async weight refresh before reading kernels.
 	e.waitAsyncRefresh()
 	if e.useANE && e.ensureLayers() == nil {
@@ -390,7 +390,7 @@ func (e *Engine) forwardTraining(input []uint16) ([]float32, error) {
 	return e.forwardTrainingCPU(input), nil
 }
 
-func (e *Engine) forwardTrainingCPU(input []uint16) []float32 {
+func (e *Engine) forwardTrainingCPU(input []int32) []float32 {
 	stories.EmbedLookup(e.x, e.mw.Embed, input, stories.Dim, e.seq)
 	cur := e.x
 	next := e.tmpHidden
@@ -422,7 +422,7 @@ func (e *Engine) forwardTrainingCPU(input []uint16) []float32 {
 	return cur
 }
 
-func (e *Engine) forwardTrainingANE(input []uint16) ([]float32, error) {
+func (e *Engine) forwardTrainingANE(input []int32) ([]float32, error) {
 	stories.EmbedLookup(e.x, e.mw.Embed, input, stories.Dim, e.seq)
 	cur := e.x
 	next := e.tmpHidden
@@ -437,7 +437,7 @@ func (e *Engine) forwardTrainingANE(input []uint16) ([]float32, error) {
 	return cur, nil
 }
 
-func (e *Engine) runFinalHead(finalHidden []float32, target []uint16) (float32, error) {
+func (e *Engine) runFinalHead(finalHidden []float32, target []int32) (float32, error) {
 	start := time.Now()
 	e.ensureOffload()
 	clear(e.gRMS)
@@ -655,7 +655,7 @@ func (e *Engine) backwardAttentionCPU(layer *stories.LayerWeights, cache *layerC
 }
 
 
-func (e *Engine) backwardAndUpdate(input []uint16) time.Duration {
+func (e *Engine) backwardAndUpdate(input []int32) time.Duration {
 	stepT := int(e.state.AdamT) + 1
 	useHybrid := false
 	if e.hybridBackwardRequested {
@@ -669,7 +669,7 @@ func (e *Engine) backwardAndUpdate(input []uint16) time.Duration {
 	return e.backwardAndApply(input, stepT, useHybrid)
 }
 
-func (e *Engine) backwardAndAccumulate(input []uint16, useHybrid bool) time.Duration {
+func (e *Engine) backwardAndAccumulate(input []int32, useHybrid bool) time.Duration {
 	dCur := e.dx
 	dPrev := e.gradPrev
 	for l := stories.NLayers - 1; l >= 0; l-- {
@@ -743,7 +743,7 @@ func (e *Engine) backwardAndAccumulate(input []uint16, useHybrid bool) time.Dura
 	return 0
 }
 
-func (e *Engine) backwardAndApply(input []uint16, stepT int, useHybrid bool) time.Duration {
+func (e *Engine) backwardAndApply(input []int32, stepT int, useHybrid bool) time.Duration {
 	dCur := e.dx
 	dPrev := e.gradPrev
 	for l := stories.NLayers - 1; l >= 0; l-- {

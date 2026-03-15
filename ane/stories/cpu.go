@@ -38,7 +38,7 @@ func parallelFor(n int, fn func(start, end int)) {
 	wg.Wait()
 }
 
-func EmbedLookup(out, embed []float32, tokens []uint16, dim, seq int) {
+func EmbedLookup(out, embed []float32, tokens []int32, dim, seq int) {
 	if dim <= 0 || seq <= 0 {
 		return
 	}
@@ -71,7 +71,7 @@ func EmbedLookup(out, embed []float32, tokens []uint16, dim, seq int) {
 	})
 }
 
-func EmbedBackward(dEmbed, dx []float32, tokens []uint16, dim, seq int) {
+func EmbedBackward(dEmbed, dx []float32, tokens []int32, dim, seq int) {
 	if dim <= 0 || seq <= 0 {
 		return
 	}
@@ -170,7 +170,7 @@ func rmsNormBackwardRange(dx, dw, dy, x, w []float32, d, s, start, end int) {
 	}
 }
 
-func CrossEntropyLoss(dLogits, logits []float32, targets []uint16, v, s int) float32 {
+func CrossEntropyLoss(dLogits, logits []float32, targets []int32, v, s int) float32 {
 	if v <= 0 || s <= 0 {
 		return 0
 	}

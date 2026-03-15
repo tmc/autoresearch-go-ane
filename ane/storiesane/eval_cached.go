@@ -25,7 +25,7 @@ func (e *Engine) ResetCache() {
 // per-token cost from O(n*seq) to O(n) where n is the model width.
 //
 // Returns the vocab-sized logits for the new token's position.
-func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
+func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 	if e == nil || e.mw == nil {
 		return nil, fmt.Errorf("storiesane eval next token: engine is closed")
 	}
@@ -158,7 +158,7 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 
 // EvalPrefill processes a full prompt through EvalNextToken, populating the
 // KV cache. It returns the logits for the last prompt position.
-func (e *Engine) EvalPrefill(tokens []uint16) ([]float32, error) {
+func (e *Engine) EvalPrefill(tokens []int32) ([]float32, error) {
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("storiesane eval prefill: empty prompt")
 	}

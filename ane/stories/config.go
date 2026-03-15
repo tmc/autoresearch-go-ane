@@ -138,7 +138,7 @@ func (c ModelConfig) EffectiveSeq() int {
 func Qwen3_4BConfig() ModelConfig {
 	return ModelConfig{
 		Dim:        2560,
-		Hidden:     6912,
+		Hidden:     9728,
 		Heads:      32,
 		KVHeads:    8,
 		NLayers:    36,

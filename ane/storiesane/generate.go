@@ -9,7 +9,7 @@ import (
 
 // GenerateCallback is called after each generated token.
 // Return false to stop generation early.
-type GenerateCallback func(token uint16, step int) bool
+type GenerateCallback func(token int32, step int) bool
 
 // Generate runs autoregressive decoding using KV-cached incremental evaluation.
 // It returns the full token sequence (prompt + generated).
@@ -17,9 +17,9 @@ type GenerateCallback func(token uint16, step int) bool
 // The engine has a fixed sequence length (e.seq). The prompt is prefilled
 // through the KV cache, then each new token is generated in O(n) time
 // instead of O(n*seq) full-sequence recomputation.
-func Generate(e *Engine, prompt []uint16, opts stories.GenerateOptions) ([]uint16, error) {
-	var result []uint16
-	err := GenerateStream(e, prompt, opts, func(token uint16, step int) bool {
+func Generate(e *Engine, prompt []int32, opts stories.GenerateOptions) ([]int32, error) {
+	var result []int32
+	err := GenerateStream(e, prompt, opts, func(token int32, step int) bool {
 		result = append(result, token)
 		return true
 	})
@@ -27,7 +27,7 @@ func Generate(e *Engine, prompt []uint16, opts stories.GenerateOptions) ([]uint1
 		return nil, err
 	}
 	// Prepend prompt to match expected output (prompt + generated).
-	out := make([]uint16, 0, len(prompt)+len(result))
+	out := make([]int32, 0, len(prompt)+len(result))
 	out = append(out, prompt...)
 	out = append(out, result...)
 	return out, nil
@@ -38,7 +38,7 @@ func Generate(e *Engine, prompt []uint16, opts stories.GenerateOptions) ([]uint1
 //
 // The KV cache is reset at the start of each call, then the prompt is
 // prefilled. Each subsequent token is generated incrementally.
-func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb GenerateCallback) error {
+func GenerateStream(e *Engine, prompt []int32, opts stories.GenerateOptions, cb GenerateCallback) error {
 	if e == nil || e.mw == nil {
 		return fmt.Errorf("storiesane generate: engine is closed")
 	}
@@ -59,7 +59,7 @@ func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb
 	}
 
 	// Build the stop-token set for fast lookup.
-	stopSet := make(map[uint16]bool, len(opts.StopTokens))
+	stopSet := make(map[int32]bool, len(opts.StopTokens))
 	for _, t := range opts.StopTokens {
 		stopSet[t] = true
 	}
@@ -68,10 +68,10 @@ func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb
 	rng := rand.New(rand.NewSource(e.seed))
 
 	// Prepare prompt tokens.
-	promptToks := make([]uint16, len(prompt))
+	promptToks := make([]int32, len(prompt))
 	copy(promptToks, prompt)
 	if len(promptToks) == 0 {
-		promptToks = []uint16{storiesBOS}
+		promptToks = []int32{storiesBOS}
 	}
 
 	// Truncate prompt if it exceeds sequence length (leave room for at least 1 generated token).
@@ -134,7 +134,7 @@ func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb
 // GenerateStreamNocache runs autoregressive decoding using full-sequence
 // recomputation (no KV cache). This is the legacy O(n^2) path, kept for
 // correctness testing.
-func GenerateStreamNocache(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb GenerateCallback) error {
+func GenerateStreamNocache(e *Engine, prompt []int32, opts stories.GenerateOptions, cb GenerateCallback) error {
 	if e == nil || e.mw == nil {
 		return fmt.Errorf("storiesane generate: engine is closed")
 	}
@@ -154,23 +154,23 @@ func GenerateStreamNocache(e *Engine, prompt []uint16, opts stories.GenerateOpti
 		temp = 0
 	}
 
-	stopSet := make(map[uint16]bool, len(opts.StopTokens))
+	stopSet := make(map[int32]bool, len(opts.StopTokens))
 	for _, t := range opts.StopTokens {
 		stopSet[t] = true
 	}
 
 	rng := rand.New(rand.NewSource(e.seed))
 
-	tokens := make([]uint16, len(prompt))
+	tokens := make([]int32, len(prompt))
 	copy(tokens, prompt)
 	if len(tokens) == 0 {
-		tokens = []uint16{storiesBOS}
+		tokens = []int32{storiesBOS}
 	}
 	if len(tokens) > seq {
 		tokens = tokens[len(tokens)-seq:]
 	}
 
-	window := make([]uint16, seq)
+	window := make([]int32, seq)
 	row := make([]float32, vocab)
 
 	for step := 0; step < maxTokens; step++ {
@@ -211,7 +211,7 @@ func GenerateStreamNocache(e *Engine, prompt []uint16, opts stories.GenerateOpti
 }
 
 // fillWindow places tokens right-aligned in dst, padding the left with BOS.
-func fillWindow(dst []uint16, tokens []uint16) {
+func fillWindow(dst []int32, tokens []int32) {
 	for i := range dst {
 		dst[i] = storiesBOS
 	}

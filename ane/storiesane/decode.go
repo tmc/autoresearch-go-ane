@@ -49,7 +49,7 @@ func (e *Engine) Decode(tok *stories.Tokenizer, opts stories.DecodeOptions) (sto
 	tokens := append([]int(nil), prompt...)
 	text := ""
 	stoppedOnEOS := false
-	window := make([]uint16, e.seq)
+	window := make([]int32, e.seq)
 	for step := 0; step < maxNew; step++ {
 		fillDecodeWindow(window, tokens)
 		logits, err := e.EvalLogits(window)
@@ -80,7 +80,7 @@ func (e *Engine) Decode(tok *stories.Tokenizer, opts stories.DecodeOptions) (sto
 	}, nil
 }
 
-func fillDecodeWindow(dst []uint16, tokens []int) {
+func fillDecodeWindow(dst []int32, tokens []int) {
 	for i := range dst {
 		dst[i] = storiesBOS
 	}
@@ -89,6 +89,6 @@ func fillDecodeWindow(dst []uint16, tokens []int) {
 	}
 	start := len(dst) - len(tokens)
 	for i, tok := range tokens {
-		dst[start+i] = uint16(tok)
+		dst[start+i] = int32(tok)
 	}
 }

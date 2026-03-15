@@ -5,13 +5,15 @@
 // Usage:
 //
 //	go run ./cmd/generate --model stories110M.bin --prompt "Once upon a time"
-//	go run ./cmd/generate --model qwen3-4b.bin --prompt "def fibonacci(n):" --max-tokens 128
+//	go run ./cmd/generate --model qwen3-0.6b.bin --hf-tokenizer ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/  --prompt "Once upon a time" --max-tokens 64
+//	go run ./cmd/generate --model qwen3-4b.bin --prompt "1,2,3" --raw --max-tokens 16
 package main
 
 import (
 	"flag"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,18 +23,28 @@ import (
 
 func main() {
 	modelPath := flag.String("model", "stories110M.bin", "path to model .bin file")
-	tokenizerPath := flag.String("tokenizer", "", "path to tokenizer.bin (optional, for TinyStories)")
+	tokenizerPath := flag.String("tokenizer", "", "path to tokenizer.bin (TinyStories)")
+	hfTokenizerDir := flag.String("hf-tokenizer", "", "path to HuggingFace model dir containing tokenizer.json")
+	hfModelID := flag.String("hf-model-id", "", "HuggingFace model ID for Python-backed encoding (e.g. Qwen/Qwen3-0.6B)")
 	prompt := flag.String("prompt", "Once upon a time", "input prompt text or comma-separated token IDs")
 	maxTokens := flag.Int("max-tokens", 64, "maximum tokens to generate")
 	temperature := flag.Float64("temperature", 0.8, "sampling temperature (0 = greedy)")
 	topP := flag.Float64("top-p", 0.9, "nucleus sampling threshold (0 = disabled)")
 	seqLen := flag.Int("seq", 256, "sequence length for the model")
 	useANE := flag.Bool("ane", true, "use Apple Neural Engine")
-	rawTokens := flag.Bool("raw", false, "treat --prompt as comma-separated uint16 token IDs")
+	rawTokens := flag.Bool("raw", false, "treat --prompt as comma-separated token IDs")
 	flag.Parse()
 
 	if *modelPath == "" {
 		log.Fatal("--model is required")
+	}
+
+	// Auto-detect HF tokenizer from model path if not specified.
+	if *hfTokenizerDir == "" && *tokenizerPath == "" && !*rawTokens {
+		// Try to find tokenizer.json near the model or in HF cache.
+		if dir := findHFTokenizerDir(*modelPath); dir != "" {
+			*hfTokenizerDir = dir
+		}
 	}
 
 	log.Printf("loading model from %s...", *modelPath)
@@ -55,49 +67,81 @@ func main() {
 		time.Since(t0).Round(time.Millisecond),
 		cfg.Dim, cfg.Hidden, cfg.Heads, cfg.EffectiveKVHeads(), cfg.NLayers, cfg.Vocab)
 
+	// Load HF tokenizer if available.
+	var hfTok *stories.HFTokenizer
+	if *hfTokenizerDir != "" {
+		// Expand glob in path (for ~/.cache/huggingface/hub/models--*/snapshots/*/)
+		matches, _ := filepath.Glob(*hfTokenizerDir)
+		dir := *hfTokenizerDir
+		if len(matches) > 0 {
+			dir = matches[0]
+		}
+		var tokErr error
+		hfTok, tokErr = stories.LoadHFTokenizer(dir)
+		if tokErr != nil {
+			log.Printf("warning: failed to load HF tokenizer from %s: %v", dir, tokErr)
+		} else {
+			log.Printf("loaded HF tokenizer: vocab=%d", hfTok.VocabSize())
+			if *hfModelID != "" {
+				hfTok.SetModelID(*hfModelID)
+			}
+		}
+	}
+
 	// Build prompt tokens.
-	var promptTokens []uint16
+	var promptTokens []int32
 	if *rawTokens {
 		promptTokens = parseRawTokens(*prompt)
+	} else if hfTok != nil && *hfModelID != "" {
+		// Use Python-backed encoding for the prompt (one-shot, acceptable latency).
+		promptTokens, err = hfTok.Encode(*prompt)
+		if err != nil {
+			log.Fatalf("encode prompt: %v", err)
+		}
 	} else if *tokenizerPath != "" {
 		tok, err := stories.LoadTokenizer(*tokenizerPath)
 		if err != nil {
 			log.Fatalf("load tokenizer: %v", err)
 		}
-		// Simple character-level encoding for TinyStories tokenizer.
-		promptTokens = encodeWithTokenizer(tok, *prompt)
+		_ = tok
+		promptTokens = byteEncode(*prompt)
 	} else {
-		// Fall back to byte-level encoding: each byte becomes a token.
-		// This works reasonably for models with byte-level vocabularies.
 		promptTokens = byteEncode(*prompt)
 	}
 
 	if len(promptTokens) == 0 {
-		promptTokens = []uint16{1} // BOS
+		promptTokens = []int32{1} // BOS
 	}
 
 	log.Printf("prompt: %d tokens", len(promptTokens))
 
-	// Print prompt tokens as context.
-	if *tokenizerPath != "" {
-		fmt.Print(*prompt)
+	// Print the prompt first.
+	fmt.Print(*prompt)
+
+	// Set EOS token based on model vocab size.
+	eosToken := int32(2) // default for TinyStories
+	if cfg.Vocab > 32000 {
+		// Qwen3 EOS token ID is 151645.
+		eosToken = 151645
 	}
 
 	genOpts := stories.GenerateOptions{
 		MaxTokens:   *maxTokens,
 		Temperature: float32(*temperature),
 		TopP:        float32(*topP),
-		StopTokens:  []uint16{2}, // EOS
+		StopTokens:  []int32{eosToken},
 	}
 
 	generated := 0
 	genStart := time.Now()
 
-	err = storiesane.GenerateStream(engine, promptTokens, genOpts, func(token uint16, step int) bool {
+	err = storiesane.GenerateStream(engine, promptTokens, genOpts, func(token int32, step int) bool {
 		generated++
 
-		if *tokenizerPath != "" {
-			// Use tokenizer to decode.
+		if hfTok != nil {
+			// Go-native decoding — fast, no Python subprocess.
+			fmt.Print(hfTok.DecodeToken(int(token)))
+		} else if *tokenizerPath != "" {
 			tok, loadErr := stories.LoadTokenizer(*tokenizerPath)
 			if loadErr == nil {
 				fmt.Print(tok.Decode(int(token)))
@@ -105,7 +149,6 @@ func main() {
 				fmt.Printf("[%d]", token)
 			}
 		} else {
-			// Print raw token ID.
 			if token < 128 && token >= 32 {
 				fmt.Print(string(rune(token)))
 			} else {
@@ -126,41 +169,64 @@ func main() {
 }
 
 // parseRawTokens parses comma-separated token IDs.
-func parseRawTokens(s string) []uint16 {
+func parseRawTokens(s string) []int32 {
 	parts := strings.Split(s, ",")
-	tokens := make([]uint16, 0, len(parts))
+	tokens := make([]int32, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
 		var v int
-		if _, err := fmt.Sscanf(p, "%d", &v); err == nil && v >= 0 && v < 65536 {
-			tokens = append(tokens, uint16(v))
+		if _, err := fmt.Sscanf(p, "%d", &v); err == nil && v >= 0 {
+			tokens = append(tokens, int32(v))
 		}
 	}
 	return tokens
 }
 
 // byteEncode converts a string to token IDs using byte values.
-// This is a minimal fallback for models without a loaded tokenizer.
-func byteEncode(s string) []uint16 {
-	tokens := make([]uint16, 0, len(s)+1)
+func byteEncode(s string) []int32 {
+	tokens := make([]int32, 0, len(s)+1)
 	tokens = append(tokens, 1) // BOS
 	for _, b := range []byte(s) {
-		tokens = append(tokens, uint16(b))
+		tokens = append(tokens, int32(b))
 	}
 	return tokens
 }
 
-// encodeWithTokenizer does a simple greedy longest-match encode.
-// For proper encoding of Qwen3 etc., use the Python tokenizer wrapper.
-func encodeWithTokenizer(tok *stories.Tokenizer, text string) []uint16 {
-	// Simple: just use byte encoding as fallback for now.
-	// A real tokenizer would need BPE/SentencePiece logic.
-	_ = tok
-	return byteEncode(text)
-}
+// findHFTokenizerDir tries to locate a HuggingFace tokenizer directory
+// based on the model file name.
+func findHFTokenizerDir(modelPath string) string {
+	base := filepath.Base(modelPath)
+	base = strings.TrimSuffix(base, ".bin")
 
-// DecodeOptions is unused but reserved for future tokenizer config.
-type DecodeOptions struct{}
+	// Map common model names to HF model IDs.
+	nameMap := map[string]string{
+		"qwen3-0.6b": "Qwen--Qwen3-0.6B",
+		"qwen3-4b":   "Qwen--Qwen3-4B",
+	}
+
+	hfName, ok := nameMap[strings.ToLower(base)]
+	if !ok {
+		return ""
+	}
+
+	pattern := filepath.Join(
+		filepath.Dir(modelPath),
+		"..", ".cache", "huggingface", "hub",
+		"models--"+hfName, "snapshots", "*",
+	)
+	matches, _ := filepath.Glob(pattern)
+	if len(matches) > 0 {
+		return matches[0]
+	}
+
+	// Try home directory cache.
+	home, _ := filepath.Glob(filepath.Join("~", ".cache", "huggingface", "hub", "models--"+hfName, "snapshots", "*"))
+	if len(home) > 0 {
+		return home[0]
+	}
+
+	return ""
+}
