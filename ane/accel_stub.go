@@ -71,6 +71,12 @@ func accumLinearGrad3CFAccelerate(dW1, dy1, dW2, dy2, dW3, dy3, x []float32, out
 	return false
 }
 
+// --- linearCF BLAS ---
+
+func linearCFAccelerate(out, weights, in []float32, outCh, inCh, seq int) bool {
+	return false
+}
+
 // --- grad ops ---
 
 func sumSquaresGrad(v []float32) float64 {
