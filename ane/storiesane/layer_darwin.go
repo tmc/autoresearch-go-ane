@@ -215,7 +215,43 @@ func (lf *layerForward) run(out, x []float32) error {
 	if lf != nil && lf.dynamic {
 		return lf.runDynamicInferenceOnly(out, x)
 	}
-	return lf.runInferenceOnly(out, x)
+	return lf.runWithTaps(out, x, nil)
+}
+
+// PreScaleForInference pre-scales Wo and W2 weights by layerResidualScale
+// and re-stages them to the ANE kernels. After this, the ANE kernel's
+// built-in residual add produces correctly scaled output without CPU blending.
+func (lf *layerForward) PreScaleForInference(w layerForwardWeights) error {
+	if lf == nil || !lf.dynamic {
+		return nil // only supported for dynamic layers
+	}
+	s := layerResidualScale
+	// Pre-scale Wo (attention output projection)
+	scaledWo := make([]float32, len(w.Wo))
+	for i, v := range w.Wo {
+		scaledWo[i] = v * s
+	}
+	// Pre-scale W2 (FFN down projection)
+	scaledW2 := make([]float32, len(w.W2))
+	for i, v := range w.W2 {
+		scaledW2[i] = v * s
+	}
+	scaledW := layerForwardWeights{
+		RMSAtt: w.RMSAtt,
+		Wq:     w.Wq,
+		Wk:     w.Wk,
+		Wv:     w.Wv,
+		Wo:     scaledWo,
+		RMSFFN: w.RMSFFN,
+		W1:     w.W1,
+		W2:     scaledW2,
+		W3:     w.W3,
+	}
+	if err := lf.stageDynamicWeights(scaledW); err != nil {
+		return err
+	}
+	lf.inferScaled = true
+	return nil
 }
 
 // runInferenceOnly reads only dim*seq output channels, skipping taps.

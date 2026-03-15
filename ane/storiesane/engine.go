@@ -783,48 +783,46 @@ func (e *Engine) ensureLayers() error {
 		return e.layerInitErr
 	}
 	e.layers = layers
+	// Pre-scale Wo and W2 weights for inference (eliminates CPU residual blending).
+	for i, lf := range e.layers {
+		if lf != nil && lf.dynamic {
+			layer := e.mw.Layers[i]
+			_ = lf.PreScaleForInference(layerForwardWeights{
+				RMSAtt: layer.RMSAtt,
+				Wq:     layer.Wq,
+				Wk:     layer.Wk,
+				Wv:     layer.Wv,
+				Wo:     layer.Wo,
+				RMSFFN: layer.RMSFFN,
+				W1:     layer.W1,
+				W2:     layer.W2,
+				W3:     layer.W3,
+			})
+		}
+	}
 	return nil
 }
 
-var inferProfile [4]int64
-var inferProfileN int32
-
 func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
 	e.ensureOffload()
-	t0 := time.Now()
 	stories.EmbedLookup(e.x, e.mw.Embed, tokens, stories.Dim, e.seq)
 	cur := e.x
 	next := e.tmpHidden
-	t1 := time.Now()
 	for i := range e.layers {
 		if err := e.layers[i].run(next, cur); err != nil {
 			return fmt.Errorf("storiesane eval logits: layer %d: %w", i, err)
 		}
 		cur, next = next, cur
 	}
-	t2 := time.Now()
 	if e.off == nil || !e.off.hasRMSForward() {
 		stories.RMSNorm(e.xNorm, cur, e.mw.RMSFinal, stories.Dim, e.seq)
 	} else if err := e.off.runRMSForward(e.xNorm, cur); err != nil {
 		return fmt.Errorf("storiesane eval logits: final rmsnorm: %w", err)
 	}
-	t3 := time.Now()
 	if e.off == nil || !e.off.hasClassifierForward() {
 		stories.MatMulVocabSeq(logits, e.mw.Embed, e.xNorm, stories.Vocab, stories.Dim, e.seq)
 	} else if err := e.off.runClassifierForward(logits, e.xNorm); err != nil {
 		return fmt.Errorf("storiesane eval logits: classifier: %w", err)
-	}
-	t4 := time.Now()
-	inferProfile[0] += t1.Sub(t0).Microseconds()
-	inferProfile[1] += t2.Sub(t1).Microseconds()
-	inferProfile[2] += t3.Sub(t2).Microseconds()
-	inferProfile[3] += t4.Sub(t3).Microseconds()
-	inferProfileN++
-	if inferProfileN == 8 {
-		n := inferProfileN
-		fmt.Fprintf(os.Stderr, "[profile n=%d] embed=%dus layers=%dus rms=%dus cls=%dus per-call=%dus\n",
-			n, inferProfile[0]/int64(n), inferProfile[1]/int64(n), inferProfile[2]/int64(n), inferProfile[3]/int64(n),
-			(inferProfile[0]+inferProfile[1]+inferProfile[2]+inferProfile[3])/int64(n))
 	}
 	return nil
 }
