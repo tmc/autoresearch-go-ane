@@ -32,7 +32,10 @@ type classifierDynamicTile struct {
 }
 
 type offload struct {
-	metrics   *aneStepMetrics
+	dim     int // model embedding dimension
+	vocab   int // vocabulary size
+	metrics *aneStepMetrics
+
 	rmsFwd    *model.Kernel
 	clsFwdDyn []classifierDynamicTile
 	clsFwd    *model.Kernel
@@ -89,10 +92,16 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 		closeDynamicClassifierTiles(clsBwdDyn)
 		return nil
 	}
+	cfg := mw.Config
+	dim := cfg.Dim
+	vocab := cfg.Vocab
+
 	o := &offload{
+		dim:      dim,
+		vocab:    vocab,
 		rmsFwd:   rmsFwd,
 		rmsBwd:   rmsBwd,
-		rmsBwdIn: make([]float32, 2*stories.Dim*seq),
+		rmsBwdIn: make([]float32, 2*dim*seq),
 		rmsW:     mw.RMSFinal,
 		softmax:  softmax,
 	}
@@ -100,7 +109,7 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 
 	if o.rmsFwd == nil {
 		o.rmsFwd, err = model.Compile(model.CompileOptions{
-			MILText: mil.GenFinalRMSNormDynamic(stories.Dim, seq),
+			MILText: mil.GenFinalRMSNormDynamic(dim, seq),
 		})
 		if err != nil {
 			o.notef("rms forward compile failed: %v", err)
@@ -127,7 +136,7 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 	}
 	if o.rmsBwd == nil {
 		o.rmsBwd, err = model.Compile(model.CompileOptions{
-			MILText: mil.GenRMSNormBackwardDynamic(stories.Dim, seq),
+			MILText: mil.GenRMSNormBackwardDynamic(dim, seq),
 		})
 		if err != nil {
 			o.notef("rms backward compile failed: %v", err)
@@ -149,13 +158,13 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 			o.notef("classifier forward using dynamic tile size %d", o.clsFwdTile)
 		}
 		if len(o.clsFwdDyn) == 0 {
-			if blob, err := mil.BuildWeightBlob(mw.Embed, stories.Vocab, stories.Dim); err == nil {
+			if blob, err := mil.BuildWeightBlob(mw.Embed, vocab, dim); err == nil {
 				o.clsFwd, err = compileFP16Kernel(
-					mil.GenClassifierForward(stories.Dim, stories.Vocab, seq),
+					mil.GenClassifierForward(dim, vocab, seq),
 					"@model_path/weights/embed.bin",
 					blob,
-					stories.Dim,
-					stories.Vocab,
+					dim,
+					vocab,
 					seq,
 				)
 				if err != nil {
@@ -174,7 +183,7 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 			}
 		}
 		if o.softmax == nil {
-			o.softmax, err = compileSoftmaxKernel(stories.Vocab, seq)
+			o.softmax, err = compileSoftmaxKernel(vocab, seq)
 			if err != nil {
 				o.notef("softmax compile failed: %v", err)
 			}
@@ -187,13 +196,13 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 			o.notef("classifier backward using dynamic vocab tile size %d", o.clsBwdTile)
 		}
 		if len(o.clsBwdDyn) == 0 {
-			if blob, err := mil.BuildTransposedWeightBlob(mw.Embed, stories.Vocab, stories.Dim); err == nil {
+			if blob, err := mil.BuildTransposedWeightBlob(mw.Embed, vocab, dim); err == nil {
 				o.clsBwd, err = compileFP16Kernel(
-					mil.GenClassifierBackward(stories.Dim, stories.Vocab, seq),
+					mil.GenClassifierBackward(dim, vocab, seq),
 					"@model_path/weights/embed_t.bin",
 					blob,
-					stories.Vocab,
-					stories.Dim,
+					vocab,
+					dim,
 					seq,
 				)
 				if err != nil {
@@ -212,7 +221,7 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 			}
 		}
 		if len(o.clsBwdDyn) > 0 || len(o.clsBwdTil) > 0 {
-			o.clsBwdTmp = make([]float32, stories.Dim*seq)
+			o.clsBwdTmp = make([]float32, dim*seq)
 		}
 	}
 
@@ -434,7 +443,7 @@ func writeRMSInput(k *model.Kernel, input int, data []float32) error {
 func (o *offload) runClassifierForward(logits, xNorm []float32) error {
 	if len(o.clsFwdDyn) > 0 {
 		collectCustom := o.metrics != nil && o.metrics.wantsCustomMetrics()
-		seq := len(xNorm) / stories.Dim
+		seq := len(xNorm) / o.dim
 		for _, tile := range o.clsFwdDyn {
 			dst := logits[tile.start*seq : (tile.start+tile.size)*seq]
 			if collectCustom {
@@ -471,7 +480,7 @@ func (o *offload) runClassifierForward(logits, xNorm []float32) error {
 		if err := evalKernelTracked(o.metrics, tile.kernel); err != nil {
 			return err
 		}
-		seq := len(xNorm) / stories.Dim
+		seq := len(xNorm) / o.dim
 		dst := logits[tile.start*seq : (tile.start+tile.size)*seq]
 		if err := tile.kernel.ReadOutputFP16(0, dst); err != nil {
 			return err
@@ -513,7 +522,7 @@ func (o *offload) runClassifierSoftmax(probs, xNorm []float32) error {
 		if err := evalKernelTracked(o.metrics, o.clsFwd); err != nil {
 			return err
 		}
-		if err := model.CopyOutputChannelsToInput(o.softmax, 0, 0, o.clsFwd, 0, 0, stories.Vocab); err != nil {
+		if err := model.CopyOutputChannelsToInput(o.softmax, 0, 0, o.clsFwd, 0, 0, o.vocab); err != nil {
 			return err
 		}
 	} else {
@@ -551,7 +560,7 @@ func (o *offload) runClassifierBackward(dy, dLogits []float32) error {
 		for i := range dy {
 			dy[i] = 0
 		}
-		seq := len(dy) / stories.Dim
+		seq := len(dy) / o.dim
 		for _, tile := range o.clsBwdDyn {
 			src := dLogits[tile.start*seq : (tile.start+tile.size)*seq]
 			if collectCustom {
@@ -587,7 +596,7 @@ func (o *offload) runClassifierBackward(dy, dLogits []float32) error {
 	for i := range dy {
 		dy[i] = 0
 	}
-	seq := len(dy) / stories.Dim
+	seq := len(dy) / o.dim
 	for _, tile := range o.clsBwdTil {
 		src := dLogits[tile.start*seq : (tile.start+tile.size)*seq]
 		if err := tile.kernel.WriteInputFP16(0, src); err != nil {
