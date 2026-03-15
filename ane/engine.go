@@ -28,6 +28,15 @@ type Options struct {
 	GradTaskLimit     int
 	UseANE            bool // best-effort ANE layer forward plus final-head offload on Darwin
 	HybridBackward    bool // best-effort ANE backward dx propagation on Darwin
+
+	// Per-param-group LR multipliers (relative to LR). Zero uses defaults.
+	EmbedLRMult  float32 // embedding params (Embed, VEEmbed)
+	ScalarLRMult float32 // scalar params (VEGate, SmearLambda, BackoutLambda)
+	LambdaLRMult float32 // lambda params (ResidLambdas, X0Lambdas), relative to scalar LR
+
+	// Per-param-group betas. Zero uses defaults (AdamBeta1, AdamBeta2).
+	LambdaBeta1 float32 // ResidLambdas/X0Lambdas beta1
+	LambdaBeta2 float32 // ResidLambdas/X0Lambdas beta2
 }
 
 // State captures resumable engine state.
@@ -78,6 +87,14 @@ type Engine struct {
 	adamBeta2         float32
 	adamEps           float32
 	weightDecay       float32
+	embedLR           float32
+	scalarLR          float32
+	lambdaLR          float32
+	lambdaBeta1       float32
+	lambdaBeta2       float32
+	embedLRMult       float32
+	scalarLRMult      float32
+	lambdaLRMult      float32
 	gradClip          float32
 	lossScale         float32
 	cpuClassifierHead bool
@@ -189,6 +206,21 @@ func Open(opts Options) (*Engine, error) {
 	if opts.LossScale == 0 {
 		opts.LossScale = 256
 	}
+	if opts.EmbedLRMult <= 0 {
+		opts.EmbedLRMult = 1.0
+	}
+	if opts.ScalarLRMult <= 0 {
+		opts.ScalarLRMult = 1.0
+	}
+	if opts.LambdaLRMult <= 0 {
+		opts.LambdaLRMult = 0.01
+	}
+	if opts.LambdaBeta1 <= 0 {
+		opts.LambdaBeta1 = opts.AdamBeta1
+	}
+	if opts.LambdaBeta2 <= 0 {
+		opts.LambdaBeta2 = opts.AdamBeta2
+	}
 	if opts.GradTaskLimit > 0 {
 		SetGradTaskConcurrency(opts.GradTaskLimit)
 	}
@@ -241,6 +273,14 @@ func Open(opts Options) (*Engine, error) {
 		adamBeta2:               opts.AdamBeta2,
 		adamEps:                 opts.AdamEps,
 		weightDecay:             opts.WeightDecay,
+		embedLR:                 opts.LR * opts.EmbedLRMult,
+		scalarLR:                opts.LR * opts.ScalarLRMult,
+		lambdaLR:                opts.LR * opts.ScalarLRMult * opts.LambdaLRMult,
+		lambdaBeta1:             opts.LambdaBeta1,
+		lambdaBeta2:             opts.LambdaBeta2,
+		embedLRMult:             opts.EmbedLRMult,
+		scalarLRMult:            opts.ScalarLRMult,
+		lambdaLRMult:            opts.LambdaLRMult,
 		gradClip:                opts.GradClip,
 		lossScale:               opts.LossScale,
 		cpuClassifierHead:       opts.CPUClassifierHead,
@@ -307,6 +347,9 @@ func (e *Engine) SetLR(lr float32) error {
 		return fmt.Errorf("storiesane set lr: lr must be > 0")
 	}
 	e.lr = lr
+	e.embedLR = lr * e.embedLRMult
+	e.scalarLR = lr * e.scalarLRMult
+	e.lambdaLR = lr * e.scalarLRMult * e.lambdaLRMult
 	return nil
 }
 
@@ -578,14 +621,21 @@ func (e *Engine) flushPending() time.Duration {
 	e.state.AdamT++
 	adamStart := time.Now()
 	t := int(e.state.AdamT)
+	// Matrix params: base LR, base betas, weight decay.
 	invBC1, invBC2 := adamBiasCorrectionInv(t, e.adamBeta1, e.adamBeta2)
 	e.applyLayerAdamAll(e.accum.Layers, t, invBC1, invBC2)
-	adamUpdateCFWithInv(e.mw.Embed, e.accum.Embed, &e.opt.Embed, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, e.weightDecay, invBC1, invBC2, true)
-	adamUpdateCFWithInv(e.mw.ResidLambdas, e.accum.ResidLambdas, &e.opt.ResidLambdas, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
-	adamUpdateCFWithInv(e.mw.X0Lambdas, e.accum.X0Lambdas, &e.opt.X0Lambdas, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
-	adamUpdateCFWithInv(e.mw.SmearGate, e.accum.SmearGate, &e.opt.SmearGate, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
-	adamUpdateCFWithInv(e.mw.SmearLambda, e.accum.SmearLambda, &e.opt.SmearLambda, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
-	adamUpdateCFWithInv(e.mw.BackoutLambda, e.accum.BackoutLambda, &e.opt.BackoutLambda, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	// SmearGate is a matrix param.
+	adamUpdateCFWithInv(e.mw.SmearGate, e.accum.SmearGate, &e.opt.SmearGate, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, e.weightDecay, invBC1, invBC2, false)
+	// Embed params: embed LR, no weight decay.
+	invBC1e, invBC2e := adamBiasCorrectionInv(t, e.adamBeta1, e.adamBeta2)
+	adamUpdateCFWithInv(e.mw.Embed, e.accum.Embed, &e.opt.Embed, e.embedLR, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1e, invBC2e, true)
+	// Scalar params: scalar LR, no weight decay.
+	adamUpdateCFWithInv(e.mw.SmearLambda, e.accum.SmearLambda, &e.opt.SmearLambda, e.scalarLR, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	adamUpdateCFWithInv(e.mw.BackoutLambda, e.accum.BackoutLambda, &e.opt.BackoutLambda, e.scalarLR, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	// Lambda params: lambda LR, custom betas.
+	invBC1l, invBC2l := adamBiasCorrectionInv(t, e.lambdaBeta1, e.lambdaBeta2)
+	adamUpdateCFWithInv(e.mw.ResidLambdas, e.accum.ResidLambdas, &e.opt.ResidLambdas, e.lambdaLR, e.lambdaBeta1, e.lambdaBeta2, e.adamEps, 0, invBC1l, invBC2l, false)
+	adamUpdateCFWithInv(e.mw.X0Lambdas, e.accum.X0Lambdas, &e.opt.X0Lambdas, e.lambdaLR, e.lambdaBeta1, e.lambdaBeta2, e.adamEps, 0, invBC1l, invBC2l, false)
 	e.stepMetrics.addAdam(time.Since(adamStart))
 	// Start kernel refresh asynchronously so the next step's data loading
 	// and embedding lookup overlap with compilation.
