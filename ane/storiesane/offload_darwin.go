@@ -45,7 +45,8 @@ type offload struct {
 	rmsBwd    *model.Kernel
 	rmsBwdIn  []float32
 	clsBwdTmp []float32
-	rmsW      []float32
+	rmsW         []float32
+	rmsWExpanded []float32
 
 	clsFwdTile int
 	clsBwdTile int
@@ -102,6 +103,25 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 		})
 		if err != nil {
 			o.notef("rms forward compile failed: %v", err)
+		}
+	}
+	// ANE compiler may expand weight input[1] from [1,dim,1,1] to [1,dim,1,seq].
+	// Pre-expand the weight vector to match the compiled layout.
+	if o.rmsFwd != nil {
+		layout := o.rmsFwd.InputLayout(1)
+		need := layout.Channels * layout.Width
+		if need > len(mw.RMSFinal) && layout.Width > 1 {
+			o.rmsWExpanded = make([]float32, need)
+			dim := layout.Channels
+			for d := 0; d < dim; d++ {
+				w := mw.RMSFinal[d]
+				base := d * layout.Width
+				for t := 0; t < layout.Width; t++ {
+					o.rmsWExpanded[base+t] = w
+				}
+			}
+		} else {
+			o.rmsWExpanded = mw.RMSFinal
 		}
 	}
 	if o.rmsBwd == nil {
@@ -343,7 +363,7 @@ func disableKernel(k **model.Kernel) {
 }
 
 func (o *offload) runRMSForward(out, x []float32) error {
-	if err := o.rmsFwd.WriteInputFP16(1, o.rmsW); err != nil {
+	if err := o.rmsFwd.WriteInputFP16(1, o.rmsWExpanded); err != nil {
 		return err
 	}
 	if err := o.rmsFwd.WriteInputFP16(0, x); err != nil {
@@ -560,6 +580,20 @@ func (o *offload) refreshWeights(mw *stories.ModelWeights) error {
 		return fmt.Errorf("refresh offload weights: model weights are nil")
 	}
 	o.rmsW = mw.RMSFinal
+	// Re-expand RMS weights if needed for ANE kernel.
+	if o.rmsFwd != nil && o.rmsWExpanded != nil && len(o.rmsWExpanded) > len(mw.RMSFinal) {
+		dim := len(mw.RMSFinal)
+		seq := len(o.rmsWExpanded) / dim
+		for d := 0; d < dim; d++ {
+			w := mw.RMSFinal[d]
+			base := d * seq
+			for t := 0; t < seq; t++ {
+				o.rmsWExpanded[base+t] = w
+			}
+		}
+	} else {
+		o.rmsWExpanded = mw.RMSFinal
+	}
 	forwardStart := time.Now()
 	if err := o.refreshClassifierForwardWeights(mw.Embed); err != nil {
 		return err

@@ -804,9 +804,7 @@ func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
 	}
 	if e.off == nil || !e.off.hasClassifierForward() {
 		stories.MatMulVocabSeq(logits, e.mw.Embed, e.xNorm, stories.Vocab, stories.Dim, e.seq)
-		return nil
-	}
-	if err := e.off.runClassifierForward(logits, e.xNorm); err != nil {
+	} else if err := e.off.runClassifierForward(logits, e.xNorm); err != nil {
 		return fmt.Errorf("storiesane eval logits: classifier: %w", err)
 	}
 	return nil
