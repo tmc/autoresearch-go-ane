@@ -410,14 +410,24 @@ func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
 	if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
 		return fmt.Errorf("run layer forward dynamic: eval attention: %w", err)
 	}
-	if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
-		return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
+	// For inference-only kernels, try direct surface-to-surface copy
+	// (att output → FFN input) to skip CPU roundtrip.
+	surfaceCopied := false
+	if lf.inferScaled {
+		if err := model.CopyOutputRangeToInput(lf.ffn, 0, 0, 0, lf.att, 0, 0, 0, lf.dim, lf.seq); err == nil {
+			surfaceCopied = true
+		}
 	}
-	if !lf.inferScaled {
-		blendResidualInPlace(lf.x2, x)
-	}
-	if err := writeStoriesFFNForwardActs(lf.ffn, lf.seq, lf.x2); err != nil {
-		return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
+	if !surfaceCopied {
+		if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
+		}
+		if !lf.inferScaled {
+			blendResidualInPlace(lf.x2, x)
+		}
+		if err := writeStoriesFFNForwardActs(lf.ffn, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
+		}
 	}
 	if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
 		return fmt.Errorf("run layer forward dynamic: eval ffn: %w", err)
