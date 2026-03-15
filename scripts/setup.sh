@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DATA_URL="https://huggingface.co/datasets/enio/TinyStories/resolve/main/tok32000/TinyStories_tok32000.tar.gz"
-MODEL_URL="https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.pt"
+MODEL_URL="https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin"
 
 # Token data.
 if [ ! -f tinystories_data00.bin ]; then
