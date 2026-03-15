@@ -5,6 +5,7 @@ package ane
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/tmc/apple/x/ane/dynamicmatmul"
 	"github.com/tmc/autoresearch-go-ane/ane/stories"
@@ -401,34 +402,37 @@ func gqaCausalAttentionCF(out, qf, kf, vf []float32, heads, kvHeads, headDim, se
 		groupSize = heads / kvHeads
 	}
 
-	// Scratch buffer for [seq × seq] attention scores (reused across heads).
-	scores := make([]float32, seq*seq)
-
-	for h := 0; h < heads; h++ {
-		kvH := h / groupSize
-		qOff := h * headDim * seq
-		kOff := kvH * headDim * seq
-		vOff := kvH * headDim * seq
-		outOff := h * headDim * seq
-
-		// scores = Q_h^T @ K_kvH: [seq, seq]
-		// Q_h is [headDim, seq] at qf[qOff:], K_kvH is [headDim, seq] at kf[kOff:].
-		// CblasTrans on A: A^T is [seq, headDim], B is [headDim, seq], result is [seq, seq].
-		gqaAttentionScoresBLAS(scores, qf[qOff:], kf[kOff:], headDim, seq, scale)
-
-		// Apply causal mask and softmax row-by-row.
-		for t := 0; t < seq; t++ {
-			row := scores[t*seq : (t+1)*seq]
-			// Mask future positions.
-			for j := t + 1; j < seq; j++ {
-				row[j] = -65504
-			}
-			softmaxRow(row, row)
+	// Process heads in parallel groups of 2 to overlap BLAS + softmax work.
+	var wg sync.WaitGroup
+	for h := 0; h < heads; h += 2 {
+		endH := h + 2
+		if endH > heads {
+			endH = heads
 		}
+		wg.Add(1)
+		go func(startH, endH int) {
+			defer wg.Done()
+			scores := make([]float32, seq*seq)
+			for hh := startH; hh < endH; hh++ {
+				kvH := hh / groupSize
+				qOff := hh * headDim * seq
+				kOff := kvH * headDim * seq
+				vOff := kvH * headDim * seq
+				outOff := hh * headDim * seq
 
-		// out_h = V_kvH @ scores^T: [headDim, seq]
-		// V_kvH is [headDim, seq], scores is [seq, seq].
-		// CblasNoTrans on A, CblasTrans on B.
-		gqaAttentionValueBLAS(out[outOff:], vf[vOff:], scores, headDim, seq)
+				gqaAttentionScoresBLAS(scores, qf[qOff:], kf[kOff:], headDim, seq, scale)
+
+				for t := 0; t < seq; t++ {
+					row := scores[t*seq : (t+1)*seq]
+					for j := t + 1; j < seq; j++ {
+						row[j] = -65504
+					}
+					softmaxRow(row, row)
+				}
+
+				gqaAttentionValueBLAS(out[outOff:], vf[vOff:], scores, headDim, seq)
+			}
+		}(h, endH)
 	}
+	wg.Wait()
 }
