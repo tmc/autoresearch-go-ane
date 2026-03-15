@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" font-family="system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="barGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <linearGradient id="bigBarGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="450" rx="12" fill="#0f172a"/>
+
+  <!-- Title -->
+  <text x="400" y="38" text-anchor="middle" fill="#f8fafc" font-size="20" font-weight="700">autoresearch-go-ane: Inference Speed Optimization</text>
+  <text x="400" y="58" text-anchor="middle" fill="#94a3b8" font-size="13">Autonomous Claude Code agent on Apple M5 Max (ANE) — 977x speedup</text>
+
+  <!-- Y-axis label -->
+  <text x="18" y="240" text-anchor="middle" fill="#94a3b8" font-size="12" transform="rotate(-90,18,240)">tokens / second</text>
+
+  <!-- Chart area -->
+  <g transform="translate(70, 75)">
+    <!-- Grid lines -->
+    <line x1="0" y1="0" x2="690" y2="0" stroke="#1e293b" stroke-width="1"/>
+    <line x1="0" y1="65" x2="690" y2="65" stroke="#1e293b" stroke-width="1"/>
+    <line x1="0" y1="130" x2="690" y2="130" stroke="#1e293b" stroke-width="1"/>
+    <line x1="0" y1="195" x2="690" y2="195" stroke="#1e293b" stroke-width="1"/>
+    <line x1="0" y1="260" x2="690" y2="260" stroke="#1e293b" stroke-width="1"/>
+    <line x1="0" y1="310" x2="690" y2="310" stroke="#334155" stroke-width="1"/>
+
+    <!-- Y-axis labels -->
+    <text x="-8" y="4" text-anchor="end" fill="#64748b" font-size="11">12,000</text>
+    <text x="-8" y="69" text-anchor="end" fill="#64748b" font-size="11">10,000</text>
+    <text x="-8" y="134" text-anchor="end" fill="#64748b" font-size="11">8,000</text>
+    <text x="-8" y="199" text-anchor="end" fill="#64748b" font-size="11">6,000</text>
+    <text x="-8" y="264" text-anchor="end" fill="#64748b" font-size="11">4,000</text>
+    <text x="-8" y="314" text-anchor="end" fill="#64748b" font-size="11">0</text>
+
+    <!-- Bar 0: Baseline 12 tok/s (basically invisible at this scale) -->
+    <rect x="20" y="309.7" width="70" height="0.3" rx="2" fill="#ef4444" opacity="0.8"/>
+    <text x="55" y="303" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">12</text>
+    <text x="55" y="340" text-anchor="middle" fill="#94a3b8" font-size="9">Baseline</text>
+    <text x="55" y="352" text-anchor="middle" fill="#64748b" font-size="8">(21.5s!)</text>
+
+    <!-- Bar 1: BLAS linearCF 366 tok/s -->
+    <rect x="118" y="300.5" width="70" height="9.5" rx="2" fill="url(#barGrad)" opacity="0.8"/>
+    <text x="153" y="295" text-anchor="middle" fill="#93c5fd" font-size="11" font-weight="600">366</text>
+    <text x="153" y="340" text-anchor="middle" fill="#94a3b8" font-size="9">+BLAS</text>
+    <text x="153" y="352" text-anchor="middle" fill="#64748b" font-size="8">30x</text>
+
+    <!-- Bar 2: CPU classifier 416 tok/s -->
+    <rect x="216" y="299.2" width="70" height="10.8" rx="2" fill="url(#barGrad)" opacity="0.8"/>
+    <text x="251" y="293" text-anchor="middle" fill="#93c5fd" font-size="11" font-weight="600">416</text>
+    <text x="251" y="340" text-anchor="middle" fill="#94a3b8" font-size="9">+CPU cls</text>
+    <text x="251" y="352" text-anchor="middle" fill="#64748b" font-size="8">35x</text>
+
+    <!-- Bar 3: RMS fix 423 tok/s -->
+    <rect x="314" y="299" width="70" height="11" rx="2" fill="url(#barGrad)" opacity="0.8"/>
+    <text x="349" y="293" text-anchor="middle" fill="#93c5fd" font-size="11" font-weight="600">423</text>
+    <text x="349" y="340" text-anchor="middle" fill="#94a3b8" font-size="9">+RMS fix</text>
+    <text x="349" y="352" text-anchor="middle" fill="#64748b" font-size="8">35x</text>
+
+    <!-- Bar 4: ANE WORKS! 10,667 tok/s - THE BIG ONE -->
+    <rect x="412" y="34.4" width="70" height="275.6" rx="3" fill="url(#bigBarGrad)"/>
+    <text x="447" y="27" text-anchor="middle" fill="#34d399" font-size="14" font-weight="700">10,667</text>
+    <text x="447" y="340" text-anchor="middle" fill="#94a3b8" font-size="9">ANE fixed!</text>
+    <text x="447" y="352" text-anchor="middle" fill="#34d399" font-size="8" font-weight="600">889x</text>
+
+    <!-- Bar 5: vDSP 11,178 tok/s -->
+    <rect x="510" y="21.2" width="70" height="288.8" rx="3" fill="url(#bigBarGrad)"/>
+    <text x="545" y="15" text-anchor="middle" fill="#34d399" font-size="13" font-weight="700">11,178</text>
+    <text x="545" y="340" text-anchor="middle" fill="#94a3b8" font-size="9">+vDSP</text>
+    <text x="545" y="352" text-anchor="middle" fill="#64748b" font-size="8">932x</text>
+
+    <!-- Bar 6: Pre-scale 11,289 tok/s -->
+    <rect x="608" y="18.3" width="70" height="291.7" rx="3" fill="url(#bigBarGrad)"/>
+    <text x="643" y="12" text-anchor="middle" fill="#34d399" font-size="13" font-weight="700">11,289</text>
+    <text x="643" y="340" text-anchor="middle" fill="#94a3b8" font-size="9">+pre-scale</text>
+    <text x="643" y="352" text-anchor="middle" fill="#64748b" font-size="8">941x</text>
+
+    <!-- Arrow showing the big jump -->
+    <line x1="390" y1="170" x2="415" y2="50" stroke="#fbbf24" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+    <text x="370" y="185" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">ANE was</text>
+    <text x="370" y="197" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">silently broken!</text>
+  </g>
+
+  <!-- Footer -->
+  <text x="400" y="430" text-anchor="middle" fill="#475569" font-size="11">All optimizations discovered autonomously by Claude Code agent  |  110M Llama2 on Apple M5 Max  |  BenchmarkEvalLogits (256 tokens)</text>
+</svg>

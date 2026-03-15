@@ -8,6 +8,8 @@ A Claude Code agent autonomously optimizes ML inference on Apple Neural Engine. 
 
 ### Inference Speed: 12 -> 11,289 tokens/s (977x faster)
 
+![Inference speedup chart](docs/speedup.svg)
+
 The agent ran autonomously on the `autoresearch/mar14-infer` branch, identifying and fixing critical performance bugs in the ANE inference pipeline. All optimizations were discovered, implemented, verified, and committed by Claude Code without human guidance on what to change.
 
 | # | Change | tokens/s | Speedup | How it was found |
