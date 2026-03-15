@@ -155,9 +155,16 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// Separate Q, K, V matmuls — avoids 15GB fused weight allocation for large models.
 		tQKV := time.Now()
-		linearSingle(e.cacheQKV[:qDim], layer.Wq, e.cacheXNorm, qDim, dim)
-		linearSingle(e.cacheQKV[qDim:qDim+kvDim], layer.Wk, e.cacheXNorm, kvDim, dim)
-		linearSingle(e.cacheQKV[qDim+kvDim:qDim+2*kvDim], layer.Wv, e.cacheXNorm, kvDim, dim)
+		if useFP16 {
+			fp16L := e.mw.FP16Layers[li]
+			linearSingleFP16Weights(e.cacheQKV[:qDim], fp16L.Wq, e.cacheXNorm, qDim, dim)
+			linearSingleFP16Weights(e.cacheQKV[qDim:qDim+kvDim], fp16L.Wk, e.cacheXNorm, kvDim, dim)
+			linearSingleFP16Weights(e.cacheQKV[qDim+kvDim:qDim+2*kvDim], fp16L.Wv, e.cacheXNorm, kvDim, dim)
+		} else {
+			linearSingle(e.cacheQKV[:qDim], layer.Wq, e.cacheXNorm, qDim, dim)
+			linearSingle(e.cacheQKV[qDim:qDim+kvDim], layer.Wk, e.cacheXNorm, kvDim, dim)
+			linearSingle(e.cacheQKV[qDim+kvDim:qDim+2*kvDim], layer.Wv, e.cacheXNorm, kvDim, dim)
+		}
 		timings.QKV += time.Since(tQKV)
 
 		fusedQ := e.cacheQKV[:qDim]
@@ -183,11 +190,7 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		// Wo projection: [dim, qDim] @ attOut[qDim] → x2[dim]
 		tWo := time.Now()
 		if useFP16 {
-			woSize := dim * qDim
-			tFP16 := time.Now()
-			convertFP16ToF32(e.fp16Scratch[:woSize], e.mw.FP16Layers[li].Wo)
-			timings.FP16Conv += time.Since(tFP16)
-			linearSingle(e.cacheX2, e.fp16Scratch[:woSize], e.cacheAttOut, dim, qDim)
+			linearSingleFP16Weights(e.cacheX2, e.mw.FP16Layers[li].Wo, e.cacheAttOut, dim, qDim)
 		} else {
 			linearSingle(e.cacheX2, layer.Wo, e.cacheAttOut, dim, qDim)
 		}
@@ -209,10 +212,18 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// Separate W1, W3 matmuls — avoids fused weight allocation.
 		tFFN := time.Now()
-		linearSingle(e.cacheH1H3[:hidden], layer.W1, e.cacheXNorm, hidden, dim)
-		linearSingle(e.cacheH1H3[hidden:], layer.W3, e.cacheXNorm, hidden, dim)
-		siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
-		linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
+		if useFP16 {
+			fp16L := e.mw.FP16Layers[li]
+			linearSingleFP16Weights(e.cacheH1H3[:hidden], fp16L.W1, e.cacheXNorm, hidden, dim)
+			linearSingleFP16Weights(e.cacheH1H3[hidden:], fp16L.W3, e.cacheXNorm, hidden, dim)
+			siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
+			linearSingleFP16Weights(e.cacheFFOut, fp16L.W2, e.cacheGate, dim, hidden)
+		} else {
+			linearSingle(e.cacheH1H3[:hidden], layer.W1, e.cacheXNorm, hidden, dim)
+			linearSingle(e.cacheH1H3[hidden:], layer.W3, e.cacheXNorm, hidden, dim)
+			siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
+			linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
+		}
 		timings.FFN += time.Since(tFFN)
 
 		tRes = time.Now()

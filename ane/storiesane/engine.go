@@ -252,7 +252,7 @@ func Open(opts Options) (*Engine, error) {
 	// Only beneficial for large models where memory bandwidth dominates over
 	// fp16→fp32 conversion overhead. Threshold: ~4GB of weight data.
 	weightBytes := int64(cfg.NLayers) * int64(cfg.WqSize()+cfg.WkSize()+cfg.WvSize()+cfg.WoSize()+cfg.W1Size()+cfg.W2Size()+cfg.W3Size()) * 4
-	if weightBytes > 1000*1024*1024*1024 { // fp16 conversion is slower than raw fp32 BLAS; disabled until BNNS fp16 GEMM
+	if weightBytes > 1000*1024*1024*1024 { // fp16 NEON is slower than Accelerate AMX sgemv; disabled
 		mw.CompressToFP16()
 	}
 
