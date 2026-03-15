@@ -14,3 +14,4 @@ bench_*.txt
 # Go workspace
 go.work
 go.work.sum
+/bench-note

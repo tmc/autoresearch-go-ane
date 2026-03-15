@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(test -f /Volumes/tmc/go/src/github.com/tmc/autoresearch-go-ane/tinystories_data00.bin && echo \"EXISTS\" || echo \"MISSING\")",
+      "Bash(git checkout -b autoresearch/mar14)",
+      "Bash(go test -c -o /dev/null .)",
+      "Bash(go test -bench . -benchtime 5x -count 6 2>&1 | tee bench_before.txt)",
+      "Bash(git add experiment.go && git commit -m \"experiment: increase LR to 1e-3\")",
+      "Bash(wc -l /Volumes/tmc/go/src/github.com/tmc/autoresearch-go-ane/ane/*.go /Volumes/tmc/go/src/github.com/tmc/autoresearch-go-ane/ane/stories/*.go 2>/dev/null | tail -1)",
+      "Bash(file /Volumes/tmc/go/src/github.com/tmc/autoresearch-go-ane/autoresearch* 2>/dev/null | head -5)",
+      "Bash(go test -bench . -benchtime 5x -count 6 2>&1 | tee bench_after.txt)",
+      "Bash(which nlm && nlm --help 2>&1 | head -60)",
+      "Bash(nlm create \"autoresearch-go-ane\")",
+      "Bash(git worktree add .claude/worktrees/main-clean main 2>&1)",
+      "Bash(cd /Volumes/tmc/go/src/github.com/tmc/autoresearch-go-ane/.claude/worktrees/main-clean && DATA=tinystories_data00.bin go test -bench . -benchtime 5x -count 3 -v 2>&1 | tee bench_latest.txt)",
+      "Bash(cd /Volumes/tmc/go/src/github.com/tmc/autoresearch-go-ane/.claude/worktrees/main-clean && ln -s /Volumes/tmc/go/src/github.com/maderix/ANE/training/tinystories_data00.bin . && ln -s /Volumes/tmc/go/src/github.com/tmc/autoresearch-go-ane/stories110M.bin . && ls -la tinystories_data00.bin stories110M.bin)",
+      "Bash(DATA=tinystories_data00.bin go test -bench . -benchtime 5x -count 3 -v 2>&1 | tee bench_latest.txt)",
+      "Bash(git reset --hard HEAD~1)",
+      "Bash(go vet ./ane/stories/ 2>&1 | head -20)",
+      "Bash(grep -r \"RMSAtt\\\\|RMSFFN\\\\|RMSFinal\" /Volumes/tmc/go/src/github.com/tmc/autoresearch-go-ane/ane/stories/*.go 2>/dev/null | head -30)",
+      "Bash(go build -o bench-note ./cmd/bench-note/)",
+      "Bash(./bench-note run *)",
+      "Bash(./bench-note show *)",
+      "Bash(./bench-note raw *)",
+      "Bash(./bench-note compare *)",
+      "Bash(./bench-note history *)"
+    ]
+  }
+}

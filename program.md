@@ -21,7 +21,8 @@ To set up a new experiment, work with the user to:
    - `ane/stories/cpu.go` — low-level CPU kernels (embed, matmul, softmax, RMS norm). Editable.
 4. **Verify data exists**: Check that `tinystories_data00.bin` exists. If not, tell the human to run `bash scripts/setup.sh`.
 5. **Install benchstat**: `go install golang.org/x/perf/cmd/benchstat@latest`
-6. **Confirm and go**: Confirm setup looks good.
+6. **Build bench-note**: `go build -o bench-note ./cmd/bench-note/`
+7. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
@@ -61,26 +62,47 @@ These are more impactful but riskier. Changes here can affect correctness, so ve
 
 **The first run**: Your very first run should always be to establish the baseline, so you will run the training as is.
 
-## Benchmarking with benchstat
+## Benchmarking with bench-note
 
-Use Go benchmarks + `benchstat` to measure the impact of each change with statistical rigor. This is the primary way to evaluate experiments.
+Use `bench-note` (`cmd/bench-note`) to run benchmarks, attach results to git commits as notes, and compare across commits. Results are stored in `refs/notes/benchmarks` using txtar format.
 
-**Capture a baseline** (before changing anything):
+**Build bench-note** (once per session):
 ```bash
-go test -bench . -benchtime 5x -count 6 | tee bench_before.txt
+go build -o bench-note ./cmd/bench-note/
 ```
 
-**After editing**, capture the new results:
+**Run benchmarks and attach to HEAD**:
 ```bash
-go test -bench . -benchtime 5x -count 6 | tee bench_after.txt
+./bench-note run --benchtime=5x --count=6
 ```
 
-**Compare:**
+This runs `go test -bench`, attaches the output as a git note to HEAD, and automatically runs benchstat against the nearest ancestor that has a bench note.
+
+**Attach existing output** (e.g. from a `tee` file):
 ```bash
-benchstat bench_before.txt bench_after.txt
+./bench-note run --from-file=bench_after.txt --benchtime=5x --count=6
 ```
 
-This shows per-benchmark differences with p-values. The key metrics:
+**View results**:
+```bash
+./bench-note show           # full txtar note for HEAD
+./bench-note show abc1234   # for a specific commit
+./bench-note raw            # just the raw go test output (for piping)
+```
+
+**Compare two commits**:
+```bash
+./bench-note compare abc1234 def5678
+```
+
+**List all commits with bench notes**:
+```bash
+./bench-note history            # detailed
+./bench-note history --oneline  # compact
+```
+
+### Key metrics
+
 - `BenchmarkEvalLoss` `val_bpb` — **this is the metric you are optimizing** (bits per byte, lower is better, vocab-size-independent)
 - `BenchmarkEvalLoss` `val_loss` — cross-entropy in nats (equivalent to val_bpb but vocab-dependent)
 - `BenchmarkStep` `loss` — training loss trajectory (should decrease over steps)
@@ -94,7 +116,9 @@ The `-count 6` flag runs each benchmark 6 times for meaningful statistics. Use `
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+The primary benchmark record lives in git notes (`refs/notes/benchmarks`), attached by `bench-note run`. Use `bench-note history` to review the full history with raw output and benchstat deltas.
+
+Additionally, log a summary to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
 The TSV has a header row and 7 columns:
 
@@ -128,23 +152,22 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar14`).
 
 LOOP FOREVER:
 
-1. Capture baseline benchmarks: `go test -bench . -benchtime 5x -count 6 | tee bench_before.txt`
-2. Edit files with an experimental idea (see editable files above).
-3. Verify it compiles: `go test -c -o /dev/null .`
-4. git commit: `git add -A && git commit -m "<description>"`
-5. Run benchmarks: `go test -bench . -benchtime 5x -count 6 | tee bench_after.txt`
-6. Compare: `benchstat bench_before.txt bench_after.txt`
-7. If `val_bpb` improved (decreased) with statistical significance:
+1. Edit files with an experimental idea (see editable files above).
+2. Verify it compiles: `go test -c -o /dev/null .`
+3. git commit: `git add -A && git commit -m "<description>"`
+4. Run benchmarks and attach as git note: `./bench-note run --benchtime=5x --count=6`
+   - This runs benchmarks, attaches results to HEAD, and auto-compares against the nearest ancestor with a bench note.
+5. Review the benchstat delta: `./bench-note show`
+6. If `val_bpb` improved (decreased) with statistical significance:
    - You "advance" the branch, keeping the git commit.
-   - `mv bench_after.txt bench_before.txt` (new baseline).
    - Log results to `results.tsv`.
-8. If `val_bpb` is equal or worse:
+7. If `val_bpb` is equal or worse:
    - `git reset --hard HEAD~1` to revert.
    - Log results to `results.tsv` with status `discard`.
-9. If the build or run crashed:
+8. If the build or run crashed:
    - If it's something easy to fix (typo, bad constant), fix and re-run.
    - If the idea is fundamentally broken, `git reset --hard HEAD~1`, log `crash`, move on.
-10. Go to step 2.
+9. Go to step 1.
 
 **Timeout**: Each benchmark run should take ~2 minutes for `BenchmarkStep` + `BenchmarkEvalLoss`. If a run exceeds 10 minutes, kill it and treat it as a failure.
 
