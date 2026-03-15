@@ -1019,8 +1019,16 @@ func (e *Engine) evalLogitsCPUInto(tokens []int32, logits []float32) error {
 	for i := range e.mw.Layers {
 		layer := e.mw.Layers[i]
 		rmsNormCF(xNorm, cur, layer.RMSAtt, dim, e.seq)
+		// Wq, Wk, Wv share the same input (xNorm). Run Wk concurrently with Wq,
+		// then apply RoPE to both, then compute Wv concurrently with RoPE.
+		var wkwg sync.WaitGroup
+		wkwg.Add(1)
+		go func() {
+			linearCF(kf, layer.Wk, xNorm, kvDim, dim, e.seq)
+			wkwg.Done()
+		}()
 		linearCF(qf, layer.Wq, xNorm, qDim, dim, e.seq)
-		linearCF(kf, layer.Wk, xNorm, kvDim, dim, e.seq)
+		wkwg.Wait()
 		applyRoPECFInPlace(qf, heads, headDim, e.seq, e.ropeCos, e.ropeSin)
 		applyRoPECFInPlace(kf, kvHeads, headDim, e.seq, e.ropeCos, e.ropeSin)
 		linearCF(vf, layer.Wv, xNorm, kvDim, dim, e.seq)
