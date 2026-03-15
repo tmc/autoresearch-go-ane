@@ -989,12 +989,19 @@ func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 		linearCF(x2, layer.Wo, attOut, stories.Dim, stories.Dim, e.seq)
 		rl := e.mw.ResidLambdas[i]
 		xl := e.mw.X0Lambdas[i]
-		for j := 0; j < stories.Dim*e.seq; j++ {
-			x2[j] = rl*cur[j] + x2[j]
+		n := stories.Dim * e.seq
+		// x2 += rl * cur
+		if !scaleAddAccel(x2, cur, rl, n) {
+			for j := 0; j < n; j++ {
+				x2[j] = rl*cur[j] + x2[j]
+			}
 		}
 		if xl != 0 {
-			for j := 0; j < stories.Dim*e.seq; j++ {
-				x2[j] += xl * x0[j]
+			// x2 += xl * x0
+			if !scaleAddAccel(x2, x0, xl, n) {
+				for j := 0; j < n; j++ {
+					x2[j] += xl * x0[j]
+				}
 			}
 		}
 		rmsNormNoWeightCF(xNorm, x2, stories.Dim, e.seq)
@@ -1003,12 +1010,19 @@ func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 			gate[j] = reluSquared32(h1[j])
 		}
 		linearCF(ffOut, layer.W2, gate, stories.Dim, stories.Hidden, e.seq)
-		for j := 0; j < stories.Dim*e.seq; j++ {
-			next[j] = rl*x2[j] + ffOut[j]
+		// next = ffOut + rl * x2
+		copy(next[:n], ffOut[:n])
+		if !scaleAddAccel(next, x2, rl, n) {
+			for j := 0; j < n; j++ {
+				next[j] = rl*x2[j] + ffOut[j]
+			}
 		}
 		if xl != 0 {
-			for j := 0; j < stories.Dim*e.seq; j++ {
-				next[j] += xl * x0[j]
+			// next += xl * x0
+			if !scaleAddAccel(next, x0, xl, n) {
+				for j := 0; j < n; j++ {
+					next[j] += xl * x0[j]
+				}
 			}
 		}
 		cur, next = next, cur
