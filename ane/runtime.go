@@ -147,15 +147,13 @@ func (e *Engine) refreshLayerWeights() error {
 			return struct{}{}, fmt.Errorf("refresh layer weights: layer %d is nil", i)
 		}
 		err := e.layers[i].refreshWeights(layerForwardWeights{
-			RMSAtt: e.mw.Layers[i].RMSAtt,
-			Wq:     e.mw.Layers[i].Wq,
-			Wk:     e.mw.Layers[i].Wk,
-			Wv:     e.mw.Layers[i].Wv,
-			Wo:     e.mw.Layers[i].Wo,
-			RMSFFN: e.mw.Layers[i].RMSFFN,
-			W1:     e.mw.Layers[i].W1,
-			W2:     e.mw.Layers[i].W2,
-			W3:     e.mw.Layers[i].W3,
+			Wq: e.mw.Layers[i].Wq,
+			Wk: e.mw.Layers[i].Wk,
+			Wv: e.mw.Layers[i].Wv,
+			Wo: e.mw.Layers[i].Wo,
+			W1: e.mw.Layers[i].W1,
+			W2: e.mw.Layers[i].W2,
+			W3: e.mw.Layers[i].W3,
 		})
 		return struct{}{}, err
 	}, func(struct{}) {})

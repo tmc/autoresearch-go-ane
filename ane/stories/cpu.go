@@ -110,6 +110,45 @@ func RMSNorm(out, x, w []float32, d, s int) {
 	})
 }
 
+func RMSNormNoWeight(out, x []float32, d, s int) {
+	parallelFor(s, func(start, end int) {
+		for t := start; t < end; t++ {
+			sum := 0.0
+			for i := 0; i < d; i++ {
+				v := float64(x[i*s+t])
+				sum += v * v
+			}
+			scale := 1.0 / math.Sqrt(sum/float64(d)+1e-5)
+			for i := 0; i < d; i++ {
+				out[i*s+t] = float32(float64(x[i*s+t]) * scale)
+			}
+		}
+	})
+}
+
+func RMSNormNoWeightBackward(dx, dy, x []float32, d, s int) {
+	parallelFor(s, func(start, end int) {
+		invD := 1.0 / float64(d)
+		for t := start; t < end; t++ {
+			sum := 0.0
+			for i := 0; i < d; i++ {
+				v := float64(x[i*s+t])
+				sum += v * v
+			}
+			rrms := 1.0 / math.Sqrt(sum*invD+1e-5)
+			dot := 0.0
+			for i := 0; i < d; i++ {
+				dot += float64(dy[i*s+t]) * float64(x[i*s+t])
+			}
+			coeff := dot * rrms * rrms * rrms * invD
+			for i := 0; i < d; i++ {
+				idx := i*s + t
+				dx[idx] = float32(float64(dy[idx])*rrms - coeff*float64(x[idx]))
+			}
+		}
+	})
+}
+
 func RMSNormBackward(dx, dw, dy, x, w []float32, d, s int) {
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 2 || s < workers*4 {

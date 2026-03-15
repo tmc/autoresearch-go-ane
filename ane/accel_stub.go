@@ -18,24 +18,14 @@ func addSliceAccel(dst, src []float32) {
 	}
 }
 
-func scaleIntoAccel(dst, src []float32, scale float32) {
-	for i := range dst {
-		dst[i] = src[i] * scale
-	}
-}
-
-func addScaledResidualAccel(dst, base, branch []float32, scale float32) {
-	for i := range dst {
-		dst[i] = base[i] + scale*branch[i]
-	}
-}
-
-func siluBackwardAccel(dh1, dh3, dGate, h1, h3 []float32) {
+func reluSquaredBackwardAccel(dh1, dh3, dGate, h1, h3 []float32) {
 	for i := range dh1 {
-		sig := float32(1.0 / (1.0 + math.Exp(float64(-h1[i]))))
-		siluGrad := sig * (1 + h1[i]*(1-sig))
-		dh1[i] = dGate[i] * h3[i] * siluGrad
-		dh3[i] = dGate[i] * (h1[i] * sig)
+		r := h1[i]
+		if r < 0 {
+			r = 0
+		}
+		dh1[i] = dGate[i] * h3[i] * 2 * r
+		dh3[i] = dGate[i] * r * r
 	}
 }
 
