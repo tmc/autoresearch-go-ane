@@ -203,7 +203,72 @@ func (lf *layerForward) close() {
 }
 
 func (lf *layerForward) run(out, x []float32) error {
-	return lf.runWithTaps(out, x, nil)
+	if lf != nil && lf.dynamic {
+		return lf.runDynamicInferenceOnly(out, x)
+	}
+	return lf.runInferenceOnly(out, x)
+}
+
+// runInferenceOnly reads only dim*seq output channels, skipping taps.
+func (lf *layerForward) runInferenceOnly(out, x []float32) error {
+	if lf == nil || lf.att == nil || lf.ffn == nil {
+		return fmt.Errorf("run layer forward: layer is closed")
+	}
+	want := lf.dim * lf.seq
+	if len(x) != want || len(out) != want {
+		return fmt.Errorf("run layer forward: len mismatch in=%d out=%d want=%d", len(x), len(out), want)
+	}
+
+	if lf.attSplit {
+		if err := lf.qkv.WriteInputFP16(0, x); err != nil {
+			return fmt.Errorf("run layer forward: write qkv input: %w", err)
+		}
+		if err := evalKernelTracked(lf.metrics, lf.qkv); err != nil {
+			return fmt.Errorf("run layer forward: eval qkv: %w", err)
+		}
+		if err := lf.att.WriteInputFP16(0, x); err != nil {
+			return fmt.Errorf("run layer forward: write attention residual: %w", err)
+		}
+		if err := model.CopyOutputChannelsToInput(lf.att, 1, 0, lf.qkv, 0, 0, 3*lf.dim); err != nil {
+			if err := lf.qkv.ReadOutputFP16(0, lf.qkvOut); err != nil {
+				return fmt.Errorf("run layer forward: read qkv fallback: %w", err)
+			}
+			if err := lf.att.WriteInputFP16(1, lf.qkvOut); err != nil {
+				return fmt.Errorf("run layer forward: write qkv input: %w", err)
+			}
+		}
+		if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+			return fmt.Errorf("run layer forward: eval attention: %w", err)
+		}
+		if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward: read attention output: %w", err)
+		}
+	} else {
+		if err := lf.att.WriteInputFP16(0, x); err != nil {
+			return fmt.Errorf("run layer forward: write attention input: %w", err)
+		}
+		if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+			return fmt.Errorf("run layer forward: eval attention: %w", err)
+		}
+		if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward: read attention output: %w", err)
+		}
+	}
+	blendResidualInPlace(lf.x2, x)
+
+	if err := model.CopyOutputChannelsToInput(lf.ffn, 0, 0, lf.att, 0, 0, lf.dim); err != nil {
+		if err := lf.ffn.WriteInputFP16(0, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward: write ffn input: %w", err)
+		}
+	}
+	if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
+		return fmt.Errorf("run layer forward: eval ffn: %w", err)
+	}
+	if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, lf.seq, out); err != nil {
+		return fmt.Errorf("run layer forward: read ffn output: %w", err)
+	}
+	addScaledResidual(out, lf.x2, out)
+	return nil
 }
 
 func (lf *layerForward) runWithTaps(out, x []float32, cache *layerCache) error {

@@ -322,6 +322,38 @@ func (lb *layerBackward) stageDynamicWeights(layer stories.LayerWeights) error {
 	return nil
 }
 
+// runDynamicInferenceOnly reads only dim*seq output channels, skipping taps.
+func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
+	if lf == nil || lf.att == nil || lf.ffn == nil {
+		return fmt.Errorf("run layer forward dynamic: layer is closed")
+	}
+	want := lf.dim * lf.seq
+	if len(x) != want || len(out) != want {
+		return fmt.Errorf("run layer forward dynamic: len mismatch in=%d out=%d want=%d", len(x), len(out), want)
+	}
+	if err := writeStoriesAttentionForwardActs(lf.att, lf.seq, x); err != nil {
+		return fmt.Errorf("run layer forward dynamic: write attention input: %w", err)
+	}
+	if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+		return fmt.Errorf("run layer forward dynamic: eval attention: %w", err)
+	}
+	if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+		return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
+	}
+	blendResidualInPlace(lf.x2, x)
+	if err := writeStoriesFFNForwardActs(lf.ffn, lf.seq, lf.x2); err != nil {
+		return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
+	}
+	if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
+		return fmt.Errorf("run layer forward dynamic: eval ffn: %w", err)
+	}
+	if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, lf.seq, out); err != nil {
+		return fmt.Errorf("run layer forward dynamic: read ffn output: %w", err)
+	}
+	addScaledResidual(out, lf.x2, out)
+	return nil
+}
+
 func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) error {
 	if lf == nil || lf.att == nil || lf.ffn == nil {
 		return fmt.Errorf("run layer forward dynamic: layer is closed")
