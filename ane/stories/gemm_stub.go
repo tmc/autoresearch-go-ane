@@ -1,15 +1,13 @@
-//go:build !darwin || !cgo
-
 package stories
 
 func matMulVocabSeqAccelerate(logits, embed, x []float32, vocab, dim, seq int) bool {
 	return false
 }
 
-func matMulEmbedTAccelerate(dx, embed, dLogits []float32, vocab, dim, seq int) bool {
+func matMulEmbedTAccelerateScale(dx, embed, dLogits []float32, vocab, dim, seq int, scale float32) bool {
 	return false
 }
 
-func matMulGradEmbedAccelerate(dEmbed, dLogits, x []float32, vocab, dim, seq int) bool {
+func matMulGradEmbedAccelerateScale(dEmbed, dLogits, x []float32, vocab, dim, seq int, scale float32) bool {
 	return false
 }

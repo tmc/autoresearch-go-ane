@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/tmc/autoresearch-go-ane/ane/stories"
-	"github.com/tmc/autoresearch-go-ane/ane/storiesane"
+	"github.com/tmc/autoresearch-go-ane/ane"
 )
 
 func main() {
@@ -44,7 +44,7 @@ func main() {
 
 	opts := experimentConfig(*modelPath, tokens)
 	log.Println("opening engine...")
-	engine, err := storiesane.Open(opts)
+	engine, err := ane.Open(opts)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -151,7 +151,7 @@ const (
 	evalSeqLen = 256
 )
 
-func evalLoss(engine *storiesane.Engine, tokens []uint16) (float64, error) {
+func evalLoss(engine *ane.Engine, tokens []uint16) (float64, error) {
 	if len(tokens) < evalTokens+evalSeqLen {
 		return 0, fmt.Errorf("eval: need at least %d tokens, got %d", evalTokens+evalSeqLen, len(tokens))
 	}
