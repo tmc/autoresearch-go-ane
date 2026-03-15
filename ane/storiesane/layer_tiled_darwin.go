@@ -259,6 +259,9 @@ type tiledScratchBuffers struct {
 	gate   []float32
 	ff     []float32
 
+	ropeCos []float32
+	ropeSin []float32
+
 	kvHeads       int
 	headDim       int
 	residualScale float32
@@ -317,11 +320,12 @@ func (lf *layerForward) runTiled(out, x []float32) error {
 	headDim := sc.headDim
 	kvHeads := sc.kvHeads
 
-	// Build RoPE tables. We reuse a simple per-call build; for performance
-	// these could be cached on the layerForward, but correctness first.
-	ropeCos, ropeSin := buildRoPETables(seq, headDim)
-	applyRoPECFInPlace(sc.q, heads, headDim, seq, ropeCos, ropeSin)
-	applyRoPECFInPlace(sc.k, kvHeads, headDim, seq, ropeCos, ropeSin)
+	// Cache RoPE tables on first call.
+	if sc.ropeCos == nil {
+		sc.ropeCos, sc.ropeSin = buildRoPETables(seq, headDim)
+	}
+	applyRoPECFInPlace(sc.q, heads, headDim, seq, sc.ropeCos, sc.ropeSin)
+	applyRoPECFInPlace(sc.k, kvHeads, headDim, seq, sc.ropeCos, sc.ropeSin)
 
 	// CPU: causal attention (GQA-aware)
 	gqaCausalAttentionCF(sc.attOut, sc.q, sc.k, sc.v, heads, kvHeads, headDim, seq)

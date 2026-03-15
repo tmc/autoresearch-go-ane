@@ -66,12 +66,11 @@ func NewMoEModelWeights(cfg MoEConfig) *MoEModelWeights {
 		Embed:    make([]float32, cfg.Vocab*cfg.Dim),
 		SharedCL: true,
 	}
-	kvDim := cfg.KVDim()
 	for i := range mw.Layers {
 		layer := MoELayerWeights{
 			Wq:           make([]float32, cfg.WqSize()),
-			Wk:           make([]float32, kvDim*cfg.Dim),
-			Wv:           make([]float32, kvDim*cfg.Dim),
+			Wk:           make([]float32, cfg.WkSize()),
+			Wv:           make([]float32, cfg.WvSize()),
 			Wo:           make([]float32, cfg.WoSize()),
 			RMSAtt:       make([]float32, cfg.Dim),
 			RouterWeight: make([]float32, cfg.RouterSize()),

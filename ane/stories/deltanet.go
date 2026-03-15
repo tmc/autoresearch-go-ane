@@ -43,15 +43,15 @@ func DeltaNetForward(
 
 	// DeltaNet linear attention per head
 	attOut := make([]float32, dim*seq)
+	S := make([]float32, headDim*headDim)
+	qt := make([]float32, headDim)
+	kt := make([]float32, headDim)
+	vt := make([]float32, headDim)
 	for h := 0; h < heads; h++ {
-		// Running state matrix S: [headDim, headDim]
-		S := make([]float32, headDim*headDim)
+		// Reset running state matrix S: [headDim, headDim]
+		clear(S)
 
 		for t := 0; t < seq; t++ {
-			// Extract q_t, k_t, v_t for this head and position
-			qt := make([]float32, headDim)
-			kt := make([]float32, headDim)
-			vt := make([]float32, headDim)
 			for d := 0; d < headDim; d++ {
 				qi := h*headDim + d
 				qt[d] = q[qi*seq+t]

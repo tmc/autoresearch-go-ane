@@ -15,9 +15,13 @@ import (
 	xane "github.com/tmc/apple/x/ane"
 )
 
+type dynamicLayerSpecKey struct {
+	dim, hidden, heads, kvHeads, nLayers, seq int
+}
+
 var dynamicLayerSpecs struct {
 	mu sync.Mutex
-	m  map[int]*dynamicLayerCompileSpec
+	m  map[dynamicLayerSpecKey]*dynamicLayerCompileSpec
 }
 
 type dynamicLayerCompileSpec struct {
@@ -45,19 +49,13 @@ func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
 
 // dynamicLayerSpecForConfig returns a cached compile spec for the given model config and sequence length.
 func dynamicLayerSpecForConfig(cfg stories.ModelConfig, seq int) (*dynamicLayerCompileSpec, error) {
-	// Cache key includes config dimensions so different models get different specs.
-	type specKey struct {
-		dim, hidden, heads, kvHeads, nLayers, seq int
-	}
-	key := specKey{cfg.Dim, cfg.Hidden, cfg.Heads, cfg.EffectiveKVHeads(), cfg.NLayers, seq}
+	key := dynamicLayerSpecKey{cfg.Dim, cfg.Hidden, cfg.Heads, cfg.EffectiveKVHeads(), cfg.NLayers, seq}
 
 	dynamicLayerSpecs.mu.Lock()
 	if dynamicLayerSpecs.m == nil {
-		dynamicLayerSpecs.m = make(map[int]*dynamicLayerCompileSpec)
+		dynamicLayerSpecs.m = make(map[dynamicLayerSpecKey]*dynamicLayerCompileSpec)
 	}
-	// Use a simple hash for the map key (legacy path uses seq only).
-	mapKey := key.dim*1000000 + key.hidden*1000 + key.heads*100 + key.kvHeads*10 + key.seq
-	if spec := dynamicLayerSpecs.m[mapKey]; spec != nil {
+	if spec := dynamicLayerSpecs.m[key]; spec != nil {
 		dynamicLayerSpecs.mu.Unlock()
 		return spec, nil
 	}
@@ -94,11 +92,11 @@ func dynamicLayerSpecForConfig(cfg stories.ModelConfig, seq int) (*dynamicLayerC
 	}
 
 	dynamicLayerSpecs.mu.Lock()
-	if existing := dynamicLayerSpecs.m[mapKey]; existing != nil {
+	if existing := dynamicLayerSpecs.m[key]; existing != nil {
 		dynamicLayerSpecs.mu.Unlock()
 		return existing, nil
 	}
-	dynamicLayerSpecs.m[mapKey] = spec
+	dynamicLayerSpecs.m[key] = spec
 	dynamicLayerSpecs.mu.Unlock()
 	return spec, nil
 }

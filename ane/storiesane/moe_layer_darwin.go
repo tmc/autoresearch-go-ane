@@ -50,12 +50,11 @@ type moeLayer struct {
 	routerWeight []float32
 
 	// Expert executors, lazily compiled.
-	mu       sync.Mutex
-	experts  []*moeExpertExecutor // len == numExperts, nil until compiled
-	shared   *moeExpertExecutor   // nil if no shared expert
-	weights  *stories.MoELayerWeights
-	seq      int
-	compiled map[int]bool // tracks which expert indices are compiled
+	mu      sync.Mutex
+	experts []*moeExpertExecutor // len == numExperts, nil until compiled
+	shared  *moeExpertExecutor   // nil if no shared expert
+	weights *stories.MoELayerWeights
+	seq     int
 
 	// Scratch buffers for MoE forward.
 	x2      []float32 // [dim * seq] residual after attention
@@ -161,10 +160,9 @@ func compileMoELayer(cfg stories.MoEConfig, layer stories.MoELayerWeights, seq i
 		rmsAtt:       layer.RMSAtt,
 		rmsFFN:       layer.RMSFFN,
 		routerWeight: layer.RouterWeight,
-		experts:      make([]*moeExpertExecutor, cfg.NumExperts),
-		weights:      &layer,
-		seq:          seq,
-		compiled:     make(map[int]bool),
+		experts: make([]*moeExpertExecutor, cfg.NumExperts),
+		weights: &layer,
+		seq:     seq,
 		x2:          make([]float32, dim*seq),
 		x2norm:      make([]float32, dim*seq),
 		logits:      make([]float32, cfg.NumExperts),
@@ -249,7 +247,6 @@ func (ml *moeLayer) ensureExpertCompiled(idx int) (*moeExpertExecutor, error) {
 		return nil, fmt.Errorf("lazy compile expert %d: %w", idx, err)
 	}
 	ml.experts[idx] = exec
-	ml.compiled[idx] = true
 	return exec, nil
 }
 
@@ -396,6 +393,13 @@ func (ml *moeLayer) runMoEForward(out, x []float32) error {
 		ml.ffAccum[i] = 0
 	}
 
+	// Shared expert runs once for all tokens (not per-token).
+	if ml.shared != nil {
+		if err := runExpertFFN(ml.shared, ml.ffAccum, ml.x2norm, ml.h1[:hidden*seq], ml.h3[:hidden*seq], ml.gate[:hidden*seq]); err != nil {
+			return fmt.Errorf("run moe forward: shared expert ffn: %w", err)
+		}
+	}
+
 	// For each token position, route to top-k experts.
 	// We extract per-token hidden states from channel-first layout for the router.
 	tokenHidden := make([]float32, dim)
@@ -419,11 +423,8 @@ func (ml *moeLayer) runMoEForward(out, x []float32) error {
 				return fmt.Errorf("run moe forward: token %d expert %d: %w", t, expertIdx, err)
 			}
 
-			// Build single-token channel-first input [dim, seq] with only position t active.
-			// For efficiency in batch mode we run the full seq through the expert,
-			// but since we are routing per-token we create a single-position slice.
-			// However, the executor is compiled for full seq, so we must use full-seq buffers.
-			// We run the expert on the full x2norm and then extract position t's output.
+			// The executor is compiled for full seq, so we run the expert on full x2norm
+			// and then extract position t's output.
 			if err := runExpertFFN(exec, ml.ffExp, ml.x2norm, ml.h1[:hidden*seq], ml.h3[:hidden*seq], ml.gate[:hidden*seq]); err != nil {
 				return fmt.Errorf("run moe forward: token %d expert %d ffn: %w", t, expertIdx, err)
 			}
@@ -432,16 +433,6 @@ func (ml *moeLayer) runMoEForward(out, x []float32) error {
 			w := topW[i]
 			for d := 0; d < dim; d++ {
 				ml.ffAccum[d*seq+t] += w * ml.ffExp[d*seq+t]
-			}
-		}
-
-		// Shared expert (runs for every token).
-		if ml.shared != nil {
-			if err := runExpertFFN(ml.shared, ml.ffExp, ml.x2norm, ml.h1[:hidden*seq], ml.h3[:hidden*seq], ml.gate[:hidden*seq]); err != nil {
-				return fmt.Errorf("run moe forward: token %d shared expert ffn: %w", t, err)
-			}
-			for d := 0; d < dim; d++ {
-				ml.ffAccum[d*seq+t] += ml.ffExp[d*seq+t]
 			}
 		}
 	}
