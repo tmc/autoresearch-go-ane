@@ -96,7 +96,6 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		Wo: layer.Wo,
 		W1: layer.W1,
 		W2: layer.W2,
-		W3: layer.W3,
 	}); err != nil {
 		return nil, err
 	}
@@ -148,7 +147,7 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		attTaps: true,
 		ffnTaps: true,
 		attOut: make([]float32, 5*dim*seq),
-		ffnOut:  make([]float32, (dim+2*hidden)*seq),
+		ffnOut:  make([]float32, (dim+hidden)*seq),
 		x2:      make([]float32, dim*seq),
 	}
 	if err := lf.stageDynamicWeights(layerForwardWeights{
@@ -158,7 +157,6 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		Wo: layer.Wo,
 		W1: layer.W1,
 		W2: layer.W2,
-		W3: layer.W3,
 	}); err != nil {
 		lf.close()
 		return nil, err
@@ -179,7 +177,6 @@ func compileStoriesLayerBackwardDynamic(layer stories.LayerWeights, seq int) (_ 
 		Wo: layer.Wo,
 		W1: layer.W1,
 		W2: layer.W2,
-		W3: layer.W3,
 	}); err != nil {
 		return nil, err
 	}
@@ -271,7 +268,7 @@ func compileStoriesLayerBackwardDynamic(layer stories.LayerWeights, seq int) (_ 
 		sdpa2:   sdpa2,
 		qkv:     qkv,
 		dynamic: true,
-		ffnOut:  make([]float32, (dim+2*hidden)*seq),
+		ffnOut:  make([]float32, (dim+hidden)*seq),
 	}
 	if err := lb.stageDynamicWeights(layer); err != nil {
 		lb.close()
@@ -300,7 +297,7 @@ func (lb *layerBackward) stageDynamicWeights(layer stories.LayerWeights) error {
 	if err := stageDynamicMatmulWeights(lb.ffnW2, lb.seq, lb.hidden, layer.W2); err != nil {
 		return fmt.Errorf("stage layer backward dynamic weights: ffn w2: %w", err)
 	}
-	if err := stageStoriesFFNTailWeights(lb.ffn, lb.seq, lb.hidden, layer.W1, layer.W3); err != nil {
+	if err := stageStoriesFFNTailWeights(lb.ffn, lb.seq, lb.hidden, layer.W1); err != nil {
 		return fmt.Errorf("stage layer backward dynamic weights: ffn tail: %w", err)
 	}
 	if err := stageDynamicMatmulWeights(lb.wot, lb.seq, lb.dim, layer.Wo); err != nil {
@@ -361,16 +358,15 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 	cache.attTapsReady = true
 	hiddenSpan := lf.hidden * lf.seq
 	copy(cache.h1, lf.ffnOut[want:want+hiddenSpan])
-	copy(cache.h3, lf.ffnOut[want+hiddenSpan:want+2*hiddenSpan])
 	for i := range cache.gate {
-		cache.gate[i] = reluSquared32(cache.h1[i]) * cache.h3[i]
+		cache.gate[i] = reluSquared32(cache.h1[i])
 	}
 	rmsNormNoWeightCF(cache.x2Norm, cache.x2, lf.dim, lf.seq)
 	cache.ffnTapsReady = true
 	return nil
 }
 
-func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dh3, dFFN, h1, h3 []float32) error {
+func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dFFN, h1 []float32) error {
 	if lb == nil || lb.ffnW2 == nil || lb.ffn == nil {
 		return fmt.Errorf("run layer backward dynamic ffn: layer is closed")
 	}
@@ -382,16 +378,10 @@ func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dh3, dFFN, h1, h3 []float32)
 	if err := checkLen("run layer backward dynamic ffn", "h1", h1, hiddenN); err != nil {
 		return err
 	}
-	if err := checkLen("run layer backward dynamic ffn", "h3", h3, hiddenN); err != nil {
-		return err
-	}
 	if err := checkLen("run layer backward dynamic ffn", "dx", dxNorm, dimN); err != nil {
 		return err
 	}
 	if err := checkLen("run layer backward dynamic ffn", "dh1", dh1, hiddenN); err != nil {
-		return err
-	}
-	if err := checkLen("run layer backward dynamic ffn", "dh3", dh3, hiddenN); err != nil {
 		return err
 	}
 	if err := writeDynamicMatmulActs(lb.ffnW2, lb.seq, dFFN); err != nil {
@@ -403,7 +393,7 @@ func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dh3, dFFN, h1, h3 []float32)
 	if err := model.CopyOutputRangeToInput(lb.ffn, 0, 0, 0, lb.ffnW2, 0, 0, 0, lb.hidden, lb.seq); err != nil {
 		return fmt.Errorf("run layer backward dynamic ffn: copy dsilu to tail: %w", err)
 	}
-	if err := writeStoriesFFNTailAuxActs(lb.ffn, lb.seq, lb.hidden, h1, h3); err != nil {
+	if err := writeStoriesFFNTailAuxActs(lb.ffn, lb.seq, lb.hidden, h1); err != nil {
 		return fmt.Errorf("run layer backward dynamic ffn: write tail aux input: %w", err)
 	}
 	if err := evalKernelTracked(lb.metrics, lb.ffn); err != nil {
@@ -414,7 +404,6 @@ func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dh3, dFFN, h1, h3 []float32)
 	}
 	copy(dxNorm, lb.ffnOut[:dimN])
 	copy(dh1, lb.ffnOut[dimN:dimN+hiddenN])
-	copy(dh3, lb.ffnOut[dimN+hiddenN:dimN+2*hiddenN])
 	return nil
 }
 
@@ -536,7 +525,7 @@ func writeStoriesAttentionForwardActs(k *model.Kernel, seq int, x []float32) err
 }
 
 func stageStoriesFFNForwardWeights(k *model.Kernel, seq, hidden int, w layerForwardWeights) error {
-	width := seq + 1 + 3*hidden
+	width := seq + 1 + 2*hidden
 	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
 		if err := requireFP16InputLayout("stage stories ffn forward weights", layout, stories.Dim, width); err != nil {
 			return err
@@ -546,15 +535,14 @@ func stageStoriesFFNForwardWeights(k *model.Kernel, seq, hidden int, w layerForw
 			row[seq] = xane.Float32ToFP16(1.0) // Parameterless RMSNorm: weight = 1.0
 		}
 		writeTransposedMatrixFP16(data, layout, 0, seq+1, hidden, stories.Dim, w.W1)
-		writeTransposedMatrixFP16(data, layout, 0, seq+1+hidden, hidden, stories.Dim, w.W3)
-		writeMatrixRowsFP16(data, layout, 0, seq+1+2*hidden, stories.Dim, hidden, w.W2)
+		writeMatrixRowsFP16(data, layout, 0, seq+1+hidden, stories.Dim, hidden, w.W2)
 		return nil
 	})
 }
 
 func writeStoriesFFNForwardActs(k *model.Kernel, seq int, x []float32) error {
 	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
-		if err := requireFP16InputLayout("write stories ffn forward acts", layout, stories.Dim, seq+1+3*stories.Hidden); err != nil {
+		if err := requireFP16InputLayout("write stories ffn forward acts", layout, stories.Dim, seq+1+2*stories.Hidden); err != nil {
 			return err
 		}
 		writeChannelFirstActsFP16(data, layout, seq, x)
@@ -562,25 +550,23 @@ func writeStoriesFFNForwardActs(k *model.Kernel, seq int, x []float32) error {
 	})
 }
 
-func stageStoriesFFNTailWeights(k *model.Kernel, seq, hidden int, w1, w3 []float32) error {
-	width := 3*seq + 2*stories.Dim
+func stageStoriesFFNTailWeights(k *model.Kernel, seq, hidden int, w1 []float32) error {
+	width := 2*seq + stories.Dim
 	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
 		if err := requireFP16InputLayout("stage stories ffn tail weights", layout, hidden, width); err != nil {
 			return err
 		}
-		writeMatrixRowsFP16(data, layout, 0, 3*seq, hidden, stories.Dim, w1)
-		writeMatrixRowsFP16(data, layout, 0, 3*seq+stories.Dim, hidden, stories.Dim, w3)
+		writeMatrixRowsFP16(data, layout, 0, 2*seq, hidden, stories.Dim, w1)
 		return nil
 	})
 }
 
-func writeStoriesFFNTailAuxActs(k *model.Kernel, seq, hidden int, h1, h3 []float32) error {
+func writeStoriesFFNTailAuxActs(k *model.Kernel, seq, hidden int, h1 []float32) error {
 	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
-		if err := requireFP16InputLayout("write stories ffn tail acts", layout, hidden, 3*seq+2*stories.Dim); err != nil {
+		if err := requireFP16InputLayout("write stories ffn tail acts", layout, hidden, 2*seq+stories.Dim); err != nil {
 			return err
 		}
 		writeChannelFirstActsOffsetFP16(data, layout, 0, seq, seq, h1)
-		writeChannelFirstActsOffsetFP16(data, layout, 0, 2*seq, seq, h3)
 		return nil
 	})
 }

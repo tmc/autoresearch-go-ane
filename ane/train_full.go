@@ -19,20 +19,18 @@ type layerCache struct {
 	x2       []float32
 	x2Norm   []float32
 	h1       []float32
-	h3       []float32
 	gate     []float32
 	preMix   []float32 // pre-residual-lambda output for backward
 	qPreNorm []float32 // Q before QK-norm (saved for backward)
 	kPreNorm []float32 // K before QK-norm (saved for backward)
 	dOut     []float32
 	dh1      []float32
-	dh3      []float32
 	dx2      []float32
 	dq       []float32
 	dk       []float32
 	dv       []float32
 	ve       []float32 // VE lookup result, dim*seq, VE layers only
-	veGateAct []float32 // sigmoid gate activation per position, seq, VE layers only
+	veGateAct []float32 // per-head sigmoid gate activation, Heads*seq, VE layers only
 
 	attTapsReady bool
 	ffnTapsReady bool
@@ -59,14 +57,12 @@ func newLayerCache(seq, layer int) layerCache {
 		x2:       make([]float32, stories.Dim*seq),
 		x2Norm:   make([]float32, stories.Dim*seq),
 		h1:       make([]float32, stories.Hidden*seq),
-		h3:       make([]float32, stories.Hidden*seq),
 		gate:     make([]float32, stories.Hidden*seq),
 		preMix:   make([]float32, stories.Dim*seq),
 		qPreNorm: make([]float32, stories.Dim*seq),
 		kPreNorm: make([]float32, stories.Dim*seq),
 		dOut:     make([]float32, stories.Dim*seq),
 		dh1:      make([]float32, stories.Hidden*seq),
-		dh3:      make([]float32, stories.Hidden*seq),
 		dx2:      make([]float32, stories.Dim*seq),
 		dq:       make([]float32, stories.Dim*seq),
 		dk:       make([]float32, stories.Dim*seq),
@@ -74,7 +70,7 @@ func newLayerCache(seq, layer int) layerCache {
 	}
 	if stories.IsVELayer(layer) {
 		lc.ve = make([]float32, stories.Dim*seq)
-		lc.veGateAct = make([]float32, seq)
+		lc.veGateAct = make([]float32, stories.Heads*seq)
 	}
 	return lc
 }
@@ -87,7 +83,6 @@ func newLayerGrad(layer int) stories.LayerWeights {
 		Wo: make([]float32, stories.WOSize),
 		W1: make([]float32, stories.W1Size),
 		W2: make([]float32, stories.W2Size),
-		W3: make([]float32, stories.W3Size),
 	}
 	if stories.IsVELayer(layer) {
 		lw.VEEmbed = make([]float32, stories.VEEmbedSize(stories.Vocab))
@@ -119,7 +114,6 @@ func clearLayerGrad(g *stories.LayerWeights) {
 	clear(g.Wo)
 	clear(g.W1)
 	clear(g.W2)
-	clear(g.W3)
 	clear(g.VEEmbed)
 	clear(g.VEGate)
 }
@@ -146,7 +140,6 @@ func scaleLayerGrad(g *stories.LayerWeights, scale float32) {
 	scaleGradSlice(g.Wo, scale)
 	scaleGradSlice(g.W1, scale)
 	scaleGradSlice(g.W2, scale)
-	scaleGradSlice(g.W3, scale)
 	scaleGradSlice(g.VEEmbed, scale)
 	scaleGradSlice(g.VEGate, scale)
 }
@@ -184,7 +177,6 @@ func (e *Engine) clipLayerGradients(layers []stories.LayerWeights, gEmbed []floa
 		norm2 += sumSquares(g.Wo)
 		norm2 += sumSquares(g.W1)
 		norm2 += sumSquares(g.W2)
-		norm2 += sumSquares(g.W3)
 		norm2 += sumSquares(g.VEEmbed)
 		norm2 += sumSquares(g.VEGate)
 	}
@@ -210,7 +202,6 @@ func addLayerGrad(dst, src *stories.LayerWeights) {
 	addSlice(dst.Wo, src.Wo)
 	addSlice(dst.W1, src.W1)
 	addSlice(dst.W2, src.W2)
-	addSlice(dst.W3, src.W3)
 	addSlice(dst.VEEmbed, src.VEEmbed)
 	addSlice(dst.VEGate, src.VEGate)
 }
@@ -435,9 +426,8 @@ func (e *Engine) forwardTrainingCPU(input []uint16) []float32 {
 		}
 		rmsNormNoWeightCF(cache.x2Norm, cache.x2, stories.Dim, e.seq)
 		linearCF(cache.h1, layer.W1, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
-		linearCF(cache.h3, layer.W3, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
 		for j := range cache.gate {
-			cache.gate[j] = reluSquared32(cache.h1[j]) * cache.h3[j]
+			cache.gate[j] = reluSquared32(cache.h1[j])
 		}
 		cache.attTapsReady = true
 		cache.ffnTapsReady = true
@@ -593,9 +583,8 @@ func (e *Engine) ensureFFNCache(layer *stories.LayerWeights, cache *layerCache) 
 	}
 	rmsNormNoWeightCF(cache.x2Norm, cache.x2, stories.Dim, e.seq)
 	linearCF(cache.h1, layer.W1, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
-	linearCF(cache.h3, layer.W3, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
 	for i := range cache.gate {
-		cache.gate[i] = reluSquared32(cache.h1[i]) * cache.h3[i]
+		cache.gate[i] = reluSquared32(cache.h1[i])
 	}
 	cache.ffnTapsReady = true
 }
@@ -603,12 +592,8 @@ func (e *Engine) ensureFFNCache(layer *stories.LayerWeights, cache *layerCache) 
 func (e *Engine) backwardFFNCPU(layerIdx int, layer *stories.LayerWeights, cache *layerCache, grad *stories.LayerWeights, dFFN, dPrev []float32) {
 	e.ensureFFNCache(layer, cache)
 	linearBackwardDXCF(e.gradGate, layer.W2, dFFN, stories.Dim, stories.Hidden, e.seq)
-	reluSquaredBackwardAccel(e.gradH1, e.gradH3, e.gradGate, cache.h1, cache.h3)
+	reluSquaredBackwardSimple(e.gradH1, e.gradGate, cache.h1)
 	linearBackwardDXCF(e.gradXNorm, layer.W1, e.gradH1, stories.Hidden, stories.Dim, e.seq)
-	linearBackwardDXCF(dPrev, layer.W3, e.gradH3, stories.Hidden, stories.Dim, e.seq)
-	for i := range e.gradXNorm {
-		e.gradXNorm[i] += dPrev[i]
-	}
 	rmsNormNoWeightBackwardCF(dPrev, e.gradXNorm, cache.x2, stories.Dim, e.seq)
 	for i := range e.gradX2 {
 		e.gradX2[i] += dPrev[i]
@@ -617,13 +602,12 @@ func (e *Engine) backwardFFNCPU(layerIdx int, layer *stories.LayerWeights, cache
 
 func (e *Engine) backwardFFNHybrid(lb *layerBackward, layerIdx int, layer *stories.LayerWeights, cache *layerCache, grad *stories.LayerWeights, dFFN, dPrev []float32) error {
 	e.ensureFFNCache(layer, cache)
-	if err := lb.runFFN(e.gradXNorm, cache.dh1, cache.dh3, dFFN, cache.h1, cache.h3); err != nil {
-		return err
-	}
+	linearBackwardDXCF(e.gradGate, layer.W2, dFFN, stories.Dim, stories.Hidden, e.seq)
+	reluSquaredBackwardSimple(cache.dh1, e.gradGate, cache.h1)
+	linearBackwardDXCF(e.gradXNorm, layer.W1, cache.dh1, stories.Hidden, stories.Dim, e.seq)
 	e.submitDWJob(func() {
 		accumLinearGradCF(grad.W2, cache.dOut, cache.gate, stories.Dim, stories.Hidden, e.seq)
 		accumLinearGradCF(grad.W1, cache.dh1, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
-		accumLinearGradCF(grad.W3, cache.dh3, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
 	})
 	rmsNormNoWeightBackwardCF(dPrev, e.gradXNorm, cache.x2, stories.Dim, e.seq)
 	for i := range cache.dx2 {
@@ -738,12 +722,10 @@ func (e *Engine) backwardAndAccumulate(input []uint16, useHybrid bool) time.Dura
 			scaleSlice(e.gradX2, rl)
 			e.backwardFFNCPU(l, layer, cache, grad, cache.dOut, dPrev)
 			copy(cache.dh1, e.gradH1)
-			copy(cache.dh3, e.gradH3)
 			copy(cache.dx2, e.gradX2)
 			e.submitDWJob(func() {
 				accumLinearGradCF(grad.W2, cache.dOut, cache.gate, stories.Dim, stories.Hidden, e.seq)
 				accumLinearGradCF(grad.W1, cache.dh1, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
-				accumLinearGradCF(grad.W3, cache.dh3, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
 			})
 		}
 
@@ -872,12 +854,10 @@ func (e *Engine) backwardAndApply(input []uint16, stepT int, useHybrid bool) tim
 			scaleSlice(e.gradX2, rl)
 			e.backwardFFNCPU(l, layer, cache, grad, cache.dOut, dPrev)
 			copy(cache.dh1, e.gradH1)
-			copy(cache.dh3, e.gradH3)
 			copy(cache.dx2, e.gradX2)
 			e.submitDWJob(func() {
 				accumLinearGradCF(grad.W2, cache.dOut, cache.gate, stories.Dim, stories.Hidden, e.seq)
 				accumLinearGradCF(grad.W1, cache.dh1, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
-				accumLinearGradCF(grad.W3, cache.dh3, cache.x2Norm, stories.Hidden, stories.Dim, e.seq)
 			})
 		}
 
@@ -1039,43 +1019,58 @@ func (e *Engine) applyLayerAdamAll(grads []stories.LayerWeights, t int, invBC1, 
 	}
 }
 
-// veForwardCF applies value embeddings: looks up VE embeddings by input token,
-// computes a gated value via sigmoid, and adds to V. Channel-first layout.
+// veForwardCF applies per-head value embeddings: looks up VE embeddings by
+// input token, computes a per-head gated value via sigmoid over the first
+// VEGateChannels of x, and adds to V. Channel-first layout.
 func veForwardCF(v, ve, veGateAct, veEmbed, veGate, x []float32, input []uint16, dim, seq int) {
+	heads := stories.Heads
+	headDim := stories.HeadDim
+	gc := stories.VEGateChannels
 	for t := 0; t < seq; t++ {
 		tok := int(input[t])
 		for d := 0; d < dim; d++ {
 			ve[d*seq+t] = veEmbed[tok*dim+d]
 		}
-		gatePre := float32(0)
-		for d := 0; d < dim; d++ {
-			gatePre += veGate[d] * x[d*seq+t]
-		}
-		act := float32(1.0 / (1.0 + math.Exp(-float64(gatePre))))
-		veGateAct[t] = act
-		gate := 3.0 * act
-		for d := 0; d < dim; d++ {
-			v[d*seq+t] += gate * ve[d*seq+t]
+		for h := 0; h < heads; h++ {
+			gatePre := float32(0)
+			gateBase := h * gc
+			for c := 0; c < gc; c++ {
+				gatePre += veGate[gateBase+c] * x[c*seq+t]
+			}
+			act := float32(1.0 / (1.0 + math.Exp(-float64(gatePre))))
+			veGateAct[h*seq+t] = act
+			gate := 3.0 * act
+			dBase := h * headDim
+			for d := dBase; d < dBase+headDim; d++ {
+				v[d*seq+t] += gate * ve[d*seq+t]
+			}
 		}
 	}
 }
 
-// veBackwardCF computes VE gradients from dV.
+// veBackwardCF computes per-head VE gradients from dV.
 func veBackwardCF(dVEEmbed, dVEGate, dPrev, dv, ve, veGateAct, veEmbed, veGate, x []float32, input []uint16, dim, seq int) {
+	heads := stories.Heads
+	headDim := stories.HeadDim
+	gc := stories.VEGateChannels
 	for t := 0; t < seq; t++ {
 		tok := int(input[t])
-		act := veGateAct[t]
-		gate := float32(3.0) * act
-		dGate := float32(0)
-		for d := 0; d < dim; d++ {
-			dvdt := dv[d*seq+t]
-			dVEEmbed[tok*dim+d] += dvdt * gate
-			dGate += dvdt * ve[d*seq+t]
-		}
-		dGatePre := dGate * 3.0 * act * (1 - act)
-		for d := 0; d < dim; d++ {
-			dVEGate[d] += dGatePre * x[d*seq+t]
-			dPrev[d*seq+t] += dGatePre * veGate[d]
+		for h := 0; h < heads; h++ {
+			act := veGateAct[h*seq+t]
+			gate := float32(3.0) * act
+			dGate := float32(0)
+			dBase := h * headDim
+			for d := dBase; d < dBase+headDim; d++ {
+				dvdt := dv[d*seq+t]
+				dVEEmbed[tok*dim+d] += dvdt * gate
+				dGate += dvdt * ve[d*seq+t]
+			}
+			dGatePre := dGate * 3.0 * act * (1 - act)
+			gateBase := h * gc
+			for c := 0; c < gc; c++ {
+				dVEGate[gateBase+c] += dGatePre * x[c*seq+t]
+				dPrev[c*seq+t] += dGatePre * veGate[gateBase+c]
+			}
 		}
 	}
 }
@@ -1087,7 +1082,6 @@ func applyLayerAdam(dst *stories.LayerWeights, grad *stories.LayerWeights, st *s
 	adamUpdateCFWithInv(dst.Wo, grad.Wo, &st.Wo, lr, b1, b2, eps, wd, invBC1, invBC2, false)
 	adamUpdateCFWithInv(dst.W1, grad.W1, &st.W1, lr, b1, b2, eps, wd, invBC1, invBC2, false)
 	adamUpdateCFWithInv(dst.W2, grad.W2, &st.W2, lr, b1, b2, eps, wd, invBC1, invBC2, false)
-	adamUpdateCFWithInv(dst.W3, grad.W3, &st.W3, lr, b1, b2, eps, wd, invBC1, invBC2, false)
 	adamUpdateCFWithInv(dst.VEEmbed, grad.VEEmbed, &st.VEEmbed, lr, b1, b2, eps, 0, invBC1, invBC2, true)
 	adamUpdateCFWithInv(dst.VEGate, grad.VEGate, &st.VEGate, lr, b1, b2, eps, 0, invBC1, invBC2, false)
 }

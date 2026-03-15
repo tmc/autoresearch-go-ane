@@ -4,6 +4,7 @@ const (
 	Dim        = 768
 	Hidden     = 2048
 	Heads      = 12
+	HeadDim    = Dim / Heads
 	SeqDefault = 256
 	NLayers    = 12
 	Vocab      = 32000
@@ -14,7 +15,6 @@ const (
 	WOSize = Dim * Dim
 	W1Size = Hidden * Dim
 	W2Size = Dim * Hidden
-	W3Size = Hidden * Dim
 )
 
 type Llama2Config struct {

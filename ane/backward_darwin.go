@@ -56,7 +56,6 @@ func compileStoriesLayerBackward(layer stories.LayerWeights, seq int) (*layerBac
 		Wo: layer.Wo,
 		W1: layer.W1,
 		W2: layer.W2,
-		W3: layer.W3,
 	}); err != nil {
 		return nil, err
 	}
@@ -68,10 +67,6 @@ func compileStoriesLayerBackward(layer stories.LayerWeights, seq int) (*layerBac
 	w1tBlob, err := mil.BuildTransposedWeightBlob(layer.W1, hidden, dim)
 	if err != nil {
 		return nil, fmt.Errorf("compile layer backward: w1t blob: %w", err)
-	}
-	w3tBlob, err := mil.BuildTransposedWeightBlob(layer.W3, hidden, dim)
-	if err != nil {
-		return nil, fmt.Errorf("compile layer backward: w3t blob: %w", err)
 	}
 	wotBlob, err := mil.BuildTransposedWeightBlob(layer.Wo, dim, dim)
 	if err != nil {
@@ -99,10 +94,9 @@ func compileStoriesLayerBackward(layer stories.LayerWeights, seq int) (*layerBac
 		[]model.WeightFile{
 			{Path: "@model_path/weights/w2t.bin", Blob: w2tBlob},
 			{Path: "@model_path/weights/w1t.bin", Blob: w1tBlob},
-			{Path: "@model_path/weights/w3t.bin", Blob: w3tBlob},
 		},
-		dim+2*hidden,
-		dim+2*hidden,
+		dim+hidden,
+		dim+hidden,
 		seq,
 	)
 	if err != nil {
@@ -175,8 +169,8 @@ func compileStoriesLayerBackward(layer stories.LayerWeights, seq int) (*layerBac
 		sdpa1:    sdpa1,
 		sdpa2:    sdpa2,
 		qkv:      qkv,
-		ffnIn:    make([]float32, (dim+2*hidden)*seq),
-		ffnOut:   make([]float32, (dim+2*hidden)*seq),
+		ffnIn:    make([]float32, (dim+hidden)*seq),
+		ffnOut:   make([]float32, (dim+hidden)*seq),
 		sdpa1In:  make([]float32, 4*dim*seq),
 		sdpa1Out: make([]float32, (dim+2*scoreCh)*seq),
 		sdpa2In:  make([]float32, (2*scoreCh+2*dim)*seq),
@@ -210,9 +204,9 @@ func (lb *layerBackward) close() {
 	lb.qkvIn = nil
 }
 
-func (lb *layerBackward) runFFN(dxNorm, dh1, dh3, dFFN, h1, h3 []float32) error {
+func (lb *layerBackward) runFFN(dxNorm, dh1, dFFN, h1 []float32) error {
 	if lb != nil && lb.dynamic {
-		return lb.runDynamicFFN(dxNorm, dh1, dh3, dFFN, h1, h3)
+		return lb.runDynamicFFN(dxNorm, dh1, dFFN, h1)
 	}
 	if lb == nil || lb.ffn == nil {
 		return fmt.Errorf("run layer backward ffn: layer is closed")
@@ -225,20 +219,14 @@ func (lb *layerBackward) runFFN(dxNorm, dh1, dh3, dFFN, h1, h3 []float32) error 
 	if err := checkLen("run layer backward ffn", "h1", h1, hiddenN); err != nil {
 		return err
 	}
-	if err := checkLen("run layer backward ffn", "h3", h3, hiddenN); err != nil {
-		return err
-	}
 	if err := checkLen("run layer backward ffn", "dx", dxNorm, dimN); err != nil {
 		return err
 	}
 	if err := checkLen("run layer backward ffn", "dh1", dh1, hiddenN); err != nil {
 		return err
 	}
-	if err := checkLen("run layer backward ffn", "dh3", dh3, hiddenN); err != nil {
-		return err
-	}
 
-	concatInto(lb.ffnIn, dFFN, h1, h3)
+	concatInto(lb.ffnIn, dFFN, h1)
 	if err := lb.ffn.WriteInputFP16(0, lb.ffnIn); err != nil {
 		return fmt.Errorf("run layer backward ffn: write input: %w", err)
 	}
@@ -250,7 +238,6 @@ func (lb *layerBackward) runFFN(dxNorm, dh1, dh3, dFFN, h1, h3 []float32) error 
 	}
 	copy(dxNorm, lb.ffnOut[:dimN])
 	copy(dh1, lb.ffnOut[dimN:dimN+hiddenN])
-	copy(dh3, lb.ffnOut[dimN+hiddenN:dimN+2*hiddenN])
 	return nil
 }
 
