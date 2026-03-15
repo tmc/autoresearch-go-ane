@@ -132,6 +132,30 @@ func siluBackwardAccel(dh1, dh3, dGate, h1, h3 []float32) {
 // linearCFAccelerate computes out = weights @ x using BLAS.
 // Layout: weights [outCh x inCh] row-major, x [inCh x seq] channel-first,
 // out [outCh x seq] channel-first.
+// blendResidualInPlaceAccel: sum[i] = base[i] + (sum[i]-base[i])*scale
+// Equivalent to: sum = scale*sum + (1-scale)*base
+func blendResidualInPlaceAccel(sum, base []float32, scale float32) {
+	if len(sum) == 0 {
+		return
+	}
+	// sum = scale * sum
+	C.vDSP_vsmul(
+		(*C.float)(unsafe.Pointer(&sum[0])), 1,
+		(*C.float)(unsafe.Pointer(&scale)),
+		(*C.float)(unsafe.Pointer(&sum[0])), 1,
+		C.vDSP_Length(len(sum)),
+	)
+	// sum = sum + (1-scale) * base
+	oneMinusScale := 1.0 - scale
+	C.vDSP_vsma(
+		(*C.float)(unsafe.Pointer(&base[0])), 1,
+		(*C.float)(unsafe.Pointer(&oneMinusScale)),
+		(*C.float)(unsafe.Pointer(&sum[0])), 1,
+		(*C.float)(unsafe.Pointer(&sum[0])), 1,
+		C.vDSP_Length(len(sum)),
+	)
+}
+
 func linearCFAccelerate(out, weights, x []float32, outCh, inCh, seq int) bool {
 	if outCh <= 0 || inCh <= 0 || seq <= 0 {
 		return false
