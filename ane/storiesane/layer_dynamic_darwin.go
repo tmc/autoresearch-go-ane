@@ -231,7 +231,6 @@ func compileStoriesLayerForwardInference(layer stories.LayerWeights, seq int) (_
 		inferScaled: true,
 		rmsAtt:      layer.RMSAtt,
 		rmsFFN:      layer.RMSFFN,
-		x2:          make([]float32, dim*seq),
 	}
 	w := layerForwardWeights{
 		RMSAtt: layer.RMSAtt, Wq: layer.Wq, Wk: layer.Wk, Wv: layer.Wv, Wo: layer.Wo,
@@ -419,6 +418,9 @@ func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
 		}
 	}
 	if !surfaceCopied {
+		if lf.x2 == nil {
+			lf.x2 = make([]float32, lf.dim*lf.seq)
+		}
 		if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
 			return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
 		}
@@ -438,7 +440,6 @@ func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
 	if !lf.inferScaled {
 		addScaledResidual(out, lf.x2, out)
 	}
-	// else: W2 pre-scaled, ANE output is already x2 + s*W2@gate
 	return nil
 }
 
@@ -470,6 +471,9 @@ func (lf *layerForward) runDynamicInferPipelined(out, x []float32, idx int, laye
 		}
 	}
 	if !surfaceCopied {
+		if lf.x2 == nil {
+			lf.x2 = make([]float32, lf.dim*lf.seq)
+		}
 		if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
 			return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
 		}
