@@ -504,8 +504,10 @@ func rmsNormSingle(out, x, w []float32, dim int) {
 // linearSingle computes out = W @ x for a single position.
 // W is [outDim, inDim] row-major, x is [inDim], out is [outDim].
 func linearSingle(out, w, x []float32, outDim, inDim int) {
-	// Use BLAS via linearCF with seq=1 — the CF layout with seq=1
-	// is equivalent to a flat vector.
+	// Try sgemv first (optimized for matrix-vector), fall back to sgemm.
+	if linearSingleGEMV(out, w, x, outDim, inDim) {
+		return
+	}
 	linearCF(out, w, x, outDim, inDim, 1)
 }
 
