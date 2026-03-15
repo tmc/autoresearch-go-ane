@@ -261,18 +261,6 @@ func NewAdamState(n int) AdamState {
 	return AdamState{M: make([]float32, n), V: make([]float32, n)}
 }
 
-func AdamUpdate(w, g []float32, st *AdamState, t int, lr, b1, b2, eps float32) {
-	bc1 := float32(1.0 - math.Pow(float64(b1), float64(t)))
-	bc2 := float32(1.0 - math.Pow(float64(b2), float64(t)))
-	for i := range w {
-		st.M[i] = b1*st.M[i] + (1-b1)*g[i]
-		st.V[i] = b2*st.V[i] + (1-b2)*g[i]*g[i]
-		mh := st.M[i] / bc1
-		vh := st.V[i] / bc2
-		w[i] -= lr * mh / (float32(math.Sqrt(float64(vh))) + eps)
-	}
-}
-
 func MatMulVocabSeq(logits, embed, x []float32, vocab, dim, seq int) {
 	if matMulVocabSeqAccelerate(logits, embed, x, vocab, dim, seq) {
 		return
