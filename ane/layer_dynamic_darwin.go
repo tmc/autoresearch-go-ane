@@ -34,6 +34,10 @@ type dynamicLayerCompileSpec struct {
 	sdpa1MIL   string
 	sdpa2MIL   string
 	qkvMIL     string
+
+	// Inference-only kernels (smaller output surfaces).
+	attInfMIL string
+	ffnInfMIL string
 }
 
 func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
@@ -72,6 +76,8 @@ func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
 		sdpa1MIL:    genStoriesSDPABackward1Dynamic(dim, heads, seq),
 		sdpa2MIL:    mil.GenSDPABackward2(dim, heads, seq),
 		qkvMIL:      genStoriesQKVBackwardDynamic(dim, heads, seq),
+		attInfMIL:   genStoriesSDPAForwardDynamicInference(dim, heads, seq),
+		ffnInfMIL:   genStoriesFFNForwardDynamicInference(dim, hidden, seq),
 	}
 
 	dynamicLayerSpecs.mu.Lock()
@@ -137,6 +143,41 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 	if err != nil {
 		return nil, fmt.Errorf("compile layer forward dynamic: ffn: %w", err)
 	}
+	// Compile inference-only kernels (smaller output, no taps).
+	attInf, err := model.Compile(model.CompileOptions{
+		MILText:     spec.attInfMIL,
+		SharedModel: true,
+		WeightFiles: []model.WeightFile{
+			{
+				Path: "@model_path/weights/mask.bin",
+				Blob: spec.maskBlob,
+			},
+			{
+				Path: "@model_path/weights/rope_cos.bin",
+				Blob: spec.ropeCosBlob,
+			},
+			{
+				Path: "@model_path/weights/rope_sin.bin",
+				Blob: spec.ropeSinBlob,
+			},
+		},
+	})
+	if err != nil {
+		// Non-fatal: fall back to taps kernel for inference.
+		attInf = nil
+	}
+	ffnInf, ffnInfErr := model.Compile(model.CompileOptions{
+		MILText:     spec.ffnInfMIL,
+		SharedModel: true,
+	})
+	if ffnInfErr != nil {
+		ffnInf = nil
+		if attInf != nil {
+			attInf.Close()
+			attInf = nil
+		}
+	}
+
 	lf := &layerForward{
 		dim:     dim,
 		hidden:  hidden,
@@ -144,6 +185,8 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		seq:     seq,
 		att:     att,
 		ffn:     ffn,
+		attInf:  attInf,
+		ffnInf:  ffnInf,
 		dynamic: true,
 		attTaps: true,
 		ffnTaps: true,
@@ -288,6 +331,17 @@ func (lf *layerForward) stageDynamicWeights(w layerForwardWeights) error {
 	if err := stageStoriesFFNForwardWeights(lf.ffn, lf.seq, lf.hidden, w); err != nil {
 		return fmt.Errorf("stage layer forward dynamic weights: ffn: %w", err)
 	}
+	// Stage weights into inference kernels (same input layout, shared weights).
+	if lf.attInf != nil {
+		if err := stageStoriesAttentionForwardWeights(lf.attInf, lf.seq, w); err != nil {
+			return fmt.Errorf("stage layer forward dynamic weights: attention inf: %w", err)
+		}
+	}
+	if lf.ffnInf != nil {
+		if err := stageStoriesFFNForwardWeights(lf.ffnInf, lf.seq, lf.hidden, w); err != nil {
+			return fmt.Errorf("stage layer forward dynamic weights: ffn inf: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -367,9 +421,9 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 	return nil
 }
 
-// runDynamicInferenceOnly runs a dynamic layer reading only the dim output
-// channels from attention and FFN, skipping taps (Q, K, V, att_out, h1).
-// Saves ~30 MB of IOSurface reads per inference call across 12 layers.
+// runDynamicInferenceOnly runs a dynamic layer using inference-only kernels
+// when available, falling back to reading only dim channels from taps kernels.
+// Inference kernels output only dim channels (no taps), shrinking IOSurfaces.
 func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
 	if lf == nil || lf.att == nil || lf.ffn == nil {
 		return fmt.Errorf("run layer forward dynamic: layer is closed")
@@ -381,27 +435,35 @@ func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
 	if len(out) != want {
 		return fmt.Errorf("run layer forward dynamic: output len=%d want=%d", len(out), want)
 	}
-	if err := writeStoriesAttentionForwardActs(lf.att, lf.seq, x); err != nil {
+
+	// Use inference kernels if available, otherwise fall back to taps kernels.
+	attK := lf.att
+	ffnK := lf.ffn
+	if lf.attInf != nil && lf.ffnInf != nil {
+		attK = lf.attInf
+		ffnK = lf.ffnInf
+	}
+
+	if err := writeStoriesAttentionForwardActs(attK, lf.seq, x); err != nil {
 		return fmt.Errorf("run layer forward dynamic: write attention input: %w", err)
 	}
-	if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+	if err := evalKernelTracked(lf.metrics, attK); err != nil {
 		return fmt.Errorf("run layer forward dynamic: eval attention: %w", err)
 	}
-	// Read only x2 (dim channels), skip taps (q, k, v, att_out).
-	if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+	// Read only x2 (dim channels).
+	if err := readOutputFP16ChannelsFast(attK, 0, 0, lf.seq, lf.x2); err != nil {
 		return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
 	}
-	if err := writeStoriesFFNForwardActs(lf.ffn, lf.seq, lf.x2); err != nil {
+	if err := writeStoriesFFNForwardActs(ffnK, lf.seq, lf.x2); err != nil {
 		return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
 	}
-	if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
+	if err := evalKernelTracked(lf.metrics, ffnK); err != nil {
 		return fmt.Errorf("run layer forward dynamic: eval ffn: %w", err)
 	}
-	// Read only x_next (dim channels), skip h1.
-	if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, lf.seq, out); err != nil {
+	// Read only x_next (dim channels).
+	if err := readOutputFP16ChannelsFast(ffnK, 0, 0, lf.seq, out); err != nil {
 		return fmt.Errorf("run layer forward dynamic: read ffn output: %w", err)
 	}
-	// The FFN kernel already computes x_next = x2 + ff, so out is the final result.
 	return nil
 }
 
