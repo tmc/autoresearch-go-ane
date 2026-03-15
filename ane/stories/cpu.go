@@ -38,7 +38,7 @@ func parallelFor(n int, fn func(start, end int)) {
 	wg.Wait()
 }
 
-func EmbedLookup(out, embed []float32, tokens []uint16, dim, seq int) {
+func EmbedLookup(out, embed []float32, tokens []int32, dim, seq int) {
 	if dim <= 0 || seq <= 0 {
 		return
 	}
@@ -71,7 +71,7 @@ func EmbedLookup(out, embed []float32, tokens []uint16, dim, seq int) {
 	})
 }
 
-func EmbedBackward(dEmbed, dx []float32, tokens []uint16, dim, seq int) {
+func EmbedBackward(dEmbed, dx []float32, tokens []int32, dim, seq int) {
 	if dim <= 0 || seq <= 0 {
 		return
 	}
@@ -105,45 +105,6 @@ func RMSNorm(out, x, w []float32, d, s int) {
 			rrms := 1.0 / math.Sqrt(sum/float64(d)+1e-5)
 			for i := 0; i < d; i++ {
 				out[i*s+t] = float32(float64(x[i*s+t]) * rrms * float64(w[i]))
-			}
-		}
-	})
-}
-
-func RMSNormNoWeight(out, x []float32, d, s int) {
-	parallelFor(s, func(start, end int) {
-		for t := start; t < end; t++ {
-			sum := 0.0
-			for i := 0; i < d; i++ {
-				v := float64(x[i*s+t])
-				sum += v * v
-			}
-			scale := 1.0 / math.Sqrt(sum/float64(d)+1e-5)
-			for i := 0; i < d; i++ {
-				out[i*s+t] = float32(float64(x[i*s+t]) * scale)
-			}
-		}
-	})
-}
-
-func RMSNormNoWeightBackward(dx, dy, x []float32, d, s int) {
-	parallelFor(s, func(start, end int) {
-		invD := 1.0 / float64(d)
-		for t := start; t < end; t++ {
-			sum := 0.0
-			for i := 0; i < d; i++ {
-				v := float64(x[i*s+t])
-				sum += v * v
-			}
-			rrms := 1.0 / math.Sqrt(sum*invD+1e-5)
-			dot := 0.0
-			for i := 0; i < d; i++ {
-				dot += float64(dy[i*s+t]) * float64(x[i*s+t])
-			}
-			coeff := dot * rrms * rrms * rrms * invD
-			for i := 0; i < d; i++ {
-				idx := i*s + t
-				dx[idx] = float32(float64(dy[idx])*rrms - coeff*float64(x[idx]))
 			}
 		}
 	})
@@ -209,7 +170,7 @@ func rmsNormBackwardRange(dx, dw, dy, x, w []float32, d, s, start, end int) {
 	}
 }
 
-func CrossEntropyLoss(dLogits, logits []float32, targets []uint16, v, s int) float32 {
+func CrossEntropyLoss(dLogits, logits []float32, targets []int32, v, s int) float32 {
 	if v <= 0 || s <= 0 {
 		return 0
 	}
@@ -298,6 +259,18 @@ type AdamState struct {
 
 func NewAdamState(n int) AdamState {
 	return AdamState{M: make([]float32, n), V: make([]float32, n)}
+}
+
+func AdamUpdate(w, g []float32, st *AdamState, t int, lr, b1, b2, eps float32) {
+	bc1 := float32(1.0 - math.Pow(float64(b1), float64(t)))
+	bc2 := float32(1.0 - math.Pow(float64(b2), float64(t)))
+	for i := range w {
+		st.M[i] = b1*st.M[i] + (1-b1)*g[i]
+		st.V[i] = b2*st.V[i] + (1-b2)*g[i]*g[i]
+		mh := st.M[i] / bc1
+		vh := st.V[i] / bc2
+		w[i] -= lr * mh / (float32(math.Sqrt(float64(vh))) + eps)
+	}
 }
 
 func MatMulVocabSeq(logits, embed, x []float32, vocab, dim, seq int) {
