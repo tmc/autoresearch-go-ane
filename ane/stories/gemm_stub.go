@@ -1,3 +1,5 @@
+//go:build !darwin
+
 package stories
 
 func matMulVocabSeqAccelerate(logits, embed, x []float32, vocab, dim, seq int) bool {
