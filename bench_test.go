@@ -7,12 +7,14 @@ import (
 	"os"
 	"testing"
 
+	"github.com/tmc/aneperf"
 	"github.com/tmc/autoresearch-go-ane/ane"
 )
 
 var (
-	testEngine *ane.Engine
-	testTokens []uint16
+	testEngine  *ane.Engine
+	testTokens  []uint16
+	testSampler *aneperf.Sampler
 )
 
 func TestMain(m *testing.M) {
@@ -58,8 +60,17 @@ func TestMain(m *testing.M) {
 	}
 	fmt.Fprintf(os.Stderr, "engine ready\n")
 
+	testSampler, err = aneperf.NewSampler()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aneperf sampler: %v\n", err)
+		// Non-fatal: benchmarks still run, just without ANE metrics.
+	}
+
 	code := m.Run()
 	testEngine.Close()
+	if testSampler != nil {
+		testSampler.Close()
+	}
 	os.Exit(code)
 }
 
@@ -70,6 +81,7 @@ func TestMain(m *testing.M) {
 //   - step_ms:   per-step wall time
 //   - ane_ms:    ANE eval time per step
 //   - adam_ms:   optimizer time per step
+//   - ane-watts, ane-compute-%, etc. from aneperf
 func BenchmarkStep(b *testing.B) {
 	// Warmup: first few steps have compilation overhead.
 	for range 3 {
@@ -84,10 +96,12 @@ func BenchmarkStep(b *testing.B) {
 	b.SetBytes(tokensPerStep * 2) // uint16 tokens
 	b.ResetTimer()
 	for b.Loop() {
+		snap := startANESample()
 		res, err := testEngine.Step()
 		if err != nil {
 			b.Fatal(err)
 		}
+		stopANESample(snap, b)
 		lastRes = res
 	}
 	b.StopTimer()
@@ -100,6 +114,7 @@ func BenchmarkStep(b *testing.B) {
 
 // BenchmarkEvalLogits measures single-window inference throughput. Reports:
 //   - tokens/s: inference throughput
+//   - ane-watts, ane-compute-%, etc. from aneperf
 func BenchmarkEvalLogits(b *testing.B) {
 	window := testTokens[:evalSeqLen]
 
@@ -111,9 +126,11 @@ func BenchmarkEvalLogits(b *testing.B) {
 	b.SetBytes(int64(evalSeqLen) * 2)
 	b.ResetTimer()
 	for b.Loop() {
+		snap := startANESample()
 		if _, err := testEngine.EvalLogits(window); err != nil {
 			b.Fatal(err)
 		}
+		stopANESample(snap, b)
 	}
 }
 
@@ -121,13 +138,16 @@ func BenchmarkEvalLogits(b *testing.B) {
 // Reports:
 //   - val_loss: cross-entropy in nats
 //   - windows:  number of eval windows processed
+//   - ane-watts, ane-compute-%, etc. from aneperf
 func BenchmarkEvalLoss(b *testing.B) {
 	windows := (evalTokens - 1) / (evalSeqLen - 1)
 	for b.Loop() {
+		snap := startANESample()
 		loss, err := evalLoss(testEngine, testTokens)
 		if err != nil {
 			b.Fatal(err)
 		}
+		stopANESample(snap, b)
 		b.ReportMetric(loss, "val_loss")
 	}
 	b.ReportMetric(float64(windows), "windows")
@@ -140,4 +160,19 @@ func BenchmarkLRSchedule(b *testing.B) {
 		_ = lrSchedule(float64(i) / 1000.0)
 		i++
 	}
+}
+
+func startANESample() aneperf.Snapshot {
+	if testSampler == nil {
+		return aneperf.Snapshot{}
+	}
+	return testSampler.Start()
+}
+
+func stopANESample(snap aneperf.Snapshot, b *testing.B) {
+	if testSampler == nil {
+		return
+	}
+	delta := testSampler.Stop(snap)
+	delta.ReportMetrics(b)
 }
