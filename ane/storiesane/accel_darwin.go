@@ -182,6 +182,52 @@ func linearCFAccelerate(out, weights, x []float32, outCh, inCh, seq int) bool {
 	return true
 }
 
+// siluMulAccel computes gate[i] = silu(h1[i]) * h3[i] using vectorized exp.
+// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+func siluMulAccel(gate, h1, h3 []float32) {
+	n := len(gate)
+	if n == 0 {
+		return
+	}
+	// gate = -h1
+	minusOne := C.float(-1.0)
+	C.vDSP_vsmul(
+		(*C.float)(unsafe.Pointer(&h1[0])), 1,
+		&minusOne,
+		(*C.float)(unsafe.Pointer(&gate[0])), 1,
+		C.vDSP_Length(n),
+	)
+	// gate = exp(-h1)
+	cn := C.int(n)
+	C.vvexpf(
+		(*C.float)(unsafe.Pointer(&gate[0])),
+		(*C.float)(unsafe.Pointer(&gate[0])),
+		&cn,
+	)
+	// gate = 1 + exp(-h1)
+	one := C.float(1.0)
+	C.vDSP_vsadd(
+		(*C.float)(unsafe.Pointer(&gate[0])), 1,
+		&one,
+		(*C.float)(unsafe.Pointer(&gate[0])), 1,
+		C.vDSP_Length(n),
+	)
+	// gate = h1 / (1 + exp(-h1)) = silu(h1)
+	C.vDSP_vdiv(
+		(*C.float)(unsafe.Pointer(&gate[0])), 1,
+		(*C.float)(unsafe.Pointer(&h1[0])), 1,
+		(*C.float)(unsafe.Pointer(&gate[0])), 1,
+		C.vDSP_Length(n),
+	)
+	// gate = silu(h1) * h3
+	C.vDSP_vmul(
+		(*C.float)(unsafe.Pointer(&gate[0])), 1,
+		(*C.float)(unsafe.Pointer(&h3[0])), 1,
+		(*C.float)(unsafe.Pointer(&gate[0])), 1,
+		C.vDSP_Length(n),
+	)
+}
+
 func softmaxRowAccel(out, in []float32) {
 	n := len(in)
 	if n == 0 {

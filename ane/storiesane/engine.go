@@ -840,9 +840,7 @@ func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 		rmsNormCF(xNorm, x2, layer.RMSFFN, stories.Dim, e.seq)
 		linearCF(h1, layer.W1, xNorm, stories.Hidden, stories.Dim, e.seq)
 		linearCF(h3, layer.W3, xNorm, stories.Hidden, stories.Dim, e.seq)
-		for j := range gate {
-			gate[j] = silu32(h1[j]) * h3[j]
-		}
+		siluMulAccel(gate, h1, h3)
 		linearCF(ffOut, layer.W2, gate, stories.Dim, stories.Hidden, e.seq)
 		addScaledResidual(next, x2, ffOut)
 		cur, next = next, cur

@@ -43,6 +43,12 @@ func blendResidualInPlaceAccel(sum, base []float32, scale float32) {
 	}
 }
 
+func siluMulAccel(gate, h1, h3 []float32) {
+	for i := range gate {
+		gate[i] = silu32(h1[i]) * h3[i]
+	}
+}
+
 func linearCFAccelerate(out, weights, x []float32, outCh, inCh, seq int) bool {
 	return false
 }
