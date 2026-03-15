@@ -181,6 +181,30 @@ func accumLinearGrad3CFAccelerate(dW1, dy1, dW2, dy2, dW3, dy3, x []float32, out
 	return true
 }
 
+// --- linearCF BLAS ---
+
+func linearCFAccelerate(out, weights, in []float32, outCh, inCh, seq int) bool {
+	if outCh <= 0 || inCh <= 0 || seq <= 0 {
+		return false
+	}
+	if len(out) < outCh*seq || len(weights) < outCh*inCh || len(in) < inCh*seq {
+		return false
+	}
+	// out = weights @ in  (outCh x inCh) @ (inCh x seq) = (outCh x seq)
+	// weights is row-major [outCh, inCh], in is channel-first [inCh, seq],
+	// out is channel-first [outCh, seq].
+	accelerate.Cblas_sgemm(
+		accelerate.CblasRowMajor,
+		accelerate.CblasNoTrans,
+		accelerate.CblasNoTrans,
+		outCh, seq, inCh,
+		1.0, weights, inCh,
+		in, seq,
+		0.0, out, seq,
+	)
+	return true
+}
+
 // --- grad ops ---
 
 func sumSquaresGrad(v []float32) float64 {
