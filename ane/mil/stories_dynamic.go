@@ -28,8 +28,7 @@ func appendDynamicRMSNormFP16(b *strings.Builder, outVar, xVar, wVar string, dim
 	fmt.Fprintf(b, "        tensor<fp16, [1,1,1,%d]> %s_ss2 = mul(x=%s_ss,y=invd)[name=string(\"%s_ss2\")];\n", seq, outVar, outVar, outVar)
 	b.WriteString("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n")
 	fmt.Fprintf(b, "        tensor<fp16, [1,1,1,%d]> %s_ss3 = add(x=%s_ss2,y=eps)[name=string(\"%s_ss3\")];\n", seq, outVar, outVar, outVar)
-	b.WriteString("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n")
-	fmt.Fprintf(b, "        tensor<fp16, [1,1,1,%d]> %s_rrms = pow(x=%s_ss3,y=nhalf)[name=string(\"%s_rrms\")];\n", seq, outVar, outVar, outVar)
+	fmt.Fprintf(b, "        tensor<fp16, [1,1,1,%d]> %s_rrms = rsqrt(x=%s_ss3)[name=string(\"%s_rrms\")];\n", seq, outVar, outVar, outVar)
 	fmt.Fprintf(b, "        tensor<fp16, [1,%d,1,%d]> %s_xr = mul(x=%s,y=%s_rrms)[name=string(\"%s_xr\")];\n", dim, seq, outVar, xVar, outVar, outVar)
 	fmt.Fprintf(b, "        tensor<fp16, [1,%d,1,%d]> %s = mul(x=%s_xr,y=%s)[name=string(\"%s\")];\n", dim, seq, outVar, outVar, wVar, outVar)
 }
