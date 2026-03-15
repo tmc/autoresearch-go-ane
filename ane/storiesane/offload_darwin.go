@@ -363,16 +363,49 @@ func disableKernel(k **model.Kernel) {
 }
 
 func (o *offload) runRMSForward(out, x []float32) error {
-	if err := o.rmsFwd.WriteInputFP16(1, o.rmsWExpanded); err != nil {
+	// Write activations to input[0], adapting to compiled layout.
+	if err := writeRMSInput(o.rmsFwd, 0, x); err != nil {
 		return err
 	}
-	if err := o.rmsFwd.WriteInputFP16(0, x); err != nil {
+	// Write weights to input[1], using pre-expanded buffer.
+	if err := writeRMSInput(o.rmsFwd, 1, o.rmsWExpanded); err != nil {
 		return err
 	}
 	if err := evalKernelTracked(o.metrics, o.rmsFwd); err != nil {
 		return err
 	}
 	return o.rmsFwd.ReadOutputFP16(0, out)
+}
+
+// writeRMSInput writes data to an RMS kernel input, handling cases where
+// the ANE compiler transforms the input layout dimensions.
+func writeRMSInput(k *model.Kernel, input int, data []float32) error {
+	layout := k.InputLayout(input)
+	need := layout.Channels * layout.Width
+	if need == len(data) || need <= 0 {
+		return k.WriteInputFP16(input, data)
+	}
+	// Expand or contract data to match compiled layout.
+	dim := layout.Channels
+	seq := layout.Width
+	if dim*seq != need {
+		return k.WriteInputFP16(input, data) // let it error naturally
+	}
+	buf := make([]float32, need)
+	srcSeq := len(data) / dim
+	if srcSeq <= 0 {
+		srcSeq = 1
+	}
+	for d := 0; d < dim; d++ {
+		for t := 0; t < seq; t++ {
+			srcT := t
+			if srcT >= srcSeq {
+				srcT = srcSeq - 1
+			}
+			buf[d*seq+t] = data[d*srcSeq+srcT]
+		}
+	}
+	return k.WriteInputFP16(input, buf)
 }
 
 func (o *offload) runClassifierForward(logits, xNorm []float32) error {
