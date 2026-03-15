@@ -844,10 +844,20 @@ func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
 		}
 		cur, next = next, cur
 	}
-	if e.off == nil || !e.off.hasRMSForward() {
-		stories.RMSNorm(e.xNorm, cur, e.mw.RMSFinal, stories.Dim, e.seq)
-	} else if err := e.off.runRMSForward(e.xNorm, cur); err != nil {
-		return fmt.Errorf("storiesane eval logits: final rmsnorm: %w", err)
+	// Try direct surface copy from last FFN to RMS norm.
+	lastLF := useLayers[len(useLayers)-1]
+	rmsOK := false
+	if e.off != nil && e.off.hasRMSForward() && lastLF != nil && lastLF.ffn != nil {
+		if err := e.off.runRMSForwardFromSurface(e.xNorm, lastLF.ffn, stories.Dim, e.seq); err == nil {
+			rmsOK = true
+		}
+	}
+	if !rmsOK {
+		if e.off == nil || !e.off.hasRMSForward() {
+			stories.RMSNorm(e.xNorm, cur, e.mw.RMSFinal, stories.Dim, e.seq)
+		} else if err := e.off.runRMSForward(e.xNorm, cur); err != nil {
+			return fmt.Errorf("storiesane eval logits: final rmsnorm: %w", err)
+		}
 	}
 	if e.off == nil || !e.off.hasClassifierForward() {
 		stories.MatMulVocabSeq(logits, e.mw.Embed, e.xNorm, stories.Vocab, stories.Dim, e.seq)

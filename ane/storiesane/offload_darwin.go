@@ -377,6 +377,25 @@ func (o *offload) runRMSForward(out, x []float32) error {
 	return o.rmsFwd.ReadOutputFP16(0, out)
 }
 
+// runRMSForwardFromSurface copies FFN output directly to RMS input, skipping CPU roundtrip.
+func (o *offload) runRMSForwardFromSurface(out []float32, src *model.Kernel, dim, seq int) error {
+	if o == nil || o.rmsFwd == nil || src == nil {
+		return fmt.Errorf("rms forward from surface: unavailable")
+	}
+	// Copy FFN output surface → RMS input[0] surface.
+	if err := model.CopyOutputRangeToInput(o.rmsFwd, 0, 0, 0, src, 0, 0, 0, dim, seq); err != nil {
+		return err
+	}
+	// Write weights to input[1].
+	if err := writeRMSInput(o.rmsFwd, 1, o.rmsWExpanded); err != nil {
+		return err
+	}
+	if err := evalKernelTracked(o.metrics, o.rmsFwd); err != nil {
+		return err
+	}
+	return o.rmsFwd.ReadOutputFP16(0, out)
+}
+
 // writeRMSInput writes data to an RMS kernel input, handling cases where
 // the ANE compiler transforms the input layout dimensions.
 func writeRMSInput(k *model.Kernel, input int, data []float32) error {
