@@ -13,7 +13,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 	"time"
 
@@ -33,7 +36,18 @@ func main() {
 	seqLen := flag.Int("seq", 256, "sequence length for the model")
 	useANE := flag.Bool("ane", true, "use Apple Neural Engine")
 	rawTokens := flag.Bool("raw", false, "treat --prompt as comma-separated token IDs")
+	cpuProfile := flag.String("cpuprofile", "", "write CPU profile to file")
+	memProfile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
+
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	if *modelPath == "" {
 		log.Fatal("--model is required")
@@ -156,6 +170,15 @@ func main() {
 			}
 		}
 
+		if generated <= 3 {
+			t := engine.LastTokenTimings()
+			log.Printf("  token %d timings: total=%v qkv=%v attn=%v wo=%v ffn=%v cls=%v fp16=%v",
+				step, t.Total.Round(time.Millisecond), t.QKV.Round(time.Millisecond),
+				t.Attention.Round(time.Millisecond), t.Wo.Round(time.Millisecond),
+				t.FFN.Round(time.Millisecond), t.Classifier.Round(time.Millisecond),
+				t.FP16Conv.Round(time.Millisecond))
+		}
+
 		return true
 	})
 	if err != nil {
@@ -164,6 +187,17 @@ func main() {
 
 	elapsed := time.Since(genStart)
 	tokPerSec := float64(generated) / elapsed.Seconds()
+
+	if *memProfile != "" {
+		f, err := os.Create(*memProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		runtime.GC()
+		pprof.WriteHeapProfile(f)
+		f.Close()
+	}
+
 	fmt.Println()
 	log.Printf("generated %d tokens in %v (%.1f tok/s)", generated, elapsed.Round(time.Millisecond), tokPerSec)
 }

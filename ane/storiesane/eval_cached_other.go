@@ -2,7 +2,31 @@
 
 package storiesane
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
+
+// TokenTimings holds per-token timing breakdown for EvalNextToken.
+type TokenTimings struct {
+	Total      time.Duration
+	Embed      time.Duration
+	LayerTotal time.Duration
+	QKV        time.Duration
+	RoPE       time.Duration
+	Attention  time.Duration
+	Wo         time.Duration
+	FFN        time.Duration
+	Residual   time.Duration
+	RMSNorm    time.Duration
+	Classifier time.Duration
+	FP16Conv   time.Duration
+}
+
+// LastTokenTimings returns the per-component timing breakdown from the most recent EvalNextToken call.
+func (e *Engine) LastTokenTimings() TokenTimings {
+	return TokenTimings{}
+}
 
 // ResetCache clears the KV cache (no-op on non-darwin).
 func (e *Engine) ResetCache() {}

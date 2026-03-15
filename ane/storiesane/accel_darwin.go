@@ -40,6 +40,17 @@ static void silu_backward_f32(
 	}
 }
 
+// Matrix-vector multiply using cblas_sgemv (optimized for seq=1).
+// weights: [outDim, inDim] row-major fp32
+// x: [inDim] fp32, out: [outDim] fp32
+static void storiesane_gemv_f32(float *out, const float *weights, const float *x, int outDim, int inDim) {
+	cblas_sgemv(CblasRowMajor, CblasNoTrans,
+		outDim, inDim,
+		1.0f, weights, inDim,
+		x, 1,
+		0.0f, out, 1);
+}
+
 // softmax_row_f32 computes numerically-stable softmax over n elements.
 static void softmax_row_f32(float* out, const float* in, int n) {
 	float maxv;
@@ -238,5 +249,24 @@ func softmaxRowAccel(out, in []float32) {
 		(*C.float)(unsafe.Pointer(&in[0])),
 		C.int(n),
 	)
+}
+
+// linearSingleGEMV uses cblas_sgemv for single-token matmul (seq=1).
+// Faster than cblas_sgemm for matrix-vector products.
+func linearSingleGEMV(out, weights, x []float32, outDim, inDim int) bool {
+	if outDim <= 0 || inDim <= 0 {
+		return false
+	}
+	if len(out) < outDim || len(weights) < outDim*inDim || len(x) < inDim {
+		return false
+	}
+	C.storiesane_gemv_f32(
+		(*C.float)(unsafe.Pointer(&out[0])),
+		(*C.float)(unsafe.Pointer(&weights[0])),
+		(*C.float)(unsafe.Pointer(&x[0])),
+		C.int(outDim),
+		C.int(inDim),
+	)
+	return true
 }
 

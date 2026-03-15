@@ -5,7 +5,32 @@ package storiesane
 import (
 	"fmt"
 	"math"
+	"time"
 )
+
+// TokenTimings holds per-token timing breakdown for EvalNextToken.
+type TokenTimings struct {
+	Total      time.Duration
+	Embed      time.Duration
+	LayerTotal time.Duration
+	QKV        time.Duration // Fused QKV matmul
+	RoPE       time.Duration
+	Attention  time.Duration // Single-query attention against KV cache
+	Wo         time.Duration
+	FFN        time.Duration // Fused W1W3 + SiLU + W2
+	Residual   time.Duration
+	RMSNorm    time.Duration
+	Classifier time.Duration
+	FP16Conv   time.Duration // fp16→fp32 conversion time
+}
+
+// LastTokenTimings returns the per-component timing breakdown from the most recent EvalNextToken call.
+func (e *Engine) LastTokenTimings() TokenTimings {
+	if e == nil {
+		return TokenTimings{}
+	}
+	return e.lastTokenTimings
+}
 
 // ResetCache clears the KV cache, forcing the next EvalNextToken call to
 // re-process the full prompt from scratch.
@@ -64,6 +89,8 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		e.cacheQKV = make([]float32, qDim+2*kvDim)
 		// Fused W1W3 buffer: [2*hidden] for one BLAS call instead of 2.
 		e.cacheH1H3 = make([]float32, 2*hidden)
+		// Pre-build fused weight matrices to avoid cold-start overhead.
+		e.ensureFusedWeights()
 	}
 
 	// Lazily allocate fp16 scratch and fused fp16 weight arrays.
@@ -78,9 +105,6 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		if w2Size := dim * hidden; w2Size > maxSize {
 			maxSize = w2Size
 		}
-		if embedSize := vocab * dim; embedSize > maxSize {
-			maxSize = embedSize
-		}
 		e.fp16Scratch = make([]float32, maxSize)
 		e.fusedQKVFP16 = make([][]uint16, cfg.NLayers)
 		e.fusedW1W3FP16 = make([][]uint16, cfg.NLayers)
@@ -92,36 +116,40 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 	pos := e.kvc.pos
 
+	var timings TokenTimings
+	t0 := time.Now()
+
 	// --- Embedding lookup for single token ---
+	tEmbed := time.Now()
 	tokInt := int(token)
 	if tokInt >= vocab {
 		tokInt = 0
 	}
-	if useFP16 {
-		// Convert fp16 embedding row to fp32.
-		convertFP16ToF32(e.cacheX[:dim], e.mw.EmbedFP16[tokInt*dim:(tokInt+1)*dim])
-	} else {
-		for d := 0; d < dim; d++ {
-			e.cacheX[d] = e.mw.Embed[tokInt*dim+d]
-		}
+	for d := 0; d < dim; d++ {
+		e.cacheX[d] = e.mw.Embed[tokInt*dim+d]
 	}
+	timings.Embed = time.Since(tEmbed)
 
 	cur := e.cacheX
 	next := e.cacheNext
 	residualScale := float32(e.cfg.ResidualScale())
 
 	// --- Transformer layers ---
+	tLayerStart := time.Now()
 	for li := range e.mw.Layers {
 		layer := e.mw.Layers[li]
 
 		// Attention sub-block: RMSNorm → Q,K,V → RoPE → cache → attention → Wo → residual
+		tRMS := time.Now()
 		if useFP16 {
 			rmsNormSingle(e.cacheXNorm, cur, e.mw.FP16Layers[li].RMSAtt, dim)
 		} else {
 			rmsNormSingle(e.cacheXNorm, cur, layer.RMSAtt, dim)
 		}
+		timings.RMSNorm += time.Since(tRMS)
 
 		// Fused QKV: one BLAS call instead of 3.
+		tQKV := time.Now()
 		qkvSize := (qDim + 2*kvDim) * dim
 		if useFP16 {
 			if e.fusedQKVFP16[li] == nil {
@@ -132,7 +160,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 				copy(fused[(qDim+kvDim)*dim:], fp16L.Wv)
 				e.fusedQKVFP16[li] = fused
 			}
+			tFP16 := time.Now()
 			convertFP16ToF32(e.fp16Scratch[:qkvSize], e.fusedQKVFP16[li])
+			timings.FP16Conv += time.Since(tFP16)
 			linearSingle(e.cacheQKV, e.fp16Scratch[:qkvSize], e.cacheXNorm, qDim+2*kvDim, dim)
 		} else {
 			if e.fusedQKVW == nil {
@@ -148,42 +178,57 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 			}
 			linearSingle(e.cacheQKV, e.fusedQKVW[li], e.cacheXNorm, qDim+2*kvDim, dim)
 		}
+		timings.QKV += time.Since(tQKV)
+
 		// Use slices directly from fused output to avoid copies.
 		fusedQ := e.cacheQKV[:qDim]
 		fusedK := e.cacheQKV[qDim : qDim+kvDim]
 		fusedV := e.cacheQKV[qDim+kvDim:]
 
+		tRoPE := time.Now()
 		applyRoPESinglePos(fusedQ, heads, headDim, pos, e.cachedRopeCos, e.cachedRopeSin)
 		applyRoPESinglePos(fusedK, kvHeads, headDim, pos, e.cachedRopeCos, e.cachedRopeSin)
+		timings.RoPE += time.Since(tRoPE)
 
 		// Append K, V to cache.
 		e.kvc.appendKV(li, fusedK, fusedV)
 
 		// Single-query attention against cached KV.
+		tAttn := time.Now()
 		cachedK := e.kvc.getK(li)
 		cachedV := e.kvc.getV(li)
 		singleQueryGQAAttention(e.cacheAttOut, fusedQ, cachedK, cachedV,
 			heads, kvHeads, headDim, pos+1, e.kvc.maxSeq)
+		timings.Attention += time.Since(tAttn)
 
 		// Wo projection: [dim, qDim] @ attOut[qDim] → x2[dim]
+		tWo := time.Now()
 		if useFP16 {
 			woSize := dim * qDim
+			tFP16 := time.Now()
 			convertFP16ToF32(e.fp16Scratch[:woSize], e.mw.FP16Layers[li].Wo)
+			timings.FP16Conv += time.Since(tFP16)
 			linearSingle(e.cacheX2, e.fp16Scratch[:woSize], e.cacheAttOut, dim, qDim)
 		} else {
 			linearSingle(e.cacheX2, layer.Wo, e.cacheAttOut, dim, qDim)
 		}
+		timings.Wo += time.Since(tWo)
 
 		// Residual connection: x2 = cur + scale * x2
+		tRes := time.Now()
 		addScaledResidualSingle(e.cacheX2, cur, e.cacheX2, residualScale)
+		timings.Residual += time.Since(tRes)
 
 		// FFN sub-block: RMSNorm → W1+W3 fused → SiLU → W2 → residual
+		tRMS = time.Now()
 		if useFP16 {
 			rmsNormSingle(e.cacheXNorm, e.cacheX2, e.mw.FP16Layers[li].RMSFFN, dim)
 		} else {
 			rmsNormSingle(e.cacheXNorm, e.cacheX2, layer.RMSFFN, dim)
 		}
+		timings.RMSNorm += time.Since(tRMS)
 
+		tFFN := time.Now()
 		w1w3Size := 2 * hidden * dim
 		if useFP16 {
 			if e.fusedW1W3FP16[li] == nil {
@@ -193,7 +238,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 				copy(fused[hidden*dim:], fp16L.W3)
 				e.fusedW1W3FP16[li] = fused
 			}
+			tFP16 := time.Now()
 			convertFP16ToF32(e.fp16Scratch[:w1w3Size], e.fusedW1W3FP16[li])
+			timings.FP16Conv += time.Since(tFP16)
 			linearSingle(e.cacheH1H3, e.fp16Scratch[:w1w3Size], e.cacheXNorm, 2*hidden, dim)
 		} else {
 			if e.fusedW1W3 == nil {
@@ -211,33 +258,75 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		if useFP16 {
 			w2Size := dim * hidden
+			tFP16 := time.Now()
 			convertFP16ToF32(e.fp16Scratch[:w2Size], e.mw.FP16Layers[li].W2)
+			timings.FP16Conv += time.Since(tFP16)
 			linearSingle(e.cacheFFOut, e.fp16Scratch[:w2Size], e.cacheGate, dim, hidden)
 		} else {
 			linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
 		}
+		timings.FFN += time.Since(tFFN)
+
+		tRes = time.Now()
 		addScaledResidualSingle(next, e.cacheX2, e.cacheFFOut, residualScale)
+		timings.Residual += time.Since(tRes)
 
 		cur, next = next, cur
 	}
+	timings.LayerTotal = time.Since(tLayerStart)
 
 	// Final RMSNorm + classifier.
+	tRMS := time.Now()
 	rmsNormSingle(e.cacheXNorm, cur, e.mw.RMSFinal, dim)
+	timings.RMSNorm += time.Since(tRMS)
 
 	// Classifier: logits = Embed @ xNorm where Embed is [vocab, dim] row-major.
-	// Use BLAS matmul via linearCF with seq=1.
-	if useFP16 {
-		embedSize := vocab * dim
-		convertFP16ToF32(e.fp16Scratch[:embedSize], e.mw.EmbedFP16)
-		linearSingle(e.cacheLogits, e.fp16Scratch[:embedSize], e.cacheXNorm, vocab, dim)
-	} else {
-		linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
-	}
+	// Always use fp32 embedding — too large to convert per token (~1.5GB for 151K vocab).
+	tCls := time.Now()
+	linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
+	timings.Classifier = time.Since(tCls)
 
 	e.kvc.advancePos()
 
+	timings.Total = time.Since(t0)
+	e.lastTokenTimings = timings
+
 	// Return the internal buffer directly — caller must consume before next call.
 	return e.cacheLogits, nil
+}
+
+// ensureFusedWeights pre-builds the fused QKV and W1W3 weight matrices for
+// all layers. Called once at first use to avoid cold-start overhead.
+func (e *Engine) ensureFusedWeights() {
+	cfg := e.cfg
+	dim := cfg.Dim
+	qDim := cfg.QDim()
+	kvDim := cfg.KVDim()
+	hidden := cfg.Hidden
+
+	if e.fusedQKVW == nil {
+		e.fusedQKVW = make([][]float32, cfg.NLayers)
+		e.fusedW1W3 = make([][]float32, cfg.NLayers)
+	}
+	for li := range e.mw.Layers {
+		if e.fusedQKVW[li] == nil {
+			layer := e.mw.Layers[li]
+			qkvSize := (qDim + 2*kvDim) * dim
+			fused := make([]float32, qkvSize)
+			copy(fused[0:], layer.Wq)
+			copy(fused[qDim*dim:], layer.Wk)
+			copy(fused[(qDim+kvDim)*dim:], layer.Wv)
+			e.fusedQKVW[li] = fused
+		}
+		if e.fusedW1W3[li] == nil {
+			layer := e.mw.Layers[li]
+			w1w3Size := 2 * hidden * dim
+			fused := make([]float32, w1w3Size)
+			copy(fused[0:], layer.W1)
+			copy(fused[hidden*dim:], layer.W3)
+			e.fusedW1W3[li] = fused
+		}
+	}
 }
 
 // EvalPrefill processes a full prompt through EvalNextToken, populating the

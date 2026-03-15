@@ -167,6 +167,8 @@ type Engine struct {
 	fusedQKVFP16  [][]uint16  // per-layer fused QKV in fp16
 	fusedW1W3FP16 [][]uint16  // per-layer fused W1+W3 in fp16
 	fp16Scratch   []float32   // scratch buffer for largest weight matrix (fp16→fp32)
+
+	lastTokenTimings TokenTimings
 }
 
 const (
@@ -240,7 +242,7 @@ func Open(opts Options) (*Engine, error) {
 	// Only beneficial for large models where memory bandwidth dominates over
 	// fp16→fp32 conversion overhead. Threshold: ~4GB of weight data.
 	weightBytes := int64(cfg.NLayers) * int64(cfg.WqSize()+cfg.WkSize()+cfg.WvSize()+cfg.WoSize()+cfg.W1Size()+cfg.W2Size()+cfg.W3Size()) * 4
-	if weightBytes > 4*1024*1024*1024 {
+	if weightBytes > 1000*1024*1024*1024 { // fp16 conversion is slower than raw fp32 BLAS; disabled until BNNS fp16 GEMM
 		mw.CompressToFP16()
 	}
 

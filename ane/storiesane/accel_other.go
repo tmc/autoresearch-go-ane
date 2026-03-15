@@ -53,6 +53,10 @@ func linearCFAccelerate(out, weights, x []float32, outCh, inCh, seq int) bool {
 	return false
 }
 
+func linearSingleGEMV(out, weights, x []float32, outDim, inDim int) bool {
+	return false
+}
+
 func softmaxRowAccel(out, in []float32) {
 	maxv := in[0]
 	for i := 1; i < len(in); i++ {
