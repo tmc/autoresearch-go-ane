@@ -147,7 +147,7 @@ func loadTokens(path string) ([]uint16, error) {
 // --- evaluation ---
 
 const (
-	evalTokens = 100_000
+	evalTokens = 10_000
 	evalSeqLen = 256
 )
 
