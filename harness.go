@@ -35,6 +35,12 @@ func loadTokens(path string) ([]uint16, error) {
 const (
 	evalTokens = 10_000
 	evalSeqLen = 256
+
+	// avgBytesPerToken is the mean UTF-8 byte length per token for the
+	// Llama2 32K sentencepiece tokenizer on English text. Used to convert
+	// cross-entropy loss (nats/token) to bits per byte (BPB), a
+	// vocab-size-independent metric: bpb = loss / ln(2) / avgBytesPerToken.
+	avgBytesPerToken = 3.7
 )
 
 func evalLoss(engine *ane.Engine, tokens []uint16) (float64, error) {

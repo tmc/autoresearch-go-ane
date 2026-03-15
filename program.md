@@ -13,8 +13,8 @@ To set up a new experiment, work with the user to:
    - `harness.go` — evaluation harness, data loading, random init. Do not modify.
    - `bench_test.go` — Go benchmarks for measuring step throughput, eval loss, etc. Do not modify.
    - `ane/train_full.go` — forward pass, backward pass, Adam optimizer, gradient clipping. Editable.
-   - `ane/train_util.go` — cross-entropy loss, RMS norm gradients, residual scaling, RoPE. Editable.
-   - `ane/common.go` — CPU primitives (linear, attention, softmax, silu), grad task concurrency. Editable.
+   - `ane/train_util.go` — cross-entropy loss, RMS norm gradients, RoPE. Editable.
+   - `ane/common.go` — CPU primitives (linear, attention, softmax, reluSquared, QK-norm, logit softcap, smear, backout), grad task concurrency. Editable.
    - `ane/accel_darwin.go` — Accelerate BLAS wrappers for GEMM. Editable.
    - `ane/accel_stub.go` — pure Go fallbacks for non-darwin. Keep in sync with accel_darwin.go.
    - `ane/engine.go` — Engine struct, Open, Step, EvalLogits, Close. Editable with care.
@@ -39,8 +39,8 @@ You have two tiers of editable files:
 
 **Tier 2 — Training internals** (`ane/` package):
 - `ane/train_full.go` — forward/backward pass, Adam optimizer, gradient accumulation
-- `ane/train_util.go` — loss computation, RMS norm gradients, residual scaling, RoPE
-- `ane/common.go` — CPU primitives (linearCF, causalAttentionCF, softmax, silu), grad concurrency
+- `ane/train_util.go` — loss computation, RMS norm gradients, RoPE
+- `ane/common.go` — CPU primitives (linearCF, causalAttentionCF, softmax, reluSquared, QK-norm, logit softcap, smear, backout), grad concurrency
 - `ane/accel_darwin.go` / `ane/accel_stub.go` — Accelerate BLAS wrappers
 - `ane/engine.go` — Engine struct, Step logic, data sampling
 - `ane/stories/cpu.go` — low-level CPU kernels
@@ -55,7 +55,7 @@ These are more impactful but riskier. Changes here can affect correctness, so ve
 - `ane/layer_darwin.go`, `ane/backward_darwin.go` — ANE MIL kernel dispatch.
 - `ane/offload_darwin.go` — ANE offload (RMS norm, classifier, softmax kernels).
 
-**The goal is simple: get the lowest val_loss.** The time budget is fixed at 5 minutes. Everything in the editable files is fair game.
+**The goal is simple: get the lowest val_bpb (bits per byte).** The time budget is fixed at 5 minutes. Everything in the editable files is fair game.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win.
 
@@ -81,13 +81,14 @@ benchstat bench_before.txt bench_after.txt
 ```
 
 This shows per-benchmark differences with p-values. The key metrics:
-- `BenchmarkEvalLoss` `val_loss` — **this is the metric you are optimizing** (cross-entropy in nats, lower is better)
+- `BenchmarkEvalLoss` `val_bpb` — **this is the metric you are optimizing** (bits per byte, lower is better, vocab-size-independent)
+- `BenchmarkEvalLoss` `val_loss` — cross-entropy in nats (equivalent to val_bpb but vocab-dependent)
 - `BenchmarkStep` `loss` — training loss trajectory (should decrease over steps)
 - `BenchmarkStep` `tok/s` — training throughput (tokens per second)
 - `BenchmarkStep` `ane-compute-%` — ANE utilization during training
 - `BenchmarkEvalLogits` `ns/op` — inference latency per 256-token window
 
-A change is worth keeping if `val_loss` decreased with `p < 0.05`. If benchstat shows `~` (no significant difference), the change has no effect — discard it.
+A change is worth keeping if `val_bpb` decreased with `p < 0.05`. If benchstat shows `~` (no significant difference), the change has no effect — discard it.
 
 The `-count 6` flag runs each benchmark 6 times for meaningful statistics. Use `-benchtime 3x` for faster exploration, `-benchtime 10x` for precise final measurements.
 
@@ -95,27 +96,28 @@ The `-count 6` flag runs each benchmark 6 times for meaningful statistics. Use `
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-The TSV has a header row and 6 columns:
+The TSV has a header row and 7 columns:
 
 ```
-commit	val_loss	steps	train_secs	status	description
+commit	val_bpb	val_loss	steps	train_secs	status	description
 ```
 
 1. git commit hash (short, 7 chars)
-2. val_loss achieved (e.g. 3.456789) — use 0.000000 for crashes
-3. number of training steps completed
-4. training wall clock seconds
-5. status: `keep`, `discard`, or `crash`
-6. short text description of what this experiment tried
+2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
+3. val_loss in nats (e.g. 3.456789) — use 0.000000 for crashes
+4. number of training steps completed
+5. training wall clock seconds
+6. status: `keep`, `discard`, or `crash`
+7. short text description of what this experiment tried
 
 Example:
 
 ```
-commit	val_loss	steps	train_secs	status	description
-a1b2c3d	3.456789	1500	300.1	keep	baseline
-b2c3d4e	3.412345	1520	300.3	keep	increase LR to 1e-3
-c3d4e5f	3.501234	1480	300.0	discard	switch to linear decay
-d4e5f6g	0.000000	0	0.0	crash	sequence length 1024 (OOM)
+commit	val_bpb	val_loss	steps	train_secs	status	description
+a1b2c3d	1.345678	3.456789	1500	300.1	keep	baseline
+b2c3d4e	1.328765	3.412345	1520	300.3	keep	increase LR to 1e-3
+c3d4e5f	1.363210	3.501234	1480	300.0	discard	switch to linear decay
+d4e5f6g	0.000000	0.000000	0	0.0	crash	sequence length 1024 (OOM)
 ```
 
 NOTE: do not commit `results.tsv` — leave it untracked by git.
@@ -132,11 +134,11 @@ LOOP FOREVER:
 4. git commit: `git add -A && git commit -m "<description>"`
 5. Run benchmarks: `go test -bench . -benchtime 5x -count 6 | tee bench_after.txt`
 6. Compare: `benchstat bench_before.txt bench_after.txt`
-7. If `val_loss` improved (decreased) with statistical significance:
+7. If `val_bpb` improved (decreased) with statistical significance:
    - You "advance" the branch, keeping the git commit.
    - `mv bench_after.txt bench_before.txt` (new baseline).
    - Log results to `results.tsv`.
-8. If `val_loss` is equal or worse:
+8. If `val_bpb` is equal or worse:
    - `git reset --hard HEAD~1` to revert.
    - Log results to `results.tsv` with status `discard`.
 9. If the build or run crashed:
@@ -194,9 +196,12 @@ You can add new functions, constants, or logic to `experiment.go`. The `experime
 - `flushPending` — gradient accumulation flush. You can modify the scaling or add gradient noise.
 
 #### Forward pass (ane/train_full.go)
-- `forwardTrainingCPU` — the full forward pass. The architecture is fixed (Llama2-style), but you can:
-  - Modify residual scaling (`layerResidualScale` in train_util.go)
-  - Change how residual connections combine
+- `forwardTrainingCPU` — the full forward pass (nanochat-style). You can:
+  - Tune residual lambda init values (in stories/weights.go RandomInit)
+  - Change smear/backout lambda init values
+  - Modify QK-norm scale factor (currently 1.2)
+  - Adjust logit softcap temperature (currently 15.0)
+  - Change VE gating formula
   - Add or remove layer operations
 - `causalAttentionCF` in common.go — the attention implementation. You can try:
   - Different attention scaling
@@ -217,8 +222,8 @@ You can add new functions, constants, or logic to `experiment.go`. The `experime
   - z-loss regularization (penalize large logits)
 
 #### Activation functions (ane/common.go)
-- `silu32` — the SiLU/Swish activation. You can try GeLU, ReLU, or other activations.
-  Note: changing this affects both forward and backward — update `siluBackward` too.
+- `reluSquared32` — the ReLU² activation (`max(0,x)²`). You can try GeLU, SiLU, or other activations.
+  Note: changing this affects both forward and backward — update `reluSquaredBackwardAccel` too.
 
 #### CPU primitives (ane/stories/cpu.go)
 - `EmbedLookup`, `RMSNorm`, `CrossEntropyLoss`, `MatMulVocabSeq`, etc.
@@ -250,19 +255,35 @@ Good starting experiments (Tier 1 — fast):
 
 Deeper experiments (Tier 2 — more impactful, more risk):
 1. **Label smoothing**: Add to `crossEntropyLossFromProbsRange` in train_util.go
-2. **Residual scaling**: Change `layerResidualScale` or the blending formula
+2. **Residual lambda tuning**: Adjust init values for `ResidLambdas`/`X0Lambdas` in RandomInit
 3. **Optimizer tweaks**: Gradient centralization, different weight decay formulations
-4. **Activation function**: Replace SiLU with GeLU or other activations
+4. **Activation function**: Replace ReLU² with GeLU or other activations
 5. **Selective layer freezing**: Skip gradient updates for early layers
 6. **Gradient noise**: Add noise before optimizer update for regularization
 7. **Per-layer learning rates**: Different LR for attention vs FFN weights
+8. **QK-norm scale**: Adjust the 1.2 scale factor in `qkNormCF`
+9. **Logit softcap temperature**: Adjust the 15.0 cap in `logitSoftcap`
+10. **Smear/Backout lambda init**: Tune initial values for smear and backout lambdas
 
 ## Model architecture
 
-The model is a 110M-parameter Llama2-style transformer trained on TinyStories:
+The model is a 110M-parameter nanochat-style transformer (based on karpathy/nanochat) trained on TinyStories:
 - Vocab: 32,000 (Llama2 BPE tokenizer)
 - Dim: 768
 - Hidden: 2,048
 - Heads: 12
 - Layers: 12
 - Default sequence length: 256
+
+### Architecture details (nanochat features)
+
+- **ReLU² activation**: FFN uses `relu(x)²` instead of SiLU
+- **Parameterless RMSNorm**: All norms have no learnable per-channel weights
+- **QK-norm**: Per-head RMSNorm on Q,K after RoPE, scaled by 1.2; attention scale = 1.0
+- **Embedding norm**: Parameterless RMSNorm after token embedding lookup
+- **Per-layer residual lambdas**: `cur = resid_lambdas[i]*cur + x0_lambdas[i]*x0` before each layer
+- **Value embeddings (VE)**: Alternating-layer (even) VE tables with gated V mixing
+- **Smear**: Bigram mixing (gated shift) after embedding norm
+- **Backout**: Subtract `backout_lambda * mid_layer_residual` before final norm
+- **Logit softcap**: `15 * tanh(logits/15)` before loss and eval
+- **Checkpoint format**: V4 (backward compatible with V3 for loading old weights)

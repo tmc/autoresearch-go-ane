@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"testing"
 
@@ -139,7 +140,8 @@ func BenchmarkEvalLogits(b *testing.B) {
 // BenchmarkEvalLoss measures the full validation pass.
 //
 // Key metrics:
-//   - val_loss:      cross-entropy in nats (THE optimization target)
+//   - val_loss:      cross-entropy in nats
+//   - val_bpb:       bits per byte (THE optimization target, vocab-size-independent)
 //   - ane-watts:     ANE power draw
 //   - ane-compute-%: ANE utilization
 func BenchmarkEvalLoss(b *testing.B) {
@@ -151,6 +153,7 @@ func BenchmarkEvalLoss(b *testing.B) {
 		}
 		stopANESample(snap, b)
 		b.ReportMetric(loss, "val_loss")
+		b.ReportMetric(loss/math.Ln2/avgBytesPerToken, "val_bpb")
 	}
 }
 
