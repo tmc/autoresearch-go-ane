@@ -156,6 +156,19 @@ type Engine struct {
 	accumGSmearLam   []float32 // [1] accumulated smear lambda gradient
 	accumGBackoutLam []float32 // [1] accumulated backout lambda gradient
 
+	// Pre-allocated CPU inference buffers (avoid per-call allocation).
+	cpuQF      []float32 // [dim*seq]
+	cpuKF      []float32 // [dim*seq]
+	cpuVF      []float32 // [dim*seq]
+	cpuAttO    []float32 // [dim*seq]
+	cpuX2      []float32 // [dim*seq]
+	cpuH1      []float32 // [hidden*seq]
+	cpuGate    []float32 // [hidden*seq]
+	cpuFFOut   []float32 // [dim*seq]
+	cpuVEScr   []float32 // [dim*seq]
+	cpuVEGate  []float32 // [heads*seq]
+	cpuX0Inf   []float32 // [dim*seq]
+
 	embedGradDone    chan struct{}
 	asyncRefreshDone chan time.Duration // async weight refresh result
 	stepMetrics      aneStepMetrics
@@ -327,6 +340,17 @@ func Open(opts Options) (*Engine, error) {
 		accumGSmearGate:  accumGSmearGate,
 		accumGSmearLam:   accumGSmearLam,
 		accumGBackoutLam: accumGBackoutLam,
+		cpuQF:            make([]float32, stories.Dim*seq),
+		cpuKF:            make([]float32, stories.Dim*seq),
+		cpuVF:            make([]float32, stories.Dim*seq),
+		cpuAttO:          make([]float32, stories.Dim*seq),
+		cpuX2:            make([]float32, stories.Dim*seq),
+		cpuH1:            make([]float32, stories.Hidden*seq),
+		cpuGate:          make([]float32, stories.Hidden*seq),
+		cpuFFOut:         make([]float32, stories.Dim*seq),
+		cpuVEScr:         make([]float32, stories.Dim*seq),
+		cpuVEGate:        make([]float32, stories.Heads*seq),
+		cpuX0Inf:         make([]float32, stories.Dim*seq),
 	}, nil
 }
 
@@ -602,6 +626,17 @@ func (e *Engine) Close() {
 	e.accumGSmearGate = nil
 	e.accumGSmearLam = nil
 	e.accumGBackoutLam = nil
+	e.cpuQF = nil
+	e.cpuKF = nil
+	e.cpuVF = nil
+	e.cpuAttO = nil
+	e.cpuX2 = nil
+	e.cpuH1 = nil
+	e.cpuGate = nil
+	e.cpuFFOut = nil
+	e.cpuVEScr = nil
+	e.cpuVEGate = nil
+	e.cpuX0Inf = nil
 	if e.gradTasks != nil {
 		e.gradTasks.Close()
 		e.gradTasks = nil
@@ -920,20 +955,20 @@ func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 	x := e.x
 	xNorm := e.xNorm
 	next := e.tmpHidden
-	qf := make([]float32, stories.Dim*e.seq)
-	kf := make([]float32, stories.Dim*e.seq)
-	vf := make([]float32, stories.Dim*e.seq)
-	attOut := make([]float32, stories.Dim*e.seq)
-	x2 := make([]float32, stories.Dim*e.seq)
-	h1 := make([]float32, stories.Hidden*e.seq)
-	gate := make([]float32, stories.Hidden*e.seq)
-	ffOut := make([]float32, stories.Dim*e.seq)
-	veScr := make([]float32, stories.Dim*e.seq)
-	veGateAct := make([]float32, stories.Heads*e.seq)
+	qf := e.cpuQF
+	kf := e.cpuKF
+	vf := e.cpuVF
+	attOut := e.cpuAttO
+	x2 := e.cpuX2
+	h1 := e.cpuH1
+	gate := e.cpuGate
+	ffOut := e.cpuFFOut
+	veScr := e.cpuVEScr
+	veGateAct := e.cpuVEGate
+	x0 := e.cpuX0Inf
 
 	stories.EmbedLookup(x, e.mw.Embed, tokens, stories.Dim, e.seq)
 	rmsNormNoWeightCF(x, x, stories.Dim, e.seq)
-	x0 := make([]float32, stories.Dim*e.seq)
 	copy(x0, x)
 	smearForwardCF(x, e.mw.SmearGate, e.mw.SmearLambda[0], stories.Dim, e.seq)
 	cur := x
