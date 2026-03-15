@@ -1,72 +1,74 @@
 # autoresearch-go-ane
 
-Autonomous AI research on Apple Silicon using ANE-accelerated training, inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
+Autonomous AI research on Apple Silicon using ANE-accelerated training and inference, inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
 
-An LLM agent edits a single file (`experiment.go`), runs 5-minute training experiments on a TinyStories language model using the Apple Neural Engine, and keeps changes that improve validation loss. Go benchmarks + [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat) provide statistically rigorous comparison between experiments.
+A Claude Code agent autonomously optimizes ML inference on Apple Neural Engine. It edits code, runs benchmarks, verifies correctness, and iterates -- all without human intervention. The agent uses [Ensue](https://ensue-network.ai) for persistent memory across sessions and [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat) for statistically rigorous comparison.
 
-## Requirements
+## Autoresearch Results
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- Go 1.24+
+### Inference Speed: 12 -> 11,289 tokens/s (977x faster)
 
-## Setup
+The agent ran autonomously on the `autoresearch/mar14-infer` branch, identifying and fixing critical performance bugs in the ANE inference pipeline. All optimizations were discovered, implemented, verified, and committed by Claude Code without human guidance on what to change.
 
-```bash
-git clone https://github.com/tmc/autoresearch-go-ane.git
-cd autoresearch-go-ane
-bash scripts/setup.sh   # downloads ~40MB token data + ~420MB model
+| # | Change | tokens/s | Speedup | How it was found |
+|---|--------|----------|---------|------------------|
+| 0 | Baseline | **12** | 1x | Agent established baseline measurement |
+| 1 | BLAS-accelerated `linearCF` | **366** | 30x | Agent noticed `linearCF` was a naive Go triple-loop, added `cblas_sgemm` |
+| 2 | CPU BLAS classifier head | **416** | 35x | Agent profiled and found ANE tile dispatch slower than single BLAS call |
+| 3 | Fix ANE RMSNorm weight layout | **423** | 35x | Agent added timing instrumentation, discovered ANE path was failing silently |
+| 4 | Fix ANE RMSNorm input layout | **10,667** | 889x | Agent traced the silent fallback to CPU, fixed both ANE input mismatches |
+| 5 | vDSP residual blending | **11,178** | 932x | Agent replaced scalar Go loop with vDSP_vsmul + vDSP_vsma |
+| 6 | Pre-scale Wo/W2 weights | **11,289** | 941x | Agent baked residual scale into weights to skip CPU blending entirely |
+
+The biggest win (step 4, 889x) came from discovering that ANE inference was **completely broken** -- the RMSNorm kernel's compiled tensor layouts didn't match what the Go code provided, causing a silent fallback to unaccelerated CPU loops for every inference call.
+
+### Time Breakdown (22ms per inference, M5 Max)
+
+```
+Embed lookup:     0.2ms  ( 1%)
+12 ANE layers:   13.5ms  (61%)  <- ANE compute-bound
+RMSNorm (ANE):    0.2ms  ( 1%)
+Classifier BLAS:  8.2ms  (37%)  <- 32K x 768 x 256 cblas_sgemm
 ```
 
-## Quick start
+### Autonomous Agent Loop
 
-```bash
-# Run baseline (random init, 5 min training)
-go run . -data tinystories_data00.bin > run.log 2>&1
-grep "^val_loss:" run.log
+The agent follows a protocol defined in [program.md](program.md):
 
-# Run benchmarks
-go test -bench . -benchtime 5x -v
+```
+LOOP FOREVER:
+  1. RECALL:    python3 scripts/coordinator.py analyze     (Ensue persistent memory)
+  2. CHECK:     python3 scripts/coordinator.py check_tried (deduplicate experiments)
+  3. IMPLEMENT: edit ane/ files
+  4. VERIFY:    go test -run TestInferenceCorrectness       (golden logits oracle)
+  5. BENCHMARK: go test -bench BenchmarkEvalLogits          (measure speed)
+  6. COMPARE:   benchstat bench_before.txt bench_after.txt  (statistical rigor)
+  7. PUBLISH:   python3 scripts/coordinator.py publish_result (persist to Ensue)
+  8. DECIDE:    keep or git reset --hard HEAD~1
 ```
 
-## Benchmarks
+Key design: every experiment is published to Ensue (even failures), so the agent never repeats a failed approach across sessions.
 
-`go test -bench .` reports:
+## Performance Dashboard (anperf)
 
-| Benchmark | Key metrics |
-|---|---|
-| `BenchmarkStep` | training loss, step time (ms), ANE eval time, Adam time |
-| `BenchmarkEvalLogits` | single-window inference throughput |
-| `BenchmarkEvalLoss` | **validation loss** (the optimization target) |
-| `BenchmarkLRSchedule` | LR schedule computation overhead |
+The project includes `anperf`, a real-time performance dashboard served at `localhost:9090/perf/` during training:
 
-Compare experiments with [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
+- Live training loss and throughput charts (Canvas-based, SSE updates)
+- ANE vs CPU vs Adam timing breakdown with component waterfall
+- Run versioning with disk persistence (`.anperf/` directory)
+- Inference benchmarking tab
 
-```bash
-go install golang.org/x/perf/cmd/benchstat@latest
+## Architecture
 
-# Capture baseline
-go test -bench . -benchtime 5x -count 6 | tee bench_before.txt
-
-# Edit experiment.go, then capture new results
-go test -bench . -benchtime 5x -count 6 | tee bench_after.txt
-
-# Compare
-benchstat bench_before.txt bench_after.txt
+```
+EvalLogits -> evalLogitsANEInto:
+  EmbedLookup (CPU, 0.2ms)
+    -> 12x LayerForward (ANE: RMSNorm + QKV + RoPE + SDPA + Wo + residual + FFN)
+      -> RMSNorm (ANE, 0.2ms)
+        -> Classifier (CPU BLAS, 8.2ms)
 ```
 
-## How it works
-
-1. Agent edits `experiment.go` (hyperparameters, LR schedule, etc.)
-2. Runs Go benchmarks to measure training throughput and validation loss
-3. Uses `benchstat` to compare before/after with statistical rigor
-4. Keeps the change if `val_loss` improved significantly, discards otherwise
-5. Repeats
-
-See [program.md](program.md) for full agent instructions.
-
-## Model
-
-110M-parameter Llama2-style transformer trained on [TinyStories](https://huggingface.co/datasets/enio/TinyStories):
+110M-parameter Llama2-style transformer on [TinyStories](https://huggingface.co/datasets/enio/TinyStories):
 
 | Parameter | Value |
 |---|---|
@@ -75,56 +77,24 @@ See [program.md](program.md) for full agent instructions.
 | Hidden | 2,048 |
 | Heads | 12 |
 | Layers | 12 |
-| Sequence length | 256 (default) |
+| Sequence length | 256 |
 
-## Inference Optimization Results (mar14-infer)
+## Setup
 
-**977x speedup**: 21.5s -> 22ms per inference on Apple M5 Max.
-
-### Tokens/s History
-
-| # | Change | ns/op | tokens/s | vs baseline |
-|---|--------|-------|----------|-------------|
-| 0 | Baseline (broken ANE, naive CPU loops) | 21,500,000,000 | **12** | 1x |
-| 1 | BLAS-accelerated `linearCF` + pre-alloc buffers | 700,000,000 | **366** | 30x |
-| 2 | CPU BLAS classifier head (replace ANE tiles) | 616,000,000 | **416** | 35x |
-| 3 | Fix ANE RMSNorm weight tensor expansion | 606,000,000 | **423** | 35x |
-| 4 | Fix ANE RMSNorm input layout (both paths) | 24,000,000 | **10,667** | 889x |
-| 5 | vDSP-accelerated residual blending | 22,900,000 | **11,178** | 932x |
-| 6 | Pre-scale Wo/W2 weights (eliminate CPU residual) | 22,670,000 | **11,289** | 941x |
-
-### What Was Wrong
-
-Two critical bugs caused ANE inference to silently fall back to a naive CPU path:
-
-1. **No BLAS for forward matmuls** -- `linearCF` used a naive Go triple-loop instead of `cblas_sgemm`. Fixed by adding Accelerate BLAS to the forward path.
-
-2. **ANE RMSNorm input layout mismatch** -- The ANE compiler transforms tensor shapes unpredictably. The RMSNorm kernel's compiled inputs expected different sizes than what the Go code provided, causing `WriteInputFP16` to fail. The ANE path silently fell back to CPU for ALL inference. Fixed by detecting the compiled layout and adapting input data to match.
-
-### Time Breakdown (22ms total on M5 Max)
-
-```
-Embed lookup:     0.2ms  ( 1%)
-12 ANE layers:   13.5ms  (61%)  <- ANE compute bound
-RMSNorm (ANE):    0.2ms  ( 1%)
-Classifier BLAS:  8.2ms  (37%)  <- 32K x 768 x 256 matmul
+```bash
+git clone https://github.com/tmc/autoresearch-go-ane.git
+cd autoresearch-go-ane
+bash scripts/setup.sh   # downloads ~40MB token data + ~420MB model
+go test -bench BenchmarkEvalLogits -benchtime 5x -v
 ```
 
-### Architecture
-
-```
-EvalLogits -> evalLogitsANEInto:
-  EmbedLookup (CPU)
-    -> 12x LayerForward (ANE: RMSNorm + QKV + RoPE + SDPA + Wo + residual + FFN)
-      -> RMSNorm (ANE)
-        -> Classifier (CPU BLAS, cblas_sgemm 32000x768x256)
-```
+Requirements: macOS with Apple Silicon (M1+), Go 1.24+
 
 ## Credits
 
-- [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — autonomous research pattern
-- [maderix/ANE](https://github.com/maderix/ANE) — Go Apple Neural Engine training (vendored in `ane/`)
-- [tmc/apple](https://github.com/tmc/apple) — Go Apple platform bindings
+- [karpathy/autoresearch](https://github.com/karpathy/autoresearch) -- autonomous research pattern
+- [tmc/apple](https://github.com/tmc/apple) -- Go Apple platform bindings
+- [Ensue](https://ensue-network.ai) -- persistent agent memory across sessions
 
 ## License
 
