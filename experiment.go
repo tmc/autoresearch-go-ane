@@ -18,10 +18,10 @@ const (
 	SequenceLength = 256
 	AccumSteps     = 8
 	LearningRate   = 3e-4
-	AdamBeta1      = 0.9
-	AdamBeta2      = 0.999
-	AdamEps        = 1e-8
-	WeightDecay    = 0.01
+	AdamBeta1      = 0.8
+	AdamBeta2      = 0.95
+	AdamEps        = 1e-10
+	WeightDecay    = 0.0
 	GradClip       = 1.0
 	LossScale      = 256.0
 	UseANE         = true
