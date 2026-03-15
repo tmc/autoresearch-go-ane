@@ -587,10 +587,12 @@ func GenStoriesSDPAForwardInference(dim, heads, seq int, residualScale float64) 
 	fmt.Fprintf(&b, "        tensor<fp16, [1,%d,1,%d]> af = reshape(shape=att_shape,x=at)[name=string(\"af\")];\n", dim, seq)
 	// Wo projection
 	appendDynamicMatmulFP16(&b, "oo", "af", "Wo", dim, dim, seq)
-	// Residual with scale baked in: out = x + scale * oo
+	// Residual with scale baked in: out = (1-scale)*x + scale*oo
 	fmt.Fprintf(&b, "        fp16 rs = const()[name=string(\"rs\"), val=fp16(%f)];\n", residualScale)
+	fmt.Fprintf(&b, "        fp16 rs1 = const()[name=string(\"rs1\"), val=fp16(%f)];\n", 1.0-residualScale)
 	fmt.Fprintf(&b, "        tensor<fp16, [1,%d,1,%d]> oo_s = mul(x=oo,y=rs)[name=string(\"oo_s\")];\n", dim, seq)
-	fmt.Fprintf(&b, "        tensor<fp16, [1,%d,1,%d]> out = add(x=x,y=oo_s)[name=string(\"out\")];\n", dim, seq)
+	fmt.Fprintf(&b, "        tensor<fp16, [1,%d,1,%d]> x_s = mul(x=x,y=rs1)[name=string(\"x_s\")];\n", dim, seq)
+	fmt.Fprintf(&b, "        tensor<fp16, [1,%d,1,%d]> out = add(x=x_s,y=oo_s)[name=string(\"out\")];\n", dim, seq)
 	b.WriteString("    } -> (out);\n}\n")
 	return b.String()
 }

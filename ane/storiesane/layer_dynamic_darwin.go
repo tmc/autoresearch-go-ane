@@ -33,6 +33,10 @@ type dynamicLayerCompileSpec struct {
 	sdpa1MIL   string
 	sdpa2MIL   string
 	qkvMIL     string
+
+	// Inference-only MIL programs (no taps, baked-in residual scale).
+	attInferMIL string
+	ffnInferMIL string
 }
 
 func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
@@ -59,6 +63,7 @@ func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build rope blobs: %w", err)
 	}
+	residualScale := float64(layerResidualScale)
 	spec := &dynamicLayerCompileSpec{
 		maskBlob:    maskBlob,
 		ropeCosBlob: ropeCosBlob,
@@ -71,6 +76,8 @@ func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
 		sdpa1MIL:    mil.GenStoriesSDPABackward1Dynamic(dim, heads, seq),
 		sdpa2MIL:    mil.GenSDPABackward2(dim, heads, seq),
 		qkvMIL:      mil.GenStoriesQKVBackwardDynamic(dim, heads, seq),
+		attInferMIL: mil.GenStoriesSDPAForwardInference(dim, heads, seq, residualScale),
+		ffnInferMIL: mil.GenStoriesFFNForwardInference(dim, hidden, seq, residualScale),
 	}
 
 	dynamicLayerSpecs.mu.Lock()
@@ -165,6 +172,70 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		W1:     layer.W1,
 		W2:     layer.W2,
 		W3:     layer.W3,
+	}
+	if err := lf.stageDynamicWeights(w); err != nil {
+		lf.close()
+		return nil, err
+	}
+	return lf, nil
+}
+
+func compileStoriesLayerForwardInference(layer stories.LayerWeights, seq int) (_ *layerForward, err error) {
+	const (
+		dim    = stories.Dim
+		hidden = stories.Hidden
+		heads  = stories.Heads
+	)
+	if err := validateLayerWeights(dim, hidden, layerForwardWeights{
+		RMSAtt: layer.RMSAtt, Wq: layer.Wq, Wk: layer.Wk, Wv: layer.Wv, Wo: layer.Wo,
+		RMSFFN: layer.RMSFFN, W1: layer.W1, W2: layer.W2, W3: layer.W3,
+	}); err != nil {
+		return nil, err
+	}
+	spec, err := dynamicLayerSpec(seq)
+	if err != nil {
+		return nil, fmt.Errorf("compile layer forward inference: %w", err)
+	}
+	att, err := model.Compile(model.CompileOptions{
+		MILText:     spec.attInferMIL,
+		SharedModel: true,
+		WeightFiles: []model.WeightFile{
+			{Path: "@model_path/weights/mask.bin", Blob: spec.maskBlob},
+			{Path: "@model_path/weights/rope_cos.bin", Blob: spec.ropeCosBlob},
+			{Path: "@model_path/weights/rope_sin.bin", Blob: spec.ropeSinBlob},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("compile layer forward inference: attention: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			att.Close()
+		}
+	}()
+	ffn, err := model.Compile(model.CompileOptions{
+		MILText:     spec.ffnInferMIL,
+		SharedModel: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("compile layer forward inference: ffn: %w", err)
+	}
+	lf := &layerForward{
+		dim:         dim,
+		hidden:      hidden,
+		heads:       heads,
+		seq:         seq,
+		att:         att,
+		ffn:         ffn,
+		dynamic:     true,
+		inferScaled: true,
+		rmsAtt:      layer.RMSAtt,
+		rmsFFN:      layer.RMSFFN,
+		x2:          make([]float32, dim*seq),
+	}
+	w := layerForwardWeights{
+		RMSAtt: layer.RMSAtt, Wq: layer.Wq, Wk: layer.Wk, Wv: layer.Wv, Wo: layer.Wo,
+		RMSFFN: layer.RMSFFN, W1: layer.W1, W2: layer.W2, W3: layer.W3,
 	}
 	if err := lf.stageDynamicWeights(w); err != nil {
 		lf.close()

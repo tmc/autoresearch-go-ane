@@ -91,6 +91,9 @@ type Engine struct {
 	layersInit              bool
 	layersDirty             bool
 	layerInitErr            error
+	inferLayers             []*layerForward
+	inferLayersInit         bool
+	inferLayerInitErr       error
 	backward                []*layerBackward
 	hybridBackwardRequested bool
 	backwardInit            bool
@@ -494,6 +497,12 @@ func (e *Engine) Close() {
 		}
 	}
 	e.layers = nil
+	for i := range e.inferLayers {
+		if e.inferLayers[i] != nil {
+			e.inferLayers[i].close()
+		}
+	}
+	e.inferLayers = nil
 	for i := range e.backward {
 		if e.backward[i] != nil {
 			e.backward[i].close()
@@ -785,13 +794,47 @@ func (e *Engine) ensureLayers() error {
 	return nil
 }
 
+func (e *Engine) ensureInferLayers() error {
+	if e.inferLayersInit {
+		return e.inferLayerInitErr
+	}
+	e.inferLayersInit = true
+	if !e.useANE {
+		e.inferLayerInitErr = fmt.Errorf("ane layer forward is disabled")
+		return e.inferLayerInitErr
+	}
+	layers, err := compileParallel(len(e.mw.Layers), func(i int) (*layerForward, error) {
+		lf, err := compileStoriesLayerForwardInference(e.mw.Layers[i], e.seq)
+		if err != nil {
+			return nil, fmt.Errorf("storiesane eval logits: compile infer layer %d: %w", i, err)
+		}
+		return lf, nil
+	}, func(lf *layerForward) {
+		if lf != nil {
+			lf.close()
+		}
+	})
+	if err != nil {
+		e.inferLayers = nil
+		e.inferLayerInitErr = err
+		return e.inferLayerInitErr
+	}
+	e.inferLayers = layers
+	return nil
+}
+
 func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
 	e.ensureOffload()
+	// Try inference-only layers first (no taps, baked-in residual scale).
+	useLayers := e.layers
+	if e.ensureInferLayers() == nil {
+		useLayers = e.inferLayers
+	}
 	stories.EmbedLookup(e.x, e.mw.Embed, tokens, stories.Dim, e.seq)
 	cur := e.x
 	next := e.tmpHidden
-	for i := range e.layers {
-		if err := e.layers[i].run(next, cur); err != nil {
+	for i := range useLayers {
+		if err := useLayers[i].run(next, cur); err != nil {
 			return fmt.Errorf("storiesane eval logits: layer %d: %w", i, err)
 		}
 		cur, next = next, cur
