@@ -1,7 +1,3 @@
-github.com/tmc/aneperf v0.0.0-20260315013400-e1bd670fe867 h1:nLnoHtJS9O+xBly394N/Ogl4hicmjR4fIfctm+g2iFU=
-github.com/tmc/aneperf v0.0.0-20260315013400-e1bd670fe867/go.mod h1:6nGOFDPngx4078a8VL/Qc9gZzp64v7Iz4nnZcovEa2I=
-github.com/tmc/apple v0.3.0 h1:LtZBP+PadD5hk3x3jT3N/TpGhFkHSG8913/vPogDoqY=
-github.com/tmc/apple v0.3.0/go.mod h1:3sxc4uX+aUMt7sgfFNpRWtmcpAq+Bv4r+yBAk3JBrYc=
 github.com/tmc/apple v0.3.2 h1:QXmwZLXfVWkmc9Mjaj4CF3OGlVZL17TGXG24gTZ51DY=
 github.com/tmc/apple v0.3.2/go.mod h1:3sxc4uX+aUMt7sgfFNpRWtmcpAq+Bv4r+yBAk3JBrYc=
 github.com/tmc/purego v0.10.0-alpha.2.0.20260315005611-7a4926ded181 h1:2k8C5HxqfA2cl3mk/G/YwrBn5wObkNZ99vjV2Xj2DMY=

@@ -16,31 +16,22 @@ import (
 
 const (
 	SequenceLength = 256
-	AccumSteps     = 8
+	AccumSteps     = 4
 	LearningRate   = 3e-4
-	AdamBeta1      = 0.8
-	AdamBeta2      = 0.95
-	AdamEps        = 1e-10
-	WeightDecay    = 0.0
+	AdamBeta1      = 0.9
+	AdamBeta2      = 0.999
+	AdamEps        = 1e-8
+	WeightDecay    = 0.01
 	GradClip       = 1.0
 	LossScale      = 256.0
 	UseANE         = true
 	HybridBackward = true
 	Seed           = 42
-
-	// Per-param-group LR multipliers (relative to LearningRate).
-	EmbedLRMult  = float32(1.0)  // embed params (Embed, VEEmbed)
-	ScalarLRMult = float32(1.0)  // scalar params (VEGate, SmearLambda, BackoutLambda)
-	LambdaLRMult = float32(0.01) // lambda params (ResidLambdas, X0Lambdas), relative to scalar LR
-
-	// Custom betas for lambda params (ResidLambdas, X0Lambdas).
-	LambdaBeta1 = float32(0.96)
-	LambdaBeta2 = float32(0.95)
 )
 
 const warmupFraction = 0.05
 
-func experimentConfig(modelPath string, tokens []uint16) ane.Options {
+func experimentConfig(modelPath string, tokens []int32) ane.Options {
 	return ane.Options{
 		ModelPath:      modelPath,
 		Tokens:         tokens,
@@ -54,13 +45,9 @@ func experimentConfig(modelPath string, tokens []uint16) ane.Options {
 		WeightDecay:    WeightDecay,
 		GradClip:       GradClip,
 		LossScale:      LossScale,
-		UseANE:         UseANE,
-		HybridBackward: HybridBackward,
-		EmbedLRMult:    EmbedLRMult,
-		ScalarLRMult:   ScalarLRMult,
-		LambdaLRMult:   LambdaLRMult,
-		LambdaBeta1:    LambdaBeta1,
-		LambdaBeta2:    LambdaBeta2,
+		UseANE:            UseANE,
+		CPUClassifierHead: true,
+		HybridBackward:    HybridBackward,
 	}
 }
 
