@@ -4,7 +4,6 @@ package ane
 
 import (
 	"fmt"
-	"math"
 	"sync"
 	"unsafe"
 
@@ -16,9 +15,13 @@ import (
 	xane "github.com/tmc/apple/x/ane"
 )
 
+type dynamicLayerSpecKey struct {
+	dim, hidden, heads, kvHeads, nLayers, seq int
+}
+
 var dynamicLayerSpecs struct {
 	mu sync.Mutex
-	m  map[int]*dynamicLayerCompileSpec
+	m  map[dynamicLayerSpecKey]*dynamicLayerCompileSpec
 }
 
 type dynamicLayerCompileSpec struct {
@@ -35,35 +38,43 @@ type dynamicLayerCompileSpec struct {
 	sdpa2MIL   string
 	qkvMIL     string
 
-	// Inference-only kernels (smaller output surfaces).
-	attInfMIL string
-	ffnInfMIL string
+	// Inference-only MIL programs (no taps, baked-in residual scale).
+	attInferMIL string
+	ffnInferMIL string
 }
 
 func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
+	return dynamicLayerSpecForConfig(stories.DefaultConfig(), seq)
+}
+
+// dynamicLayerSpecForConfig returns a cached compile spec for the given model config and sequence length.
+func dynamicLayerSpecForConfig(cfg stories.ModelConfig, seq int) (*dynamicLayerCompileSpec, error) {
+	key := dynamicLayerSpecKey{cfg.Dim, cfg.Hidden, cfg.Heads, cfg.EffectiveKVHeads(), cfg.NLayers, seq}
+
 	dynamicLayerSpecs.mu.Lock()
 	if dynamicLayerSpecs.m == nil {
-		dynamicLayerSpecs.m = make(map[int]*dynamicLayerCompileSpec)
+		dynamicLayerSpecs.m = make(map[dynamicLayerSpecKey]*dynamicLayerCompileSpec)
 	}
-	if spec := dynamicLayerSpecs.m[seq]; spec != nil {
+	if spec := dynamicLayerSpecs.m[key]; spec != nil {
 		dynamicLayerSpecs.mu.Unlock()
 		return spec, nil
 	}
 	dynamicLayerSpecs.mu.Unlock()
 
-	const (
-		dim    = stories.Dim
-		hidden = stories.Hidden
-		heads  = stories.Heads
-	)
+	dim := cfg.Dim
+	hidden := cfg.Hidden
+	heads := cfg.Heads
+	kvHeads := cfg.EffectiveKVHeads()
+
 	maskBlob, err := mil.BuildCausalMaskBlob(seq)
 	if err != nil {
 		return nil, fmt.Errorf("build mask blob: %w", err)
 	}
-	ropeCosBlob, ropeSinBlob, err := buildRoPEBlobsLocal(seq, dim/heads)
+	ropeCosBlob, ropeSinBlob, err := mil.BuildRoPECosSinBlobs(seq, cfg.HeadDim())
 	if err != nil {
 		return nil, fmt.Errorf("build rope blobs: %w", err)
 	}
+	residualScale := cfg.ResidualScale()
 	spec := &dynamicLayerCompileSpec{
 		maskBlob:    maskBlob,
 		ropeCosBlob: ropeCosBlob,
@@ -76,16 +87,16 @@ func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
 		sdpa1MIL:    genStoriesSDPABackward1Dynamic(dim, heads, seq),
 		sdpa2MIL:    mil.GenSDPABackward2(dim, heads, seq),
 		qkvMIL:      genStoriesQKVBackwardDynamic(dim, heads, seq),
-		attInfMIL:   genStoriesSDPAForwardDynamicInference(dim, heads, seq),
-		ffnInfMIL:   genStoriesFFNForwardDynamicInference(dim, hidden, seq),
+		attInferMIL: GenGQASDPAForwardInferenceWithHeadDim(dim, heads, kvHeads, cfg.HeadDim(), seq, residualScale),
+		ffnInferMIL: genStoriesFFNForwardDynamicInference(dim, hidden, seq, residualScale),
 	}
 
 	dynamicLayerSpecs.mu.Lock()
-	if existing := dynamicLayerSpecs.m[seq]; existing != nil {
+	if existing := dynamicLayerSpecs.m[key]; existing != nil {
 		dynamicLayerSpecs.mu.Unlock()
 		return existing, nil
 	}
-	dynamicLayerSpecs.m[seq] = spec
+	dynamicLayerSpecs.m[key] = spec
 	dynamicLayerSpecs.mu.Unlock()
 	return spec, nil
 }
@@ -97,12 +108,15 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		heads  = stories.Heads
 	)
 	if err := validateLayerWeights(dim, hidden, layerForwardWeights{
-		Wq: layer.Wq,
-		Wk: layer.Wk,
-		Wv: layer.Wv,
-		Wo: layer.Wo,
-		W1: layer.W1,
-		W2: layer.W2,
+		RMSAtt: layer.RMSAtt,
+		Wq:     layer.Wq,
+		Wk:     layer.Wk,
+		Wv:     layer.Wv,
+		Wo:     layer.Wo,
+		RMSFFN: layer.RMSFFN,
+		W1:     layer.W1,
+		W2:     layer.W2,
+		W3:     layer.W3,
 	}); err != nil {
 		return nil, err
 	}
@@ -143,41 +157,6 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 	if err != nil {
 		return nil, fmt.Errorf("compile layer forward dynamic: ffn: %w", err)
 	}
-	// Compile inference-only kernels (smaller output, no taps).
-	attInf, err := model.Compile(model.CompileOptions{
-		MILText:     spec.attInfMIL,
-		SharedModel: true,
-		WeightFiles: []model.WeightFile{
-			{
-				Path: "@model_path/weights/mask.bin",
-				Blob: spec.maskBlob,
-			},
-			{
-				Path: "@model_path/weights/rope_cos.bin",
-				Blob: spec.ropeCosBlob,
-			},
-			{
-				Path: "@model_path/weights/rope_sin.bin",
-				Blob: spec.ropeSinBlob,
-			},
-		},
-	})
-	if err != nil {
-		// Non-fatal: fall back to taps kernel for inference.
-		attInf = nil
-	}
-	ffnInf, ffnInfErr := model.Compile(model.CompileOptions{
-		MILText:     spec.ffnInfMIL,
-		SharedModel: true,
-	})
-	if ffnInfErr != nil {
-		ffnInf = nil
-		if attInf != nil {
-			attInf.Close()
-			attInf = nil
-		}
-	}
-
 	lf := &layerForward{
 		dim:     dim,
 		hidden:  hidden,
@@ -185,26 +164,160 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		seq:     seq,
 		att:     att,
 		ffn:     ffn,
-		attInf:  attInf,
-		ffnInf:  ffnInf,
 		dynamic: true,
-		attTaps: true,
-		ffnTaps: true,
-		attOut: make([]float32, 5*dim*seq),
-		ffnOut:  make([]float32, (dim+hidden)*seq),
-		x2:      make([]float32, dim*seq),
+		attTaps:  true,
+		ffnTaps:  true,
+		rmsAtt:   layer.RMSAtt,
+		rmsFFN:   layer.RMSFFN,
+		attOut:   make([]float32, 5*dim*seq),
+		ffnOut:   make([]float32, (dim+2*hidden)*seq),
+		x2:       make([]float32, dim*seq),
 	}
-	if err := lf.stageDynamicWeights(layerForwardWeights{
-		Wq: layer.Wq,
-		Wk: layer.Wk,
-		Wv: layer.Wv,
-		Wo: layer.Wo,
-		W1: layer.W1,
-		W2: layer.W2,
-	}); err != nil {
+	w := layerForwardWeights{
+		RMSAtt: layer.RMSAtt,
+		Wq:     layer.Wq,
+		Wk:     layer.Wk,
+		Wv:     layer.Wv,
+		Wo:     layer.Wo,
+		RMSFFN: layer.RMSFFN,
+		W1:     layer.W1,
+		W2:     layer.W2,
+		W3:     layer.W3,
+	}
+	if err := lf.stageDynamicWeights(w); err != nil {
 		lf.close()
 		return nil, err
 	}
+	return lf, nil
+}
+
+func compileStoriesLayerForwardInference(layer stories.LayerWeights, seq int) (_ *layerForward, err error) {
+	const (
+		dim    = stories.Dim
+		hidden = stories.Hidden
+		heads  = stories.Heads
+	)
+	if err := validateLayerWeights(dim, hidden, layerForwardWeights{
+		RMSAtt: layer.RMSAtt, Wq: layer.Wq, Wk: layer.Wk, Wv: layer.Wv, Wo: layer.Wo,
+		RMSFFN: layer.RMSFFN, W1: layer.W1, W2: layer.W2, W3: layer.W3,
+	}); err != nil {
+		return nil, err
+	}
+	spec, err := dynamicLayerSpec(seq)
+	if err != nil {
+		return nil, fmt.Errorf("compile layer forward inference: %w", err)
+	}
+	att, err := model.Compile(model.CompileOptions{
+		MILText:     spec.attInferMIL,
+		SharedModel: true,
+		WeightFiles: []model.WeightFile{
+			{Path: "@model_path/weights/mask.bin", Blob: spec.maskBlob},
+			{Path: "@model_path/weights/rope_cos.bin", Blob: spec.ropeCosBlob},
+			{Path: "@model_path/weights/rope_sin.bin", Blob: spec.ropeSinBlob},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("compile layer forward inference: attention: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			att.Close()
+		}
+	}()
+	ffn, err := model.Compile(model.CompileOptions{
+		MILText:     spec.ffnInferMIL,
+		SharedModel: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("compile layer forward inference: ffn: %w", err)
+	}
+	lf := &layerForward{
+		dim:         dim,
+		hidden:      hidden,
+		heads:       heads,
+		seq:         seq,
+		att:         att,
+		ffn:         ffn,
+		dynamic:     true,
+		inferScaled: true,
+		rmsAtt:      layer.RMSAtt,
+		rmsFFN:      layer.RMSFFN,
+	}
+	w := layerForwardWeights{
+		RMSAtt: layer.RMSAtt, Wq: layer.Wq, Wk: layer.Wk, Wv: layer.Wv, Wo: layer.Wo,
+		RMSFFN: layer.RMSFFN, W1: layer.W1, W2: layer.W2, W3: layer.W3,
+	}
+	if err := lf.stageDynamicWeights(w); err != nil {
+		lf.close()
+		return nil, err
+	}
+	return lf, nil
+}
+
+// compileGQALayerForwardInference compiles a monolithic GQA inference layer
+// using the config-aware MIL generator that handles qDim != dim.
+func compileGQALayerForwardInference(cfg stories.ModelConfig, layer stories.LayerWeights, seq int) (_ *layerForward, err error) {
+	dim := cfg.Dim
+	qDim := cfg.QDim()
+	kvDim := cfg.KVDim()
+	hidden := cfg.Hidden
+	heads := cfg.Heads
+
+	spec, err := dynamicLayerSpecForConfig(cfg, seq)
+	if err != nil {
+		return nil, fmt.Errorf("compile gqa layer forward inference: %w", err)
+	}
+	att, err := model.Compile(model.CompileOptions{
+		MILText:     spec.attInferMIL,
+		SharedModel: true,
+		WeightFiles: []model.WeightFile{
+			{Path: "@model_path/weights/mask.bin", Blob: spec.maskBlob},
+			{Path: "@model_path/weights/rope_cos.bin", Blob: spec.ropeCosBlob},
+			{Path: "@model_path/weights/rope_sin.bin", Blob: spec.ropeSinBlob},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("compile gqa layer forward inference: attention: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			att.Close()
+		}
+	}()
+	ffn, err := model.Compile(model.CompileOptions{
+		MILText:     spec.ffnInferMIL,
+		SharedModel: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("compile gqa layer forward inference: ffn: %w", err)
+	}
+	lf := &layerForward{
+		dim:         dim,
+		hidden:      hidden,
+		heads:       heads,
+		seq:         seq,
+		att:         att,
+		ffn:         ffn,
+		dynamic:     true,
+		inferScaled: true,
+		rmsAtt:      layer.RMSAtt,
+		rmsFFN:      layer.RMSFFN,
+	}
+	w := layerForwardWeights{
+		RMSAtt: layer.RMSAtt, Wq: layer.Wq, Wk: layer.Wk, Wv: layer.Wv, Wo: layer.Wo,
+		RMSFFN: layer.RMSFFN, W1: layer.W1, W2: layer.W2, W3: layer.W3,
+	}
+	// Stage attention weights with GQA-aware layout (qDim for Wq/Wo, kvDim for Wk/Wv).
+	if err := stageGQAAttentionForwardWeights(lf.att, seq, dim, qDim, kvDim, w); err != nil {
+		lf.close()
+		return nil, fmt.Errorf("compile gqa layer forward inference: stage attention: %w", err)
+	}
+	if err := stageFFNForwardWeights(lf.ffn, seq, dim, hidden, w); err != nil {
+		lf.close()
+		return nil, fmt.Errorf("compile gqa layer forward inference: stage ffn: %w", err)
+	}
+	lf.rmsAtt = w.RMSAtt
+	lf.rmsFFN = w.RMSFFN
 	return lf, nil
 }
 
@@ -215,12 +328,15 @@ func compileStoriesLayerBackwardDynamic(layer stories.LayerWeights, seq int) (_ 
 		heads  = stories.Heads
 	)
 	if err := validateLayerWeights(dim, hidden, layerForwardWeights{
-		Wq: layer.Wq,
-		Wk: layer.Wk,
-		Wv: layer.Wv,
-		Wo: layer.Wo,
-		W1: layer.W1,
-		W2: layer.W2,
+		RMSAtt: layer.RMSAtt,
+		Wq:     layer.Wq,
+		Wk:     layer.Wk,
+		Wv:     layer.Wv,
+		Wo:     layer.Wo,
+		RMSFFN: layer.RMSFFN,
+		W1:     layer.W1,
+		W2:     layer.W2,
+		W3:     layer.W3,
 	}); err != nil {
 		return nil, err
 	}
@@ -312,7 +428,7 @@ func compileStoriesLayerBackwardDynamic(layer stories.LayerWeights, seq int) (_ 
 		sdpa2:   sdpa2,
 		qkv:     qkv,
 		dynamic: true,
-		ffnOut:  make([]float32, (dim+hidden)*seq),
+		ffnOut:  make([]float32, (dim+2*hidden)*seq),
 	}
 	if err := lb.stageDynamicWeights(layer); err != nil {
 		lb.close()
@@ -331,17 +447,8 @@ func (lf *layerForward) stageDynamicWeights(w layerForwardWeights) error {
 	if err := stageStoriesFFNForwardWeights(lf.ffn, lf.seq, lf.hidden, w); err != nil {
 		return fmt.Errorf("stage layer forward dynamic weights: ffn: %w", err)
 	}
-	// Stage weights into inference kernels (same input layout, shared weights).
-	if lf.attInf != nil {
-		if err := stageStoriesAttentionForwardWeights(lf.attInf, lf.seq, w); err != nil {
-			return fmt.Errorf("stage layer forward dynamic weights: attention inf: %w", err)
-		}
-	}
-	if lf.ffnInf != nil {
-		if err := stageStoriesFFNForwardWeights(lf.ffnInf, lf.seq, lf.hidden, w); err != nil {
-			return fmt.Errorf("stage layer forward dynamic weights: ffn inf: %w", err)
-		}
-	}
+	lf.rmsAtt = w.RMSAtt
+	lf.rmsFFN = w.RMSFFN
 	return nil
 }
 
@@ -352,7 +459,7 @@ func (lb *layerBackward) stageDynamicWeights(layer stories.LayerWeights) error {
 	if err := stageDynamicMatmulWeights(lb.ffnW2, lb.seq, lb.hidden, layer.W2); err != nil {
 		return fmt.Errorf("stage layer backward dynamic weights: ffn w2: %w", err)
 	}
-	if err := stageStoriesFFNTailWeights(lb.ffn, lb.seq, lb.hidden, layer.W1); err != nil {
+	if err := stageStoriesFFNTailWeights(lb.ffn, lb.seq, lb.hidden, layer.W1, layer.W3); err != nil {
 		return fmt.Errorf("stage layer backward dynamic weights: ffn tail: %w", err)
 	}
 	if err := stageDynamicMatmulWeights(lb.wot, lb.seq, lb.dim, layer.Wo); err != nil {
@@ -364,10 +471,119 @@ func (lb *layerBackward) stageDynamicWeights(layer stories.LayerWeights) error {
 	return nil
 }
 
-func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) error {
-	if cache == nil {
-		return lf.runDynamicInferenceOnly(out, x)
+// runDynamicInferenceOnly uses pre-scaled weights when available to eliminate
+// CPU-side residual blending. Reads only dim*seq output channels (skips taps).
+func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
+	if lf == nil || lf.att == nil || lf.ffn == nil {
+		return fmt.Errorf("run layer forward dynamic: layer is closed")
 	}
+	want := lf.dim * lf.seq
+	if len(x) != want || len(out) != want {
+		return fmt.Errorf("run layer forward dynamic: len mismatch in=%d out=%d want=%d", len(x), len(out), want)
+	}
+	if err := writeStoriesAttentionForwardActs(lf.att, lf.seq, x); err != nil {
+		return fmt.Errorf("run layer forward dynamic: write attention input: %w", err)
+	}
+	if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+		return fmt.Errorf("run layer forward dynamic: eval attention: %w", err)
+	}
+	// For inference-only kernels, try direct surface-to-surface copy
+	// (att output → FFN input) to skip CPU roundtrip.
+	surfaceCopied := false
+	if lf.inferScaled {
+		if err := model.CopyOutputRangeToInput(lf.ffn, 0, 0, 0, lf.att, 0, 0, 0, lf.dim, lf.seq); err == nil {
+			surfaceCopied = true
+		}
+	}
+	if !surfaceCopied {
+		if lf.x2 == nil {
+			lf.x2 = make([]float32, lf.dim*lf.seq)
+		}
+		if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
+		}
+		if !lf.inferScaled {
+			blendResidualInPlace(lf.x2, x)
+		}
+		if err := writeStoriesFFNForwardActs(lf.ffn, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
+		}
+	}
+	if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
+		return fmt.Errorf("run layer forward dynamic: eval ffn: %w", err)
+	}
+	if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, lf.seq, out); err != nil {
+		return fmt.Errorf("run layer forward dynamic: read ffn output: %w", err)
+	}
+	if !lf.inferScaled {
+		addScaledResidual(out, lf.x2, out)
+	}
+	return nil
+}
+
+// runDynamicInferPipelined is like runDynamicInferenceOnly but uses surface
+// copies for att→FFN and tries FFN→next att copy to skip the next layer's write.
+func (lf *layerForward) runDynamicInferPipelined(out, x []float32, idx int, layers []*layerForward) error {
+	if lf == nil || lf.att == nil || lf.ffn == nil {
+		return fmt.Errorf("run layer forward dynamic: layer is closed")
+	}
+	want := lf.dim * lf.seq
+	if len(x) != want || len(out) != want {
+		return fmt.Errorf("run layer forward dynamic: len mismatch in=%d out=%d want=%d", len(x), len(out), want)
+	}
+	// Write attention input (or skip if previous layer already copied).
+	if !lf.attInputReady {
+		if err := writeStoriesAttentionForwardActs(lf.att, lf.seq, x); err != nil {
+			return fmt.Errorf("run layer forward dynamic: write attention input: %w", err)
+		}
+	}
+	lf.attInputReady = false
+	if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+		return fmt.Errorf("run layer forward dynamic: eval attention: %w", err)
+	}
+	// Surface copy att→FFN (skip CPU roundtrip).
+	surfaceCopied := false
+	if lf.inferScaled {
+		if err := model.CopyOutputRangeToInput(lf.ffn, 0, 0, 0, lf.att, 0, 0, 0, lf.dim, lf.seq); err == nil {
+			surfaceCopied = true
+		}
+	}
+	if !surfaceCopied {
+		if lf.x2 == nil {
+			lf.x2 = make([]float32, lf.dim*lf.seq)
+		}
+		if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
+		}
+		if !lf.inferScaled {
+			blendResidualInPlace(lf.x2, x)
+		}
+		if err := writeStoriesFFNForwardActs(lf.ffn, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
+		}
+	}
+	if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
+		return fmt.Errorf("run layer forward dynamic: eval ffn: %w", err)
+	}
+	// Try to copy FFN output directly to next layer's attention input.
+	nextIdx := idx + 1
+	if nextIdx < len(layers) && layers[nextIdx] != nil && layers[nextIdx].dynamic && layers[nextIdx].att != nil {
+		nextAtt := layers[nextIdx].att
+		if err := model.CopyOutputRangeToInput(nextAtt, 0, 0, 0, lf.ffn, 0, 0, 0, lf.dim, lf.seq); err == nil {
+			layers[nextIdx].attInputReady = true
+		}
+	}
+	// Always read FFN output to CPU for the `cur` buffer.
+	if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, lf.seq, out); err != nil {
+		return fmt.Errorf("run layer forward dynamic: read ffn output: %w", err)
+	}
+	if !lf.inferScaled {
+		addScaledResidual(out, lf.x2, out)
+	}
+	return nil
+}
+
+func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) error {
 	if lf == nil || lf.att == nil || lf.ffn == nil {
 		return fmt.Errorf("run layer forward dynamic: layer is closed")
 	}
@@ -388,7 +604,7 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 		return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
 	}
 	copy(lf.x2, lf.attOut[:want])
-	// Residual is already applied inside the ANE kernel (x2 = x + Wo@attn).
+	blendResidualInPlace(lf.x2, x)
 	if err := writeStoriesFFNForwardActs(lf.ffn, lf.seq, lf.x2); err != nil {
 		return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
 	}
@@ -398,14 +614,15 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 	if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, lf.seq, lf.ffnOut); err != nil {
 		return fmt.Errorf("run layer forward dynamic: read ffn output: %w", err)
 	}
-	// FFN residual: out = x2 + ffnOutput.
-	for i := 0; i < want; i++ {
-		out[i] = lf.x2[i] + lf.ffnOut[i]
+	copy(out, lf.ffnOut[:want])
+	blendResidualInPlace(out, lf.x2)
+	if cache == nil {
+		return nil
 	}
 	copy(cache.x2, lf.x2)
 	cache.attTapsReady = false
 	cache.ffnTapsReady = false
-	rmsNormNoWeightCF(cache.xNorm, x, lf.dim, lf.seq)
+	rmsNormCFWithRRMS(cache.xNorm, cache.attRRMS, x, lf.rmsAtt, lf.dim, lf.seq)
 	copy(cache.q, lf.attOut[want:2*want])
 	copy(cache.k, lf.attOut[2*want:3*want])
 	copy(cache.v, lf.attOut[3*want:4*want])
@@ -413,61 +630,16 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 	cache.attTapsReady = true
 	hiddenSpan := lf.hidden * lf.seq
 	copy(cache.h1, lf.ffnOut[want:want+hiddenSpan])
+	copy(cache.h3, lf.ffnOut[want+hiddenSpan:want+2*hiddenSpan])
 	for i := range cache.gate {
-		cache.gate[i] = reluSquared32(cache.h1[i])
+		cache.gate[i] = silu32(cache.h1[i]) * cache.h3[i]
 	}
-	rmsNormNoWeightCF(cache.x2Norm, cache.x2, lf.dim, lf.seq)
+	rmsNormCFWithRRMS(cache.x2Norm, cache.ffnRRMS, cache.x2, lf.rmsFFN, lf.dim, lf.seq)
 	cache.ffnTapsReady = true
 	return nil
 }
 
-// runDynamicInferenceOnly runs a dynamic layer using inference-only kernels
-// when available, falling back to reading only dim channels from taps kernels.
-// Inference kernels output only dim channels (no taps), shrinking IOSurfaces.
-func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
-	if lf == nil || lf.att == nil || lf.ffn == nil {
-		return fmt.Errorf("run layer forward dynamic: layer is closed")
-	}
-	want := lf.dim * lf.seq
-	if len(x) != want {
-		return fmt.Errorf("run layer forward dynamic: input len=%d want=%d", len(x), want)
-	}
-	if len(out) != want {
-		return fmt.Errorf("run layer forward dynamic: output len=%d want=%d", len(out), want)
-	}
-
-	// Use inference kernels if available, otherwise fall back to taps kernels.
-	attK := lf.att
-	ffnK := lf.ffn
-	if lf.attInf != nil && lf.ffnInf != nil {
-		attK = lf.attInf
-		ffnK = lf.ffnInf
-	}
-
-	if err := writeStoriesAttentionForwardActs(attK, lf.seq, x); err != nil {
-		return fmt.Errorf("run layer forward dynamic: write attention input: %w", err)
-	}
-	if err := evalKernelTracked(lf.metrics, attK); err != nil {
-		return fmt.Errorf("run layer forward dynamic: eval attention: %w", err)
-	}
-	// Read only x2 (dim channels).
-	if err := readOutputFP16ChannelsFast(attK, 0, 0, lf.seq, lf.x2); err != nil {
-		return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
-	}
-	if err := writeStoriesFFNForwardActs(ffnK, lf.seq, lf.x2); err != nil {
-		return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
-	}
-	if err := evalKernelTracked(lf.metrics, ffnK); err != nil {
-		return fmt.Errorf("run layer forward dynamic: eval ffn: %w", err)
-	}
-	// Read only x_next (dim channels).
-	if err := readOutputFP16ChannelsFast(ffnK, 0, 0, lf.seq, out); err != nil {
-		return fmt.Errorf("run layer forward dynamic: read ffn output: %w", err)
-	}
-	return nil
-}
-
-func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dFFN, h1 []float32) error {
+func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dh3, dFFN, h1, h3 []float32) error {
 	if lb == nil || lb.ffnW2 == nil || lb.ffn == nil {
 		return fmt.Errorf("run layer backward dynamic ffn: layer is closed")
 	}
@@ -479,10 +651,16 @@ func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dFFN, h1 []float32) error {
 	if err := checkLen("run layer backward dynamic ffn", "h1", h1, hiddenN); err != nil {
 		return err
 	}
+	if err := checkLen("run layer backward dynamic ffn", "h3", h3, hiddenN); err != nil {
+		return err
+	}
 	if err := checkLen("run layer backward dynamic ffn", "dx", dxNorm, dimN); err != nil {
 		return err
 	}
 	if err := checkLen("run layer backward dynamic ffn", "dh1", dh1, hiddenN); err != nil {
+		return err
+	}
+	if err := checkLen("run layer backward dynamic ffn", "dh3", dh3, hiddenN); err != nil {
 		return err
 	}
 	if err := writeDynamicMatmulActs(lb.ffnW2, lb.seq, dFFN); err != nil {
@@ -494,7 +672,7 @@ func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dFFN, h1 []float32) error {
 	if err := model.CopyOutputRangeToInput(lb.ffn, 0, 0, 0, lb.ffnW2, 0, 0, 0, lb.hidden, lb.seq); err != nil {
 		return fmt.Errorf("run layer backward dynamic ffn: copy dsilu to tail: %w", err)
 	}
-	if err := writeStoriesFFNTailAuxActs(lb.ffn, lb.seq, lb.hidden, h1); err != nil {
+	if err := writeStoriesFFNTailAuxActs(lb.ffn, lb.seq, lb.hidden, h1, h3); err != nil {
 		return fmt.Errorf("run layer backward dynamic ffn: write tail aux input: %w", err)
 	}
 	if err := evalKernelTracked(lb.metrics, lb.ffn); err != nil {
@@ -505,6 +683,7 @@ func (lb *layerBackward) runDynamicFFN(dxNorm, dh1, dFFN, h1 []float32) error {
 	}
 	copy(dxNorm, lb.ffnOut[:dimN])
 	copy(dh1, lb.ffnOut[dimN:dimN+hiddenN])
+	copy(dh3, lb.ffnOut[dimN+hiddenN:dimN+2*hiddenN])
 	return nil
 }
 
@@ -605,12 +784,50 @@ func stageStoriesAttentionForwardWeights(k *model.Kernel, seq int, w layerForwar
 		}
 		for d := 0; d < stories.Dim; d++ {
 			row := inputRowFP16(data, layout, d)
-			row[seq] = xane.Float32ToFP16(1.0) // Parameterless RMSNorm: weight = 1.0
+			row[seq] = xane.Float32ToFP16(w.RMSAtt[d])
 		}
 		writeTransposedMatrixFP16(data, layout, 0, seq+1, stories.Dim, stories.Dim, w.Wq)
 		writeTransposedMatrixFP16(data, layout, 0, seq+1+stories.Dim, stories.Dim, stories.Dim, w.Wk)
 		writeTransposedMatrixFP16(data, layout, 0, seq+1+2*stories.Dim, stories.Dim, stories.Dim, w.Wv)
 		writeTransposedMatrixFP16(data, layout, 0, seq+1+3*stories.Dim, stories.Dim, stories.Dim, w.Wo)
+		return nil
+	})
+}
+
+// stageGQAAttentionForwardWeights stages weights for a GQA attention kernel.
+// Layout: x[seq], rms[1], Wq[qDim], Wk[kvDim], Wv[kvDim], Wo[qDim]
+// where qDim = heads*headDim (may differ from dim when headDim is explicit).
+func stageGQAAttentionForwardWeights(k *model.Kernel, seq, dim, qDim, kvDim int, w layerForwardWeights) error {
+	width := seq + 1 + 2*qDim + 2*kvDim
+	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
+		if err := requireFP16InputLayout("stage gqa attention forward weights", layout, dim, width); err != nil {
+			return err
+		}
+		for d := 0; d < dim; d++ {
+			row := inputRowFP16(data, layout, d)
+			row[seq] = xane.Float32ToFP16(w.RMSAtt[d])
+		}
+		off := seq + 1
+		writeTransposedMatrixFP16(data, layout, 0, off, qDim, dim, w.Wq)
+		off += qDim
+		writeTransposedMatrixFP16(data, layout, 0, off, kvDim, dim, w.Wk)
+		off += kvDim
+		writeTransposedMatrixFP16(data, layout, 0, off, kvDim, dim, w.Wv)
+		off += kvDim
+		// Wo is [dim, qDim] stored as rows of dim, columns of qDim
+		writeMatrixRowsFP16(data, layout, 0, off, dim, qDim, w.Wo)
+		return nil
+	})
+}
+
+// writeGQAAttentionForwardActs writes activations for a GQA attention kernel.
+func writeGQAAttentionForwardActs(k *model.Kernel, seq, dim, qDim, kvDim int, x []float32) error {
+	width := seq + 1 + 2*qDim + 2*kvDim
+	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
+		if err := requireFP16InputLayout("write gqa attention forward acts", layout, dim, width); err != nil {
+			return err
+		}
+		writeChannelFirstActsFP16(data, layout, seq, x)
 		return nil
 	})
 }
@@ -625,25 +842,30 @@ func writeStoriesAttentionForwardActs(k *model.Kernel, seq int, x []float32) err
 	})
 }
 
-func stageStoriesFFNForwardWeights(k *model.Kernel, seq, hidden int, w layerForwardWeights) error {
-	width := seq + 1 + 2*hidden
+func stageFFNForwardWeights(k *model.Kernel, seq, dim, hidden int, w layerForwardWeights) error {
+	width := seq + 1 + 3*hidden
 	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
-		if err := requireFP16InputLayout("stage stories ffn forward weights", layout, stories.Dim, width); err != nil {
+		if err := requireFP16InputLayout("stage ffn forward weights", layout, dim, width); err != nil {
 			return err
 		}
-		for d := 0; d < stories.Dim; d++ {
+		for d := 0; d < dim; d++ {
 			row := inputRowFP16(data, layout, d)
-			row[seq] = xane.Float32ToFP16(1.0) // Parameterless RMSNorm: weight = 1.0
+			row[seq] = xane.Float32ToFP16(w.RMSFFN[d])
 		}
-		writeTransposedMatrixFP16(data, layout, 0, seq+1, hidden, stories.Dim, w.W1)
-		writeMatrixRowsFP16(data, layout, 0, seq+1+hidden, stories.Dim, hidden, w.W2)
+		writeTransposedMatrixFP16(data, layout, 0, seq+1, hidden, dim, w.W1)
+		writeTransposedMatrixFP16(data, layout, 0, seq+1+hidden, hidden, dim, w.W3)
+		writeMatrixRowsFP16(data, layout, 0, seq+1+2*hidden, dim, hidden, w.W2)
 		return nil
 	})
 }
 
+func stageStoriesFFNForwardWeights(k *model.Kernel, seq, hidden int, w layerForwardWeights) error {
+	return stageFFNForwardWeights(k, seq, stories.Dim, hidden, w)
+}
+
 func writeStoriesFFNForwardActs(k *model.Kernel, seq int, x []float32) error {
 	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
-		if err := requireFP16InputLayout("write stories ffn forward acts", layout, stories.Dim, seq+1+2*stories.Hidden); err != nil {
+		if err := requireFP16InputLayout("write stories ffn forward acts", layout, stories.Dim, seq+1+3*stories.Hidden); err != nil {
 			return err
 		}
 		writeChannelFirstActsFP16(data, layout, seq, x)
@@ -651,23 +873,25 @@ func writeStoriesFFNForwardActs(k *model.Kernel, seq int, x []float32) error {
 	})
 }
 
-func stageStoriesFFNTailWeights(k *model.Kernel, seq, hidden int, w1 []float32) error {
-	width := 2*seq + stories.Dim
+func stageStoriesFFNTailWeights(k *model.Kernel, seq, hidden int, w1, w3 []float32) error {
+	width := 3*seq + 2*stories.Dim
 	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
 		if err := requireFP16InputLayout("stage stories ffn tail weights", layout, hidden, width); err != nil {
 			return err
 		}
-		writeMatrixRowsFP16(data, layout, 0, 2*seq, hidden, stories.Dim, w1)
+		writeMatrixRowsFP16(data, layout, 0, 3*seq, hidden, stories.Dim, w1)
+		writeMatrixRowsFP16(data, layout, 0, 3*seq+stories.Dim, hidden, stories.Dim, w3)
 		return nil
 	})
 }
 
-func writeStoriesFFNTailAuxActs(k *model.Kernel, seq, hidden int, h1 []float32) error {
+func writeStoriesFFNTailAuxActs(k *model.Kernel, seq, hidden int, h1, h3 []float32) error {
 	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
-		if err := requireFP16InputLayout("write stories ffn tail acts", layout, hidden, 2*seq+stories.Dim); err != nil {
+		if err := requireFP16InputLayout("write stories ffn tail acts", layout, hidden, 3*seq+2*stories.Dim); err != nil {
 			return err
 		}
 		writeChannelFirstActsOffsetFP16(data, layout, 0, seq, seq, h1)
+		writeChannelFirstActsOffsetFP16(data, layout, 0, 2*seq, seq, h3)
 		return nil
 	})
 }
@@ -853,42 +1077,4 @@ func writeTransposedMatrixFP16(data []uint16, layout xane.TensorLayout, channelO
 
 func iosurfaceRef(ref coregraphics.IOSurfaceRef) appleiosurface.IOSurfaceRef {
 	return appleiosurface.IOSurfaceRef(ref)
-}
-
-// ropeTheta is the base frequency for RoPE. Nanochat uses 100000.
-const ropeTheta = 100000.0
-
-// buildRoPEBlobsLocal builds fp16 RoPE cos/sin blobs using our local theta.
-func buildRoPEBlobsLocal(seq, headDim int) ([]byte, []byte, error) {
-	if seq <= 0 {
-		return nil, nil, fmt.Errorf("seq=%d must be > 0", seq)
-	}
-	if headDim <= 0 || headDim%2 != 0 {
-		return nil, nil, fmt.Errorf("headDim=%d must be even and > 0", headDim)
-	}
-	half := headDim / 2
-	cosTbl := make([]float32, seq*headDim)
-	sinTbl := make([]float32, seq*headDim)
-	for pos := 0; pos < seq; pos++ {
-		row := pos * headDim
-		for i := 0; i < half; i++ {
-			freq := float64(pos) / math.Pow(ropeTheta, float64(2*i)/float64(headDim))
-			c := float32(math.Cos(freq))
-			s := float32(math.Sin(freq))
-			even := row + 2*i
-			cosTbl[even] = c
-			cosTbl[even+1] = c
-			sinTbl[even] = s
-			sinTbl[even+1] = s
-		}
-	}
-	cosBlob, err := mil.BuildFP16Blob(cosTbl)
-	if err != nil {
-		return nil, nil, err
-	}
-	sinBlob, err := mil.BuildFP16Blob(sinTbl)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cosBlob, sinBlob, nil
 }
