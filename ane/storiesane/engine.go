@@ -374,11 +374,10 @@ func (e *Engine) EvalLogits(tokens []uint16) ([]float32, error) {
 	if len(tokens) != e.seq {
 		return nil, fmt.Errorf("storiesane eval logits: token len=%d want=%d", len(tokens), e.seq)
 	}
-	if err := e.evalLogitsInto(tokens, e.logits); err != nil {
+	out := make([]float32, len(e.logits))
+	if err := e.evalLogitsInto(tokens, out); err != nil {
 		return nil, err
 	}
-	out := make([]float32, len(e.logits))
-	copy(out, e.logits)
 	return out, nil
 }
 
