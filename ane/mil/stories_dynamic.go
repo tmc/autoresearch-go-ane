@@ -19,13 +19,10 @@ func appendDynamicMatmulFP16(b *strings.Builder, prefix, actVar, wtVar string, i
 }
 
 func appendDynamicRMSNormFP16(b *strings.Builder, outVar, xVar, wVar string, dim, seq int) {
-	invd := 1.0 / float64(dim)
 	fmt.Fprintf(b, "        tensor<fp16, [1,%d,1,%d]> %s_sq = mul(x=%s,y=%s)[name=string(\"%s_sq\")];\n", dim, seq, outVar, xVar, xVar, outVar)
 	b.WriteString("        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n")
 	b.WriteString("        bool kd = const()[name=string(\"kd\"), val=bool(true)];\n")
-	fmt.Fprintf(b, "        tensor<fp16, [1,1,1,%d]> %s_ss = reduce_sum(x=%s_sq,axes=rax,keep_dims=kd)[name=string(\"%s_ss\")];\n", seq, outVar, outVar, outVar)
-	fmt.Fprintf(b, "        fp16 invd = const()[name=string(\"invd\"), val=fp16(%f)];\n", invd)
-	fmt.Fprintf(b, "        tensor<fp16, [1,1,1,%d]> %s_ss2 = mul(x=%s_ss,y=invd)[name=string(\"%s_ss2\")];\n", seq, outVar, outVar, outVar)
+	fmt.Fprintf(b, "        tensor<fp16, [1,1,1,%d]> %s_ss2 = reduce_mean(x=%s_sq,axes=rax,keep_dims=kd)[name=string(\"%s_ss2\")];\n", seq, outVar, outVar, outVar)
 	b.WriteString("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n")
 	fmt.Fprintf(b, "        tensor<fp16, [1,1,1,%d]> %s_ss3 = add(x=%s_ss2,y=eps)[name=string(\"%s_ss3\")];\n", seq, outVar, outVar, outVar)
 	fmt.Fprintf(b, "        tensor<fp16, [1,1,1,%d]> %s_rrms = rsqrt(x=%s_ss3)[name=string(\"%s_rrms\")];\n", seq, outVar, outVar, outVar)
