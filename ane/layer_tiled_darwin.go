@@ -389,46 +389,46 @@ func addScaledResidualWith(dst, base, branch []float32, scale float32) {
 // q has shape [heads*headDim, seq], k and v have shape [kvHeads*headDim, seq].
 // When kvHeads < heads, each KV head is shared by (heads/kvHeads) query heads.
 // Output has shape [heads*headDim, seq].
+//
+// Uses BLAS (cblas_sgemm) for the two expensive matmuls:
+//   - scores = Q_h^T @ K_kvH  (attention scores)
+//   - out_h  = V_kvH @ scores^T  (value gather)
+// Causal mask and softmax are applied row-by-row between the two BLAS calls.
 func gqaCausalAttentionCF(out, qf, kf, vf []float32, heads, kvHeads, headDim, seq int) {
-	if kvHeads == heads {
-		// MHA: use the existing optimized path.
-		causalAttentionCF(out, qf, kf, vf, heads, headDim, seq)
-		return
+	scale := float32(1.0 / math.Sqrt(float64(headDim)))
+	groupSize := 1
+	if kvHeads > 0 && kvHeads < heads {
+		groupSize = heads / kvHeads
 	}
 
-	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	groupSize := heads / kvHeads
-	scores := make([]float32, seq)
-	probs := make([]float32, seq)
+	// Scratch buffer for [seq × seq] attention scores (reused across heads).
+	scores := make([]float32, seq*seq)
 
 	for h := 0; h < heads; h++ {
 		kvH := h / groupSize
-		qBase := h * headDim
-		kBase := kvH * headDim
+		qOff := h * headDim * seq
+		kOff := kvH * headDim * seq
+		vOff := kvH * headDim * seq
+		outOff := h * headDim * seq
 
+		// scores = Q_h^T @ K_kvH: [seq, seq]
+		// Q_h is [headDim, seq] at qf[qOff:], K_kvH is [headDim, seq] at kf[kOff:].
+		// CblasTrans on A: A^T is [seq, headDim], B is [headDim, seq], result is [seq, seq].
+		gqaAttentionScoresBLAS(scores, qf[qOff:], kf[kOff:], headDim, seq, scale)
+
+		// Apply causal mask and softmax row-by-row.
 		for t := 0; t < seq; t++ {
-			// Compute attention scores: q[h] dot k[kvH] for positions <= t.
-			for j := 0; j < seq; j++ {
-				if j > t {
-					scores[j] = -65504
-					continue
-				}
-				sum := float32(0)
-				for i := 0; i < headDim; i++ {
-					sum += qf[(qBase+i)*seq+t] * kf[(kBase+i)*seq+j]
-				}
-				scores[j] = sum * scale
+			row := scores[t*seq : (t+1)*seq]
+			// Mask future positions.
+			for j := t + 1; j < seq; j++ {
+				row[j] = -65504
 			}
-			softmaxRow(probs, scores)
-
-			// Weighted sum of v[kvH].
-			for i := 0; i < headDim; i++ {
-				sum := float32(0)
-				for j := 0; j < seq; j++ {
-					sum += probs[j] * vf[(kBase+i)*seq+j]
-				}
-				out[(qBase+i)*seq+t] = sum
-			}
+			softmaxRow(row, row)
 		}
+
+		// out_h = V_kvH @ scores^T: [headDim, seq]
+		// V_kvH is [headDim, seq], scores is [seq, seq].
+		// CblasNoTrans on A, CblasTrans on B.
+		gqaAttentionValueBLAS(out[outOff:], vf[vOff:], scores, headDim, seq)
 	}
 }

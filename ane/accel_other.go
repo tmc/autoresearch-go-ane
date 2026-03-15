@@ -53,6 +53,32 @@ func linearCFAccelerate(out, weights, x []float32, outCh, inCh, seq int) bool {
 	return false
 }
 
+func gqaAttentionScoresBLAS(scores, q, k []float32, headDim, seq int, alpha float32) {
+	// Fallback: pure Go Q^T @ K with scaling.
+	for t := 0; t < seq; t++ {
+		for j := 0; j < seq; j++ {
+			sum := float32(0)
+			for d := 0; d < headDim; d++ {
+				sum += q[d*seq+t] * k[d*seq+j]
+			}
+			scores[t*seq+j] = sum * alpha
+		}
+	}
+}
+
+func gqaAttentionValueBLAS(out, v, probs []float32, headDim, seq int) {
+	// Fallback: pure Go V @ probs^T.
+	for d := 0; d < headDim; d++ {
+		for t := 0; t < seq; t++ {
+			sum := float32(0)
+			for j := 0; j < seq; j++ {
+				sum += v[d*seq+j] * probs[t*seq+j]
+			}
+			out[d*seq+t] = sum
+		}
+	}
+}
+
 func linearSingleGEMV(out, weights, x []float32, outDim, inDim int) bool {
 	return false
 }

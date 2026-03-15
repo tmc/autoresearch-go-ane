@@ -251,6 +251,48 @@ func softmaxRowAccel(out, in []float32) {
 	)
 }
 
+// gqaAttentionScoresBLAS computes scores = alpha * Q^T @ K where
+// Q is [headDim, seq] and K is [headDim, seq], producing [seq, seq].
+func gqaAttentionScoresBLAS(scores, q, k []float32, headDim, seq int, alpha float32) {
+	C.cblas_sgemm(
+		C.CblasRowMajor,
+		C.CblasTrans,    // transpose Q: [seq, headDim]
+		C.CblasNoTrans,  // K as-is: [headDim, seq]
+		C.int(seq),      // M = seq
+		C.int(seq),      // N = seq
+		C.int(headDim),  // K = headDim
+		C.float(alpha),  // alpha = 1/sqrt(headDim)
+		(*C.float)(unsafe.Pointer(&q[0])),
+		C.int(seq),      // lda = seq (row stride of Q before transpose)
+		(*C.float)(unsafe.Pointer(&k[0])),
+		C.int(seq),      // ldb = seq
+		C.float(0),
+		(*C.float)(unsafe.Pointer(&scores[0])),
+		C.int(seq),      // ldc = seq
+	)
+}
+
+// gqaAttentionValueBLAS computes out = V @ probs^T where
+// V is [headDim, seq] and probs is [seq, seq], producing [headDim, seq].
+func gqaAttentionValueBLAS(out, v, probs []float32, headDim, seq int) {
+	C.cblas_sgemm(
+		C.CblasRowMajor,
+		C.CblasNoTrans,  // V as-is: [headDim, seq]
+		C.CblasTrans,    // transpose probs: [seq, seq]^T
+		C.int(headDim),  // M = headDim
+		C.int(seq),      // N = seq
+		C.int(seq),      // K = seq
+		C.float(1),
+		(*C.float)(unsafe.Pointer(&v[0])),
+		C.int(seq),      // lda = seq
+		(*C.float)(unsafe.Pointer(&probs[0])),
+		C.int(seq),      // ldb = seq
+		C.float(0),
+		(*C.float)(unsafe.Pointer(&out[0])),
+		C.int(seq),      // ldc = seq
+	)
+}
+
 // linearSingleGEMV uses cblas_sgemv for single-token matmul (seq=1).
 // Faster than cblas_sgemm for matrix-vector products.
 func linearSingleGEMV(out, weights, x []float32, outDim, inDim int) bool {
