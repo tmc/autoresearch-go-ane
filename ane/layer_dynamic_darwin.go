@@ -311,6 +311,9 @@ func (lb *layerBackward) stageDynamicWeights(layer stories.LayerWeights) error {
 }
 
 func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) error {
+	if cache == nil {
+		return lf.runDynamicInferenceOnly(out, x)
+	}
 	if lf == nil || lf.att == nil || lf.ffn == nil {
 		return fmt.Errorf("run layer forward dynamic: layer is closed")
 	}
@@ -345,9 +348,6 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 	for i := 0; i < want; i++ {
 		out[i] = lf.x2[i] + lf.ffnOut[i]
 	}
-	if cache == nil {
-		return nil
-	}
 	copy(cache.x2, lf.x2)
 	cache.attTapsReady = false
 	cache.ffnTapsReady = false
@@ -364,6 +364,44 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 	}
 	rmsNormNoWeightCF(cache.x2Norm, cache.x2, lf.dim, lf.seq)
 	cache.ffnTapsReady = true
+	return nil
+}
+
+// runDynamicInferenceOnly runs a dynamic layer reading only the dim output
+// channels from attention and FFN, skipping taps (Q, K, V, att_out, h1).
+// Saves ~30 MB of IOSurface reads per inference call across 12 layers.
+func (lf *layerForward) runDynamicInferenceOnly(out, x []float32) error {
+	if lf == nil || lf.att == nil || lf.ffn == nil {
+		return fmt.Errorf("run layer forward dynamic: layer is closed")
+	}
+	want := lf.dim * lf.seq
+	if len(x) != want {
+		return fmt.Errorf("run layer forward dynamic: input len=%d want=%d", len(x), want)
+	}
+	if len(out) != want {
+		return fmt.Errorf("run layer forward dynamic: output len=%d want=%d", len(out), want)
+	}
+	if err := writeStoriesAttentionForwardActs(lf.att, lf.seq, x); err != nil {
+		return fmt.Errorf("run layer forward dynamic: write attention input: %w", err)
+	}
+	if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+		return fmt.Errorf("run layer forward dynamic: eval attention: %w", err)
+	}
+	// Read only x2 (dim channels), skip taps (q, k, v, att_out).
+	if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+		return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
+	}
+	if err := writeStoriesFFNForwardActs(lf.ffn, lf.seq, lf.x2); err != nil {
+		return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
+	}
+	if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
+		return fmt.Errorf("run layer forward dynamic: eval ffn: %w", err)
+	}
+	// Read only x_next (dim channels), skip h1.
+	if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, lf.seq, out); err != nil {
+		return fmt.Errorf("run layer forward dynamic: read ffn output: %w", err)
+	}
+	// The FFN kernel already computes x_next = x2 + ff, so out is the final result.
 	return nil
 }
 
