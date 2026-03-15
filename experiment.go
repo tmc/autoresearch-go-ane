@@ -2,9 +2,9 @@
 
 // experiment.go — THE MODIFIABLE FILE
 //
-// The autonomous agent edits this file to explore hyperparameters,
-// learning rate schedules, and training configurations. All other
-// files in this package are read-only.
+// The autonomous agent edits this file to explore inference configuration,
+// dispatch strategies, and acceleration options. All other files in this
+// package are read-only.
 
 package main
 
@@ -14,8 +14,22 @@ import (
 	"github.com/tmc/autoresearch-go-ane/ane"
 )
 
+// Inference configuration — the primary tuning surface.
 const (
-	SequenceLength = 256
+	SequenceLength = 256 // context window for benchmarking
+
+	// Acceleration dispatch flags.
+	UseMetal    = false // Metal GPU matmul for large layers
+	UseBNNS     = false // BNNS fp16-weight GEMV
+	UseANE      = true  // Apple Neural Engine acceleration
+	TileSize    = 0     // tiled layer dimension (0 = auto)
+
+	// Buffer management.
+	PreallocBuffers = true // pre-allocate scratch buffers at engine init
+)
+
+// Training constants — kept for backward compatibility with harness.
+const (
 	AccumSteps     = 4
 	LearningRate   = 3e-4
 	AdamBeta1      = 0.9
@@ -24,7 +38,6 @@ const (
 	WeightDecay    = 0.01
 	GradClip       = 1.0
 	LossScale      = 256.0
-	UseANE         = true
 	HybridBackward = true
 	Seed           = 42
 )
