@@ -50,15 +50,13 @@ func compileStoriesLayerBackward(layer stories.LayerWeights, seq int) (*layerBac
 		return nil, fmt.Errorf("compile layer backward: invalid shape dim=%d hidden=%d heads=%d seq=%d", dim, hidden, heads, seq)
 	}
 	if err := validateLayerWeights(dim, hidden, layerForwardWeights{
-		RMSAtt: layer.RMSAtt,
-		Wq:     layer.Wq,
-		Wk:     layer.Wk,
-		Wv:     layer.Wv,
-		Wo:     layer.Wo,
-		RMSFFN: layer.RMSFFN,
-		W1:     layer.W1,
-		W2:     layer.W2,
-		W3:     layer.W3,
+		Wq: layer.Wq,
+		Wk: layer.Wk,
+		Wv: layer.Wv,
+		Wo: layer.Wo,
+		W1: layer.W1,
+		W2: layer.W2,
+		W3: layer.W3,
 	}); err != nil {
 		return nil, err
 	}

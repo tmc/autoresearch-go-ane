@@ -25,15 +25,13 @@ func (e *Engine) disableHybridBackward(error) {}
 // --- layer forward ---
 
 type layerForwardWeights struct {
-	RMSAtt []float32
-	Wq     []float32
-	Wk     []float32
-	Wv     []float32
-	Wo     []float32
-	RMSFFN []float32
-	W1     []float32
-	W2     []float32
-	W3     []float32
+	Wq []float32
+	Wk []float32
+	Wv []float32
+	Wo []float32
+	W1 []float32
+	W2 []float32
+	W3 []float32
 }
 
 type layerForward struct{}

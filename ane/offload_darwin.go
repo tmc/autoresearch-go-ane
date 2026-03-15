@@ -91,7 +91,7 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 		rmsFwd:   rmsFwd,
 		rmsBwd:   rmsBwd,
 		rmsBwdIn: make([]float32, 2*stories.Dim*seq),
-		rmsW:     mw.RMSFinal,
+		rmsW:     onesSlice(stories.Dim),
 		softmax:  softmax,
 	}
 	var err error
@@ -553,7 +553,8 @@ func (o *offload) refreshWeights(mw *stories.ModelWeights) error {
 	if mw == nil {
 		return fmt.Errorf("refresh offload weights: model weights are nil")
 	}
-	o.rmsW = mw.RMSFinal
+	// Parameterless RMSNorm: weight is always 1.0.
+	o.rmsW = onesSlice(stories.Dim)
 	forwardStart := time.Now()
 	if err := o.refreshClassifierForwardWeights(mw.Embed); err != nil {
 		return err

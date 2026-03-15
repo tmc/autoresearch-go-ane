@@ -90,15 +90,13 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		heads  = stories.Heads
 	)
 	if err := validateLayerWeights(dim, hidden, layerForwardWeights{
-		RMSAtt: layer.RMSAtt,
-		Wq:     layer.Wq,
-		Wk:     layer.Wk,
-		Wv:     layer.Wv,
-		Wo:     layer.Wo,
-		RMSFFN: layer.RMSFFN,
-		W1:     layer.W1,
-		W2:     layer.W2,
-		W3:     layer.W3,
+		Wq: layer.Wq,
+		Wk: layer.Wk,
+		Wv: layer.Wv,
+		Wo: layer.Wo,
+		W1: layer.W1,
+		W2: layer.W2,
+		W3: layer.W3,
 	}); err != nil {
 		return nil, err
 	}
@@ -149,22 +147,18 @@ func compileStoriesLayerForwardDynamic(layer stories.LayerWeights, seq int) (_ *
 		dynamic: true,
 		attTaps: true,
 		ffnTaps: true,
-		rmsAtt:  layer.RMSAtt,
-		rmsFFN:  layer.RMSFFN,
-		attOut:  make([]float32, 5*dim*seq),
+		attOut: make([]float32, 5*dim*seq),
 		ffnOut:  make([]float32, (dim+2*hidden)*seq),
 		x2:      make([]float32, dim*seq),
 	}
 	if err := lf.stageDynamicWeights(layerForwardWeights{
-		RMSAtt: layer.RMSAtt,
-		Wq:     layer.Wq,
-		Wk:     layer.Wk,
-		Wv:     layer.Wv,
-		Wo:     layer.Wo,
-		RMSFFN: layer.RMSFFN,
-		W1:     layer.W1,
-		W2:     layer.W2,
-		W3:     layer.W3,
+		Wq: layer.Wq,
+		Wk: layer.Wk,
+		Wv: layer.Wv,
+		Wo: layer.Wo,
+		W1: layer.W1,
+		W2: layer.W2,
+		W3: layer.W3,
 	}); err != nil {
 		lf.close()
 		return nil, err
@@ -179,15 +173,13 @@ func compileStoriesLayerBackwardDynamic(layer stories.LayerWeights, seq int) (_ 
 		heads  = stories.Heads
 	)
 	if err := validateLayerWeights(dim, hidden, layerForwardWeights{
-		RMSAtt: layer.RMSAtt,
-		Wq:     layer.Wq,
-		Wk:     layer.Wk,
-		Wv:     layer.Wv,
-		Wo:     layer.Wo,
-		RMSFFN: layer.RMSFFN,
-		W1:     layer.W1,
-		W2:     layer.W2,
-		W3:     layer.W3,
+		Wq: layer.Wq,
+		Wk: layer.Wk,
+		Wv: layer.Wv,
+		Wo: layer.Wo,
+		W1: layer.W1,
+		W2: layer.W2,
+		W3: layer.W3,
 	}); err != nil {
 		return nil, err
 	}
@@ -298,8 +290,6 @@ func (lf *layerForward) stageDynamicWeights(w layerForwardWeights) error {
 	if err := stageStoriesFFNForwardWeights(lf.ffn, lf.seq, lf.hidden, w); err != nil {
 		return fmt.Errorf("stage layer forward dynamic weights: ffn: %w", err)
 	}
-	lf.rmsAtt = w.RMSAtt
-	lf.rmsFFN = w.RMSFFN
 	return nil
 }
 
@@ -343,7 +333,7 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 		return fmt.Errorf("run layer forward dynamic: read attention output: %w", err)
 	}
 	copy(lf.x2, lf.attOut[:want])
-	blendResidualInPlace(lf.x2, x)
+	// Residual is already applied inside the ANE kernel (x2 = x + Wo@attn).
 	if err := writeStoriesFFNForwardActs(lf.ffn, lf.seq, lf.x2); err != nil {
 		return fmt.Errorf("run layer forward dynamic: write ffn input: %w", err)
 	}
@@ -353,15 +343,17 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 	if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, lf.seq, lf.ffnOut); err != nil {
 		return fmt.Errorf("run layer forward dynamic: read ffn output: %w", err)
 	}
-	copy(out, lf.ffnOut[:want])
-	blendResidualInPlace(out, lf.x2)
+	// FFN residual: out = x2 + ffnOutput.
+	for i := 0; i < want; i++ {
+		out[i] = lf.x2[i] + lf.ffnOut[i]
+	}
 	if cache == nil {
 		return nil
 	}
 	copy(cache.x2, lf.x2)
 	cache.attTapsReady = false
 	cache.ffnTapsReady = false
-	rmsNormCFWithRRMS(cache.xNorm, cache.attRRMS, x, lf.rmsAtt, lf.dim, lf.seq)
+	rmsNormNoWeightCF(cache.xNorm, x, lf.dim, lf.seq)
 	copy(cache.q, lf.attOut[want:2*want])
 	copy(cache.k, lf.attOut[2*want:3*want])
 	copy(cache.v, lf.attOut[3*want:4*want])
@@ -371,9 +363,9 @@ func (lf *layerForward) runDynamicWithTaps(out, x []float32, cache *layerCache) 
 	copy(cache.h1, lf.ffnOut[want:want+hiddenSpan])
 	copy(cache.h3, lf.ffnOut[want+hiddenSpan:want+2*hiddenSpan])
 	for i := range cache.gate {
-		cache.gate[i] = silu32(cache.h1[i]) * cache.h3[i]
+		cache.gate[i] = reluSquared32(cache.h1[i]) * cache.h3[i]
 	}
-	rmsNormCFWithRRMS(cache.x2Norm, cache.ffnRRMS, cache.x2, lf.rmsFFN, lf.dim, lf.seq)
+	rmsNormNoWeightCF(cache.x2Norm, cache.x2, lf.dim, lf.seq)
 	cache.ffnTapsReady = true
 	return nil
 }
@@ -523,7 +515,7 @@ func stageStoriesAttentionForwardWeights(k *model.Kernel, seq int, w layerForwar
 		}
 		for d := 0; d < stories.Dim; d++ {
 			row := inputRowFP16(data, layout, d)
-			row[seq] = xane.Float32ToFP16(w.RMSAtt[d])
+			row[seq] = xane.Float32ToFP16(1.0) // Parameterless RMSNorm: weight = 1.0
 		}
 		writeTransposedMatrixFP16(data, layout, 0, seq+1, stories.Dim, stories.Dim, w.Wq)
 		writeTransposedMatrixFP16(data, layout, 0, seq+1+stories.Dim, stories.Dim, stories.Dim, w.Wk)
@@ -551,7 +543,7 @@ func stageStoriesFFNForwardWeights(k *model.Kernel, seq, hidden int, w layerForw
 		}
 		for d := 0; d < stories.Dim; d++ {
 			row := inputRowFP16(data, layout, d)
-			row[seq] = xane.Float32ToFP16(w.RMSFFN[d])
+			row[seq] = xane.Float32ToFP16(1.0) // Parameterless RMSNorm: weight = 1.0
 		}
 		writeTransposedMatrixFP16(data, layout, 0, seq+1, hidden, stories.Dim, w.W1)
 		writeTransposedMatrixFP16(data, layout, 0, seq+1+hidden, hidden, stories.Dim, w.W3)

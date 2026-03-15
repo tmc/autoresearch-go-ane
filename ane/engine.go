@@ -102,27 +102,44 @@ type Engine struct {
 	applyGrads              []stories.LayerWeights
 	gradTasks               *gradTasks
 
-	x             []float32
-	xNorm         []float32
-	logits        []float32
-	dy            []float32
-	dx            []float32
-	gRMS          []float32
-	gEmbed        []float32
-	accumGRMS     []float32
-	accumGEmbed   []float32
-	gradGate      []float32
-	gradH1        []float32
-	gradH3        []float32
-	gradXNorm     []float32
-	gradX2        []float32
-	gradAtt       []float32
-	gradQ         []float32
-	gradK         []float32
-	gradV         []float32
-	gradPrev      []float32
-	ropeCos       []float32
-	ropeSin       []float32
+	x                []float32
+	x0               []float32 // [dim*seq] saved post-embed-norm for residual lambdas
+	xPreEmbedNorm    []float32 // [dim*seq] pre-embed-norm (for backward)
+	xNorm            []float32
+	logits           []float32
+	logitsPreSoftcap []float32 // [vocab*seq] logits before softcap (for backward)
+	dy               []float32
+	dx               []float32
+	gEmbed           []float32
+	gResidLambdas    []float32 // [NLayers] residual lambda gradients
+	gX0Lambdas       []float32 // [NLayers] x0 lambda gradients
+	gX0              []float32 // [dim*seq] accumulated x0 gradient
+	gradGate         []float32
+	gradH1           []float32
+	gradH3           []float32
+	gradXNorm        []float32
+	gradX2           []float32
+	gradAtt          []float32
+	gradQ            []float32
+	gradK            []float32
+	gradV            []float32
+	gradPrev         []float32
+	ropeCos          []float32
+	ropeSin          []float32
+
+	// Smear/Backout buffers.
+	smearGatePre     []float32 // [dim*seq] saved gate pre-activation
+	smearShifted     []float32 // [dim*seq] saved shifted input
+	smearGateAct     []float32 // [dim*seq] saved sigmoid(gatePre)
+	smearXPre        []float32 // [dim*seq] input before smear (for backward)
+	xMid             []float32 // [dim*seq] mid-layer residual snapshot
+	gSmearGate       []float32 // [dim*dim] smear gate gradient
+	gSmearLambda     []float32 // [1] smear lambda gradient
+	gBackoutLambda   []float32 // [1] backout lambda gradient
+	accumGSmearGate  []float32 // [dim*dim] accumulated smear gate gradient
+	accumGSmearLam   []float32 // [1] accumulated smear lambda gradient
+	accumGBackoutLam []float32 // [1] accumulated backout lambda gradient
+
 	embedGradDone    chan struct{}
 	asyncRefreshDone chan time.Duration // async weight refresh result
 	stepMetrics      aneStepMetrics
@@ -194,20 +211,22 @@ func Open(opts Options) (*Engine, error) {
 	} else {
 		*mw = *loaded
 	}
-	var accumGRMS []float32
-	var accumGEmbed []float32
+	var accumGSmearGate []float32
+	var accumGSmearLam []float32
+	var accumGBackoutLam []float32
 	if accum != nil {
-		accumGRMS = accum.RMSFinal
-		accumGEmbed = accum.Embed
+		accumGSmearGate = accum.SmearGate
+		accumGSmearLam = accum.SmearLambda
+		accumGBackoutLam = accum.BackoutLambda
 	}
 	caches := make([]layerCache, stories.NLayers)
 	for i := range caches {
-		caches[i] = newLayerCache(seq)
+		caches[i] = newLayerCache(seq, i)
 	}
 	ropeCos, ropeSin := buildRoPETables(seq, stories.Dim/stories.Heads)
 	applyGrads := make([]stories.LayerWeights, stories.NLayers)
 	for i := range applyGrads {
-		applyGrads[i] = newLayerGrad()
+		applyGrads[i] = newLayerGrad(i)
 	}
 
 	return &Engine{
@@ -236,14 +255,17 @@ func Open(opts Options) (*Engine, error) {
 		applyGrads:              applyGrads,
 		gradTasks:               newGradTasks(),
 		x:                       make([]float32, stories.Dim*seq),
+		x0:                      make([]float32, stories.Dim*seq),
+		xPreEmbedNorm:           make([]float32, stories.Dim*seq),
 		xNorm:                   make([]float32, stories.Dim*seq),
 		logits:                  make([]float32, stories.Vocab*seq),
+		logitsPreSoftcap:        make([]float32, stories.Vocab*seq),
 		dy:                      make([]float32, stories.Dim*seq),
 		dx:                      make([]float32, stories.Dim*seq),
-		gRMS:                    make([]float32, stories.Dim),
 		gEmbed:                  make([]float32, len(mw.Embed)),
-		accumGRMS:               accumGRMS,
-		accumGEmbed:             accumGEmbed,
+		gResidLambdas:           make([]float32, stories.NLayers),
+		gX0Lambdas:              make([]float32, stories.NLayers),
+		gX0:                     make([]float32, stories.Dim*seq),
 		gradGate:                make([]float32, stories.Hidden*seq),
 		gradH1:                  make([]float32, stories.Hidden*seq),
 		gradH3:                  make([]float32, stories.Hidden*seq),
@@ -254,8 +276,19 @@ func Open(opts Options) (*Engine, error) {
 		gradK:                   make([]float32, stories.Dim*seq),
 		gradV:                   make([]float32, stories.Dim*seq),
 		gradPrev:                make([]float32, stories.Dim*seq),
-		ropeCos:                 ropeCos,
-		ropeSin:                 ropeSin,
+		ropeCos:          ropeCos,
+		ropeSin:          ropeSin,
+		smearGatePre:     make([]float32, stories.Dim*seq),
+		smearShifted:     make([]float32, stories.Dim*seq),
+		smearGateAct:     make([]float32, stories.Dim*seq),
+		smearXPre:        make([]float32, stories.Dim*seq),
+		xMid:             make([]float32, stories.Dim*seq),
+		gSmearGate:       make([]float32, stories.Dim*stories.Dim),
+		gSmearLambda:     make([]float32, 1),
+		gBackoutLambda:   make([]float32, 1),
+		accumGSmearGate:  accumGSmearGate,
+		accumGSmearLam:   accumGSmearLam,
+		accumGBackoutLam: accumGBackoutLam,
 	}, nil
 }
 
@@ -453,8 +486,9 @@ func (e *Engine) LoadCheckpoint(path string) (stories.TrainMeta, error) {
 	if e.accum != nil {
 		clearModelGrad(e.accum)
 	}
-	clear(e.accumGRMS)
-	clear(e.accumGEmbed)
+	clear(e.accumGSmearGate)
+	clear(e.accumGSmearLam)
+	clear(e.accumGBackoutLam)
 	if err := e.loadTrailer(path); err != nil {
 		return stories.TrainMeta{}, err
 	}
@@ -494,14 +528,17 @@ func (e *Engine) Close() {
 	e.accum = nil
 	e.applyGrads = nil
 	e.x = nil
+	e.x0 = nil
+	e.xPreEmbedNorm = nil
 	e.xNorm = nil
 	e.logits = nil
+	e.logitsPreSoftcap = nil
 	e.dy = nil
 	e.dx = nil
-	e.gRMS = nil
 	e.gEmbed = nil
-	e.accumGRMS = nil
-	e.accumGEmbed = nil
+	e.gResidLambdas = nil
+	e.gX0Lambdas = nil
+	e.gX0 = nil
 	e.gradGate = nil
 	e.gradH1 = nil
 	e.gradH3 = nil
@@ -514,6 +551,17 @@ func (e *Engine) Close() {
 	e.gradPrev = nil
 	e.ropeCos = nil
 	e.ropeSin = nil
+	e.smearGatePre = nil
+	e.smearShifted = nil
+	e.smearGateAct = nil
+	e.smearXPre = nil
+	e.xMid = nil
+	e.gSmearGate = nil
+	e.gSmearLambda = nil
+	e.gBackoutLambda = nil
+	e.accumGSmearGate = nil
+	e.accumGSmearLam = nil
+	e.accumGBackoutLam = nil
 	if e.gradTasks != nil {
 		e.gradTasks.Close()
 		e.gradTasks = nil
@@ -529,14 +577,18 @@ func (e *Engine) flushPending() time.Duration {
 		scale /= e.lossScale
 	}
 	scaleModelGrad(e.accum, scale)
-	e.clipLayerGradients(e.accum.Layers, e.accum.RMSFinal, e.accum.Embed)
+	e.clipLayerGradients(e.accum.Layers, e.accum.Embed)
 	e.state.AdamT++
 	adamStart := time.Now()
 	t := int(e.state.AdamT)
 	invBC1, invBC2 := adamBiasCorrectionInv(t, e.adamBeta1, e.adamBeta2)
 	e.applyLayerAdamAll(e.accum.Layers, t, invBC1, invBC2)
-	adamUpdateCFWithInv(e.mw.RMSFinal, e.accum.RMSFinal, &e.opt.RMSFinal, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
 	adamUpdateCFWithInv(e.mw.Embed, e.accum.Embed, &e.opt.Embed, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, e.weightDecay, invBC1, invBC2, true)
+	adamUpdateCFWithInv(e.mw.ResidLambdas, e.accum.ResidLambdas, &e.opt.ResidLambdas, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	adamUpdateCFWithInv(e.mw.X0Lambdas, e.accum.X0Lambdas, &e.opt.X0Lambdas, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	adamUpdateCFWithInv(e.mw.SmearGate, e.accum.SmearGate, &e.opt.SmearGate, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	adamUpdateCFWithInv(e.mw.SmearLambda, e.accum.SmearLambda, &e.opt.SmearLambda, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	adamUpdateCFWithInv(e.mw.BackoutLambda, e.accum.BackoutLambda, &e.opt.BackoutLambda, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
 	e.stepMetrics.addAdam(time.Since(adamStart))
 	// Start kernel refresh asynchronously so the next step's data loading
 	// and embedding lookup overlap with compilation.
@@ -575,17 +627,8 @@ func (e *Engine) appendTrailer(path string) error {
 	if err := binary.Write(f, binary.LittleEndian, e.state.PendingSteps); err != nil {
 		return fmt.Errorf("storiesane append trailer: write pending steps: %w", err)
 	}
-	if version == trailerVersionV2 {
-		if err := writeModelGrad(f, e.accum); err != nil {
-			return fmt.Errorf("storiesane append trailer: write accum grads: %w", err)
-		}
-		return nil
-	}
-	if err := writeF32Slice(f, e.accumGRMS); err != nil {
-		return fmt.Errorf("storiesane append trailer: write accum rms: %w", err)
-	}
-	if err := writeF32Slice(f, e.accumGEmbed); err != nil {
-		return fmt.Errorf("storiesane append trailer: write accum embed: %w", err)
+	if err := writeModelGrad(f, e.accum); err != nil {
+		return fmt.Errorf("storiesane append trailer: write accum grads: %w", err)
 	}
 	return nil
 }
@@ -621,11 +664,12 @@ func (e *Engine) loadTrailer(path string) error {
 	}
 	switch ver {
 	case trailerVersionV1:
-		if err := readF32Slice(f, e.accumGRMS); err != nil {
-			return fmt.Errorf("storiesane load trailer: read accum rms: %w", err)
-		}
-		if err := readF32Slice(f, e.accumGEmbed); err != nil {
-			return fmt.Errorf("storiesane load trailer: read accum embed: %w", err)
+		// V1 trailers stored accumGRMS and accumGEmbed which no longer exist.
+		// Skip them.
+		rmsBytes := int64(stories.Dim) * 4
+		embedBytes := int64(stories.Vocab*stories.Dim) * 4
+		if _, err := f.Seek(rmsBytes+embedBytes, io.SeekCurrent); err != nil {
+			return fmt.Errorf("storiesane load trailer: skip v1 accum fields: %w", err)
 		}
 	case trailerVersionV2:
 		if e.accum == nil {
@@ -642,11 +686,26 @@ func (e *Engine) loadTrailer(path string) error {
 
 func storiesCheckpointSize() int {
 	const headerBytes = 96
-	layerWeights := stories.NLayers * (stories.WQSize*3 + stories.WOSize + stories.W1Size + stories.W2Size + stories.W3Size + stories.Dim*2)
-	layerOpt := stories.NLayers * (stories.WQSize*6 + stories.WOSize*2 + stories.W1Size*2 + stories.W2Size*2 + stories.W3Size*2 + stories.Dim*4)
-	final := stories.Dim * 3
+	// V4 format: per-layer weights (no RMS), VE, per-layer optim, model-level.
+	layerWeights := stories.NLayers * (stories.WQSize*3 + stories.WOSize + stories.W1Size + stories.W2Size + stories.W3Size)
+	layerOpt := stories.NLayers * (stories.WQSize*6 + stories.WOSize*2 + stories.W1Size*2 + stories.W2Size*2 + stories.W3Size*2)
+	veEmbedN := stories.VEEmbedSize(stories.Vocab)
+	veGateN := stories.VEGateSize()
+	for i := 0; i < stories.NLayers; i++ {
+		if stories.IsVELayer(i) {
+			layerWeights += veEmbedN + veGateN
+			layerOpt += 2*veEmbedN + 2*veGateN
+		}
+	}
+	// Model-level: Embed(w+m+v) + ResidLambdas(w+m+v) + X0Lambdas(w+m+v)
+	// + SmearGate(w+m+v) + SmearLambda(w+m+v) + BackoutLambda(w+m+v)
 	embed := stories.Vocab * stories.Dim * 3
-	return headerBytes + 4*(layerWeights+layerOpt+final+embed)
+	residLambdas := stories.NLayers * 3
+	x0Lambdas := stories.NLayers * 3
+	smearGate := stories.Dim * stories.Dim * 3
+	smearLambda := 1 * 3
+	backoutLambda := 1 * 3
+	return headerBytes + 4*(layerWeights+layerOpt+embed+residLambdas+x0Lambdas+smearGate+smearLambda+backoutLambda)
 }
 
 func writeF32Slice(w io.Writer, vals []float32) error {
@@ -673,17 +732,29 @@ func writeModelGrad(w io.Writer, g *modelGrad) error {
 		for _, vals := range [][]float32{
 			layer.Wq, layer.Wk, layer.Wv, layer.Wo,
 			layer.W1, layer.W2, layer.W3,
-			layer.RMSAtt, layer.RMSFFN,
+			layer.VEEmbed, layer.VEGate,
 		} {
 			if err := writeF32Slice(w, vals); err != nil {
 				return err
 			}
 		}
 	}
-	if err := writeF32Slice(w, g.RMSFinal); err != nil {
+	if err := writeF32Slice(w, g.Embed); err != nil {
 		return err
 	}
-	return writeF32Slice(w, g.Embed)
+	if err := writeF32Slice(w, g.ResidLambdas); err != nil {
+		return err
+	}
+	if err := writeF32Slice(w, g.X0Lambdas); err != nil {
+		return err
+	}
+	if err := writeF32Slice(w, g.SmearGate); err != nil {
+		return err
+	}
+	if err := writeF32Slice(w, g.SmearLambda); err != nil {
+		return err
+	}
+	return writeF32Slice(w, g.BackoutLambda)
 }
 
 func readModelGrad(r io.Reader, g *modelGrad) error {
@@ -692,17 +763,29 @@ func readModelGrad(r io.Reader, g *modelGrad) error {
 		for _, vals := range [][]float32{
 			layer.Wq, layer.Wk, layer.Wv, layer.Wo,
 			layer.W1, layer.W2, layer.W3,
-			layer.RMSAtt, layer.RMSFFN,
+			layer.VEEmbed, layer.VEGate,
 		} {
 			if err := readF32Slice(r, vals); err != nil {
 				return err
 			}
 		}
 	}
-	if err := readF32Slice(r, g.RMSFinal); err != nil {
+	if err := readF32Slice(r, g.Embed); err != nil {
 		return err
 	}
-	return readF32Slice(r, g.Embed)
+	if err := readF32Slice(r, g.ResidLambdas); err != nil {
+		return err
+	}
+	if err := readF32Slice(r, g.X0Lambdas); err != nil {
+		return err
+	}
+	if err := readF32Slice(r, g.SmearGate); err != nil {
+		return err
+	}
+	if err := readF32Slice(r, g.SmearLambda); err != nil {
+		return err
+	}
+	return readF32Slice(r, g.BackoutLambda)
 }
 
 func drand48Seed(seed int64) uint64 {
@@ -761,26 +844,28 @@ func (e *Engine) ensureLayers() error {
 func (e *Engine) evalLogitsANEInto(tokens []uint16, logits []float32) error {
 	e.ensureOffload()
 	stories.EmbedLookup(e.x, e.mw.Embed, tokens, stories.Dim, e.seq)
+	rmsNormNoWeightCF(e.x, e.x, stories.Dim, e.seq)
+	smearForwardCF(e.x, e.mw.SmearGate, e.mw.SmearLambda[0], stories.Dim, e.seq)
 	cur := e.x
 	next := e.tmpHidden
+	midLayer := stories.NLayers / 2
 	for i := range e.layers {
 		if err := e.layers[i].run(next, cur); err != nil {
 			return fmt.Errorf("storiesane eval logits: layer %d: %w", i, err)
 		}
 		cur, next = next, cur
+		if i == midLayer-1 {
+			copy(e.xMid, cur)
+		}
 	}
-	if e.off == nil || !e.off.hasRMSForward() {
-		stories.RMSNorm(e.xNorm, cur, e.mw.RMSFinal, stories.Dim, e.seq)
-	} else if err := e.off.runRMSForward(e.xNorm, cur); err != nil {
-		return fmt.Errorf("storiesane eval logits: final rmsnorm: %w", err)
-	}
+	backoutForwardCF(cur, e.xMid, e.mw.BackoutLambda[0], stories.Dim, e.seq)
+	stories.RMSNormNoWeight(e.xNorm, cur, stories.Dim, e.seq)
 	if e.off == nil || !e.off.hasClassifierForward() {
 		stories.MatMulVocabSeq(logits, e.mw.Embed, e.xNorm, stories.Vocab, stories.Dim, e.seq)
-		return nil
-	}
-	if err := e.off.runClassifierForward(logits, e.xNorm); err != nil {
+	} else if err := e.off.runClassifierForward(logits, e.xNorm); err != nil {
 		return fmt.Errorf("storiesane eval logits: classifier: %w", err)
 	}
+	logitSoftcap(logits)
 	return nil
 }
 
@@ -797,31 +882,63 @@ func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 	h3 := make([]float32, stories.Hidden*e.seq)
 	gate := make([]float32, stories.Hidden*e.seq)
 	ffOut := make([]float32, stories.Dim*e.seq)
+	veScr := make([]float32, stories.Dim*e.seq)
+	veGateAct := make([]float32, e.seq)
 
 	stories.EmbedLookup(x, e.mw.Embed, tokens, stories.Dim, e.seq)
+	rmsNormNoWeightCF(x, x, stories.Dim, e.seq)
+	x0 := make([]float32, stories.Dim*e.seq)
+	copy(x0, x)
+	smearForwardCF(x, e.mw.SmearGate, e.mw.SmearLambda[0], stories.Dim, e.seq)
 	cur := x
+	midLayer := stories.NLayers / 2
 	for i := range e.mw.Layers {
 		layer := e.mw.Layers[i]
-		rmsNormCF(xNorm, cur, layer.RMSAtt, stories.Dim, e.seq)
+		rmsNormNoWeightCF(xNorm, cur, stories.Dim, e.seq)
 		linearCF(qf, layer.Wq, xNorm, stories.Dim, stories.Dim, e.seq)
 		linearCF(kf, layer.Wk, xNorm, stories.Dim, stories.Dim, e.seq)
 		applyRoPECFInPlace(qf, stories.Heads, stories.Dim/stories.Heads, e.seq, e.ropeCos, e.ropeSin)
 		applyRoPECFInPlace(kf, stories.Heads, stories.Dim/stories.Heads, e.seq, e.ropeCos, e.ropeSin)
+		qkNormCF(qf, kf, stories.Dim, stories.Heads, e.seq)
 		linearCF(vf, layer.Wv, xNorm, stories.Dim, stories.Dim, e.seq)
+		if stories.IsVELayer(i) {
+			veForwardCF(vf, veScr, veGateAct, layer.VEEmbed, layer.VEGate, cur, tokens, stories.Dim, e.seq)
+		}
 		causalAttentionCF(attOut, qf, kf, vf, stories.Heads, stories.Dim/stories.Heads, e.seq)
 		linearCF(x2, layer.Wo, attOut, stories.Dim, stories.Dim, e.seq)
-		addScaledResidual(x2, cur, x2)
-		rmsNormCF(xNorm, x2, layer.RMSFFN, stories.Dim, e.seq)
+		rl := e.mw.ResidLambdas[i]
+		xl := e.mw.X0Lambdas[i]
+		for j := 0; j < stories.Dim*e.seq; j++ {
+			x2[j] = rl*cur[j] + x2[j]
+		}
+		if xl != 0 {
+			for j := 0; j < stories.Dim*e.seq; j++ {
+				x2[j] += xl * x0[j]
+			}
+		}
+		rmsNormNoWeightCF(xNorm, x2, stories.Dim, e.seq)
 		linearCF(h1, layer.W1, xNorm, stories.Hidden, stories.Dim, e.seq)
 		linearCF(h3, layer.W3, xNorm, stories.Hidden, stories.Dim, e.seq)
 		for j := range gate {
-			gate[j] = silu32(h1[j]) * h3[j]
+			gate[j] = reluSquared32(h1[j]) * h3[j]
 		}
 		linearCF(ffOut, layer.W2, gate, stories.Dim, stories.Hidden, e.seq)
-		addScaledResidual(next, x2, ffOut)
+		for j := 0; j < stories.Dim*e.seq; j++ {
+			next[j] = rl*x2[j] + ffOut[j]
+		}
+		if xl != 0 {
+			for j := 0; j < stories.Dim*e.seq; j++ {
+				next[j] += xl * x0[j]
+			}
+		}
 		cur, next = next, cur
+		if i == midLayer-1 {
+			copy(e.xMid, cur)
+		}
 	}
-	stories.RMSNorm(e.xNorm, cur, e.mw.RMSFinal, stories.Dim, e.seq)
+	backoutForwardCF(cur, e.xMid, e.mw.BackoutLambda[0], stories.Dim, e.seq)
+	stories.RMSNormNoWeight(e.xNorm, cur, stories.Dim, e.seq)
 	stories.MatMulVocabSeq(logits, e.mw.Embed, e.xNorm, stories.Vocab, stories.Dim, e.seq)
+	logitSoftcap(logits)
 	return nil
 }
