@@ -158,6 +158,10 @@ type Engine struct {
 	cacheFFOut    []float32
 	cacheNext     []float32
 	cacheLogits   []float32
+	cacheQKV      []float32 // fused Q+K+V output [qDim + 2*kvDim]
+	cacheH1H3     []float32 // fused W1+W3 output [2*hidden]
+	fusedQKVW     [][]float32 // per-layer fused [qDim+2*kvDim, dim] weight matrices
+	fusedW1W3     [][]float32 // per-layer fused [2*hidden, dim] weight matrices
 }
 
 const (
@@ -621,6 +625,10 @@ func (e *Engine) Close() {
 	e.cacheFFOut = nil
 	e.cacheNext = nil
 	e.cacheLogits = nil
+	e.cacheQKV = nil
+	e.cacheH1H3 = nil
+	e.fusedQKVW = nil
+	e.fusedW1W3 = nil
 }
 
 func (e *Engine) flushPending() time.Duration {

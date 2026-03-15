@@ -58,6 +58,10 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 		e.cacheFFOut = make([]float32, dim)
 		e.cacheNext = make([]float32, dim)
 		e.cacheLogits = make([]float32, vocab)
+		// Fused QKV buffer: [qDim + 2*kvDim] for one BLAS call instead of 3.
+		e.cacheQKV = make([]float32, qDim+2*kvDim)
+		// Fused W1W3 buffer: [2*hidden] for one BLAS call instead of 2.
+		e.cacheH1H3 = make([]float32, 2*hidden)
 	}
 
 	if e.kvc.pos >= e.kvc.maxSeq {
@@ -84,11 +88,27 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 
 		// Attention sub-block: RMSNorm → Q,K,V → RoPE → cache → attention → Wo → residual
 		rmsNormSingle(e.cacheXNorm, cur, layer.RMSAtt, dim)
-		linearSingle(e.cacheQ, layer.Wq, e.cacheXNorm, qDim, dim)
-		linearSingle(e.cacheK, layer.Wk, e.cacheXNorm, kvDim, dim)
+
+		// Fused QKV: one BLAS call instead of 3.
+		if e.fusedQKVW == nil {
+			e.fusedQKVW = make([][]float32, cfg.NLayers)
+			e.fusedW1W3 = make([][]float32, cfg.NLayers)
+		}
+		if e.fusedQKVW[li] == nil {
+			// Build fused weight matrix: stack Wq, Wk, Wv vertically → [(qDim+2*kvDim), dim]
+			fused := make([]float32, (qDim+2*kvDim)*dim)
+			copy(fused[0:], layer.Wq)
+			copy(fused[qDim*dim:], layer.Wk)
+			copy(fused[(qDim+kvDim)*dim:], layer.Wv)
+			e.fusedQKVW[li] = fused
+		}
+		linearSingle(e.cacheQKV, e.fusedQKVW[li], e.cacheXNorm, qDim+2*kvDim, dim)
+		copy(e.cacheQ, e.cacheQKV[:qDim])
+		copy(e.cacheK, e.cacheQKV[qDim:qDim+kvDim])
+		copy(e.cacheV, e.cacheQKV[qDim+kvDim:])
+
 		applyRoPESinglePos(e.cacheQ, heads, headDim, pos, e.cachedRopeCos, e.cachedRopeSin)
 		applyRoPESinglePos(e.cacheK, kvHeads, headDim, pos, e.cachedRopeCos, e.cachedRopeSin)
-		linearSingle(e.cacheV, layer.Wv, e.cacheXNorm, kvDim, dim)
 
 		// Append K, V to cache.
 		e.kvc.appendKV(li, e.cacheK, e.cacheV)
@@ -105,10 +125,17 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 		// Residual connection: x2 = cur + scale * x2
 		addScaledResidualSingle(e.cacheX2, cur, e.cacheX2, dim)
 
-		// FFN sub-block: RMSNorm → W1,W3 → SiLU → W2 → residual
+		// FFN sub-block: RMSNorm → W1+W3 fused → SiLU → W2 → residual
 		rmsNormSingle(e.cacheXNorm, e.cacheX2, layer.RMSFFN, dim)
-		linearSingle(e.cacheH1, layer.W1, e.cacheXNorm, hidden, dim)
-		linearSingle(e.cacheH3, layer.W3, e.cacheXNorm, hidden, dim)
+		if e.fusedW1W3[li] == nil {
+			fused := make([]float32, 2*hidden*dim)
+			copy(fused[0:], layer.W1)
+			copy(fused[hidden*dim:], layer.W3)
+			e.fusedW1W3[li] = fused
+		}
+		linearSingle(e.cacheH1H3, e.fusedW1W3[li], e.cacheXNorm, 2*hidden, dim)
+		copy(e.cacheH1, e.cacheH1H3[:hidden])
+		copy(e.cacheH3, e.cacheH1H3[hidden:])
 		siluMulAccel(e.cacheGate, e.cacheH1, e.cacheH3)
 		linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
 		addScaledResidualSingle(next, e.cacheX2, e.cacheFFOut, dim)
@@ -119,15 +146,9 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 	// Final RMSNorm + classifier.
 	rmsNormSingle(e.cacheXNorm, cur, e.mw.RMSFinal, dim)
 
-	// Classifier: logits[v] = embed[v, :] . xNorm[:]
-	for v := 0; v < vocab; v++ {
-		sum := float32(0)
-		base := v * dim
-		for d := 0; d < dim; d++ {
-			sum += e.mw.Embed[base+d] * e.cacheXNorm[d]
-		}
-		e.cacheLogits[v] = sum
-	}
+	// Classifier: logits = Embed @ xNorm where Embed is [vocab, dim] row-major.
+	// Use BLAS matmul via linearCF with seq=1.
+	linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
 
 	e.kvc.advancePos()
 
