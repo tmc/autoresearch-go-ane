@@ -302,6 +302,10 @@ func sigmoid32(x float32) float32 {
 	return 1.0 / (1 + float32(math.Exp(float64(-x))))
 }
 
+func silu32(x float32) float32 {
+	return x / (1 + float32(math.Exp(float64(-x))))
+}
+
 // smearForwardCF applies bigram mixing in-place (eval path, no save).
 // x is channel-first [dim, seq]. smearGate is [dim*dim] row-major.
 //   gatePre[d,t] = (smearGate @ x)[d,t]

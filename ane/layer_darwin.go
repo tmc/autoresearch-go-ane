@@ -11,12 +11,15 @@ import (
 )
 
 type layerForwardWeights struct {
-	Wq []float32
-	Wk []float32
-	Wv []float32
-	Wo []float32
-	W1 []float32
-	W2 []float32
+	RMSAtt []float32
+	Wq     []float32
+	Wk     []float32
+	Wv     []float32
+	Wo     []float32
+	RMSFFN []float32
+	W1     []float32
+	W2     []float32
+	W3     []float32
 }
 
 type layerForward struct {
@@ -29,15 +32,24 @@ type layerForward struct {
 	att *model.Kernel
 	ffn *model.Kernel
 
-	// Inference-only kernels (smaller output surfaces, no taps).
-	attInf *model.Kernel
-	ffnInf *model.Kernel
+	// Inference-only kernels with residual scale baked in (no taps output).
+	inferAtt *model.Kernel
+	inferFFN *model.Kernel
 
 	metrics  *aneStepMetrics
 	dynamic  bool
 	attSplit bool
 	attTaps  bool
 	ffnTaps  bool
+
+	rmsAtt      []float32
+	rmsFFN      []float32
+	inferScaled   bool // Wo and W2 pre-scaled by layerResidualScale
+	attInputReady bool // Attention input already staged by previous layer
+
+	// Tiled forward path: each matmul is a separate dynamicmatmul.Executor.
+	tiled        *tiledExecutors
+	tiledScratch *tiledScratchBuffers
 
 	qkvOut []float32
 	attOut []float32
@@ -52,12 +64,15 @@ func compileStoriesLayerForward(layer stories.LayerWeights, seq int) (*layerForw
 		return lf, nil
 	}
 	return compileLayerForward(stories.Dim, stories.Hidden, stories.Heads, seq, layerForwardWeights{
-		Wq: layer.Wq,
-		Wk: layer.Wk,
-		Wv: layer.Wv,
-		Wo: layer.Wo,
-		W1: layer.W1,
-		W2: layer.W2,
+		RMSAtt: layer.RMSAtt,
+		Wq:     layer.Wq,
+		Wk:     layer.Wk,
+		Wv:     layer.Wv,
+		Wo:     layer.Wo,
+		RMSFFN: layer.RMSFFN,
+		W1:     layer.W1,
+		W2:     layer.W2,
+		W3:     layer.W3,
 	})
 }
 
@@ -71,8 +86,7 @@ func compileLayerForward(dim, hidden, heads, seq int, w layerForwardWeights) (_ 
 	if err := validateLayerWeights(dim, hidden, w); err != nil {
 		return nil, err
 	}
-	rmsOnes := onesSlice(dim)
-	rmsAttBlob, err := mil.BuildVectorWeightBlob(rmsOnes)
+	rmsAttBlob, err := mil.BuildVectorWeightBlob(w.RMSAtt)
 	if err != nil {
 		return nil, fmt.Errorf("compile layer forward: rms_att blob: %w", err)
 	}
@@ -96,7 +110,7 @@ func compileLayerForward(dim, hidden, heads, seq int, w layerForwardWeights) (_ 
 	if err != nil {
 		return nil, fmt.Errorf("compile layer forward: mask blob: %w", err)
 	}
-	rmsFFNBlob, err := mil.BuildVectorWeightBlob(rmsOnes)
+	rmsFFNBlob, err := mil.BuildVectorWeightBlob(w.RMSFFN)
 	if err != nil {
 		return nil, fmt.Errorf("compile layer forward: rms_ffn blob: %w", err)
 	}
@@ -108,6 +122,11 @@ func compileLayerForward(dim, hidden, heads, seq int, w layerForwardWeights) (_ 
 	if err != nil {
 		return nil, fmt.Errorf("compile layer forward: w2 blob: %w", err)
 	}
+	w3Blob, err := mil.BuildWeightBlob(w.W3, hidden, dim)
+	if err != nil {
+		return nil, fmt.Errorf("compile layer forward: w3 blob: %w", err)
+	}
+
 	preferCompact := seq > stories.SeqDefault
 	attWeights := []model.WeightFile{
 		{Path: "@model_path/weights/rms1.bin", Blob: rmsAttBlob},
@@ -148,6 +167,7 @@ func compileLayerForward(dim, hidden, heads, seq int, w layerForwardWeights) (_ 
 		{Path: "@model_path/weights/rms2.bin", Blob: rmsFFNBlob},
 		{Path: "@model_path/weights/w1.bin", Blob: w1Blob},
 		{Path: "@model_path/weights/w2.bin", Blob: w2Blob},
+		{Path: "@model_path/weights/w3.bin", Blob: w3Blob},
 	}
 	ffn, ffnTaps, ffnOutCh, err := compileLayerForwardFFN(dim, hidden, seq, ffnWeights, preferCompact)
 	if err != nil {
@@ -165,7 +185,9 @@ func compileLayerForward(dim, hidden, heads, seq int, w layerForwardWeights) (_ 
 		attSplit: attSplit,
 		attTaps:  attTaps,
 		ffnTaps:  ffnTaps,
-		qkvOut: make([]float32, qkvOutCh*seq),
+		rmsAtt:   w.RMSAtt,
+		rmsFFN:   w.RMSFFN,
+		qkvOut:   make([]float32, qkvOutCh*seq),
 		attOut:   make([]float32, attOutCh*seq),
 		ffnOut:   make([]float32, ffnOutCh*seq),
 		x2:       make([]float32, dim*seq),
@@ -179,13 +201,16 @@ func (lf *layerForward) close() {
 	closeKernel(lf.qkv)
 	closeKernel(lf.att)
 	closeKernel(lf.ffn)
-	closeKernel(lf.attInf)
-	closeKernel(lf.ffnInf)
+	closeKernel(lf.inferAtt)
+	closeKernel(lf.inferFFN)
+	lf.closeTiled()
 	lf.qkv = nil
 	lf.att = nil
 	lf.ffn = nil
-	lf.attInf = nil
-	lf.ffnInf = nil
+	lf.inferAtt = nil
+	lf.inferFFN = nil
+	lf.rmsAtt = nil
+	lf.rmsFFN = nil
 	lf.qkvOut = nil
 	lf.attOut = nil
 	lf.ffnOut = nil
@@ -193,7 +218,111 @@ func (lf *layerForward) close() {
 }
 
 func (lf *layerForward) run(out, x []float32) error {
+	if lf != nil && lf.tiled != nil {
+		return lf.runTiled(out, x)
+	}
+	if lf != nil && lf.dynamic {
+		return lf.runDynamicInferenceOnly(out, x)
+	}
 	return lf.runWithTaps(out, x, nil)
+}
+
+// PreScaleForInference pre-scales Wo and W2 weights by layerResidualScale
+// and re-stages them to the ANE kernels. After this, the ANE kernel's
+// built-in residual add produces correctly scaled output without CPU blending.
+func (lf *layerForward) PreScaleForInference(w layerForwardWeights) error {
+	if lf == nil || !lf.dynamic {
+		return nil // only supported for dynamic layers
+	}
+	s := layerResidualScale
+	// Pre-scale Wo (attention output projection)
+	scaledWo := make([]float32, len(w.Wo))
+	for i, v := range w.Wo {
+		scaledWo[i] = v * s
+	}
+	// Pre-scale W2 (FFN down projection)
+	scaledW2 := make([]float32, len(w.W2))
+	for i, v := range w.W2 {
+		scaledW2[i] = v * s
+	}
+	scaledW := layerForwardWeights{
+		RMSAtt: w.RMSAtt,
+		Wq:     w.Wq,
+		Wk:     w.Wk,
+		Wv:     w.Wv,
+		Wo:     scaledWo,
+		RMSFFN: w.RMSFFN,
+		W1:     w.W1,
+		W2:     scaledW2,
+		W3:     w.W3,
+	}
+	if err := lf.stageDynamicWeights(scaledW); err != nil {
+		return err
+	}
+	lf.inferScaled = true
+	return nil
+}
+
+// runInferenceOnly reads only dim*seq output channels, skipping taps.
+func (lf *layerForward) runInferenceOnly(out, x []float32) error {
+	if lf == nil || lf.att == nil || lf.ffn == nil {
+		return fmt.Errorf("run layer forward: layer is closed")
+	}
+	want := lf.dim * lf.seq
+	if len(x) != want || len(out) != want {
+		return fmt.Errorf("run layer forward: len mismatch in=%d out=%d want=%d", len(x), len(out), want)
+	}
+
+	if lf.attSplit {
+		if err := lf.qkv.WriteInputFP16(0, x); err != nil {
+			return fmt.Errorf("run layer forward: write qkv input: %w", err)
+		}
+		if err := evalKernelTracked(lf.metrics, lf.qkv); err != nil {
+			return fmt.Errorf("run layer forward: eval qkv: %w", err)
+		}
+		if err := lf.att.WriteInputFP16(0, x); err != nil {
+			return fmt.Errorf("run layer forward: write attention residual: %w", err)
+		}
+		if err := model.CopyOutputChannelsToInput(lf.att, 1, 0, lf.qkv, 0, 0, 3*lf.dim); err != nil {
+			if err := lf.qkv.ReadOutputFP16(0, lf.qkvOut); err != nil {
+				return fmt.Errorf("run layer forward: read qkv fallback: %w", err)
+			}
+			if err := lf.att.WriteInputFP16(1, lf.qkvOut); err != nil {
+				return fmt.Errorf("run layer forward: write qkv input: %w", err)
+			}
+		}
+		if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+			return fmt.Errorf("run layer forward: eval attention: %w", err)
+		}
+		if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward: read attention output: %w", err)
+		}
+	} else {
+		if err := lf.att.WriteInputFP16(0, x); err != nil {
+			return fmt.Errorf("run layer forward: write attention input: %w", err)
+		}
+		if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+			return fmt.Errorf("run layer forward: eval attention: %w", err)
+		}
+		if err := readOutputFP16ChannelsFast(lf.att, 0, 0, lf.seq, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward: read attention output: %w", err)
+		}
+	}
+	blendResidualInPlace(lf.x2, x)
+
+	if err := model.CopyOutputChannelsToInput(lf.ffn, 0, 0, lf.att, 0, 0, lf.dim); err != nil {
+		if err := lf.ffn.WriteInputFP16(0, lf.x2); err != nil {
+			return fmt.Errorf("run layer forward: write ffn input: %w", err)
+		}
+	}
+	if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
+		return fmt.Errorf("run layer forward: eval ffn: %w", err)
+	}
+	if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, lf.seq, out); err != nil {
+		return fmt.Errorf("run layer forward: read ffn output: %w", err)
+	}
+	addScaledResidual(out, lf.x2, out)
+	return nil
 }
 
 func (lf *layerForward) runWithTaps(out, x []float32, cache *layerCache) error {
@@ -259,7 +388,7 @@ func (lf *layerForward) runWithTaps(out, x []float32, cache *layerCache) error {
 			copy(lf.x2, lf.attOut)
 		}
 	}
-	// Residual is already applied inside the ANE kernel (x2 = x + Wo@attn).
+	blendResidualInPlace(lf.x2, x)
 
 	if err := model.CopyOutputChannelsToInput(lf.ffn, 0, 0, lf.att, 0, 0, lf.dim); err != nil {
 		if err := lf.ffn.WriteInputFP16(0, lf.x2); err != nil {
@@ -276,23 +405,20 @@ func (lf *layerForward) runWithTaps(out, x []float32, cache *layerCache) error {
 	if lf.ffnTaps {
 		ffnMain = lf.ffnOut[:want]
 	}
-	// FFN residual: out = x2 + ffnOutput.
-	for i := range out[:len(ffnMain)] {
-		out[i] = lf.x2[i] + ffnMain[i]
-	}
+	addScaledResidual(out, lf.x2, ffnMain)
 	if cache != nil {
 		copy(cache.x2, lf.x2)
 		cache.attTapsReady = false
 		cache.ffnTapsReady = false
 		if lf.attSplit {
-			rmsNormNoWeightCF(cache.xNorm, x, lf.dim, lf.seq)
+			rmsNormCF(cache.xNorm, x, lf.rmsAtt, lf.dim, lf.seq)
 			copy(cache.q, lf.qkvOut[:want])
 			copy(cache.k, lf.qkvOut[want:2*want])
 			copy(cache.v, lf.qkvOut[2*want:3*want])
 			copy(cache.attOut, lf.attOut[want:2*want])
 			cache.attTapsReady = true
 		} else if lf.attTaps {
-			rmsNormNoWeightCF(cache.xNorm, x, lf.dim, lf.seq)
+			rmsNormCF(cache.xNorm, x, lf.rmsAtt, lf.dim, lf.seq)
 			copy(cache.q, lf.attOut[want:2*want])
 			copy(cache.k, lf.attOut[2*want:3*want])
 			copy(cache.v, lf.attOut[3*want:4*want])
@@ -302,10 +428,11 @@ func (lf *layerForward) runWithTaps(out, x []float32, cache *layerCache) error {
 		if lf.ffnTaps {
 			hiddenSpan := lf.hidden * lf.seq
 			copy(cache.h1, lf.ffnOut[want:want+hiddenSpan])
+			copy(cache.h3, lf.ffnOut[want+hiddenSpan:want+2*hiddenSpan])
 			for i := range cache.gate {
-				cache.gate[i] = reluSquared32(cache.h1[i])
+				cache.gate[i] = silu32(cache.h1[i]) * cache.h3[i]
 			}
-			rmsNormNoWeightCF(cache.x2Norm, cache.x2, lf.dim, lf.seq)
+			rmsNormCF(cache.x2Norm, cache.x2, lf.rmsFFN, lf.dim, lf.seq)
 			cache.ffnTapsReady = true
 		}
 	}
@@ -390,6 +517,9 @@ func validateLayerWeights(dim, hidden int, w layerForwardWeights) error {
 		}
 		return nil
 	}
+	if err := check("rms_att", len(w.RMSAtt), dim); err != nil {
+		return err
+	}
 	if err := check("wq", len(w.Wq), dim*dim); err != nil {
 		return err
 	}
@@ -402,10 +532,16 @@ func validateLayerWeights(dim, hidden int, w layerForwardWeights) error {
 	if err := check("wo", len(w.Wo), dim*dim); err != nil {
 		return err
 	}
+	if err := check("rms_ffn", len(w.RMSFFN), dim); err != nil {
+		return err
+	}
 	if err := check("w1", len(w.W1), hidden*dim); err != nil {
 		return err
 	}
 	if err := check("w2", len(w.W2), dim*hidden); err != nil {
+		return err
+	}
+	if err := check("w3", len(w.W3), hidden*dim); err != nil {
 		return err
 	}
 	return nil

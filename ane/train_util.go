@@ -8,7 +8,7 @@ import (
 
 // --- cross-entropy loss ---
 
-func crossEntropyLossFromProbs(dLogits, probs []float32, targets []uint16, vocab, seq int) float32 {
+func crossEntropyLossFromProbs(dLogits, probs []float32, targets []int32, vocab, seq int) float32 {
 	loss, valid := crossEntropyLossFromProbsUnscaled(dLogits, probs, targets, vocab, seq)
 	if valid == 0 {
 		return 0
@@ -20,7 +20,7 @@ func crossEntropyLossFromProbs(dLogits, probs []float32, targets []uint16, vocab
 	return loss
 }
 
-func crossEntropyLossFromProbsUnscaled(dLogits, probs []float32, targets []uint16, vocab, seq int) (float32, int) {
+func crossEntropyLossFromProbsUnscaled(dLogits, probs []float32, targets []int32, vocab, seq int) (float32, int) {
 	if vocab <= 0 || seq <= 0 {
 		return 0, 0
 	}
@@ -86,7 +86,7 @@ func sameBackingSlice(a, b []float32) bool {
 	return &a[0] == &b[0]
 }
 
-func crossEntropyLossFromProbsRange(dLogits, probs []float32, targets []uint16, vocab, seq, start, end int) (float64, int) {
+func crossEntropyLossFromProbsRange(dLogits, probs []float32, targets []int32, vocab, seq, start, end int) (float64, int) {
 	loss := 0.0
 	valid := 0
 	for t := start; t < end; t++ {

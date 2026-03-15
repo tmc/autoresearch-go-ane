@@ -32,7 +32,10 @@ type classifierDynamicTile struct {
 }
 
 type offload struct {
-	metrics   *aneStepMetrics
+	dim     int // model embedding dimension
+	vocab   int // vocabulary size
+	metrics *aneStepMetrics
+
 	rmsFwd    *model.Kernel
 	clsFwdDyn []classifierDynamicTile
 	clsFwd    *model.Kernel
@@ -45,7 +48,9 @@ type offload struct {
 	rmsBwd    *model.Kernel
 	rmsBwdIn  []float32
 	clsBwdTmp []float32
-	rmsW      []float32
+	rmsW             []float32
+	rmsWExpanded     []float32
+	rmsWeightsStaged bool
 
 	clsFwdTile int
 	clsBwdTile int
@@ -87,26 +92,51 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 		closeDynamicClassifierTiles(clsBwdDyn)
 		return nil
 	}
+	cfg := mw.Config
+	dim := cfg.Dim
+	vocab := cfg.Vocab
+
 	o := &offload{
+		dim:      dim,
+		vocab:    vocab,
 		rmsFwd:   rmsFwd,
 		rmsBwd:   rmsBwd,
-		rmsBwdIn: make([]float32, 2*stories.Dim*seq),
-		rmsW:     onesSlice(stories.Dim),
+		rmsBwdIn: make([]float32, 2*dim*seq),
+		rmsW:     mw.RMSFinal,
 		softmax:  softmax,
 	}
 	var err error
 
 	if o.rmsFwd == nil {
 		o.rmsFwd, err = model.Compile(model.CompileOptions{
-			MILText: mil.GenFinalRMSNormDynamic(stories.Dim, seq),
+			MILText: mil.GenFinalRMSNormDynamic(dim, seq),
 		})
 		if err != nil {
 			o.notef("rms forward compile failed: %v", err)
 		}
 	}
+	// ANE compiler may expand weight input[1] from [1,dim,1,1] to [1,dim,1,seq].
+	// Pre-expand the weight vector to match the compiled layout.
+	if o.rmsFwd != nil {
+		layout := o.rmsFwd.InputLayout(1)
+		need := layout.Channels * layout.Width
+		if need > len(mw.RMSFinal) && layout.Width > 1 {
+			o.rmsWExpanded = make([]float32, need)
+			dim := layout.Channels
+			for d := 0; d < dim; d++ {
+				w := mw.RMSFinal[d]
+				base := d * layout.Width
+				for t := 0; t < layout.Width; t++ {
+					o.rmsWExpanded[base+t] = w
+				}
+			}
+		} else {
+			o.rmsWExpanded = mw.RMSFinal
+		}
+	}
 	if o.rmsBwd == nil {
 		o.rmsBwd, err = model.Compile(model.CompileOptions{
-			MILText: mil.GenRMSNormBackwardDynamic(stories.Dim, seq),
+			MILText: mil.GenRMSNormBackwardDynamic(dim, seq),
 		})
 		if err != nil {
 			o.notef("rms backward compile failed: %v", err)
@@ -128,13 +158,13 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 			o.notef("classifier forward using dynamic tile size %d", o.clsFwdTile)
 		}
 		if len(o.clsFwdDyn) == 0 {
-			if blob, err := mil.BuildWeightBlob(mw.Embed, stories.Vocab, stories.Dim); err == nil {
+			if blob, err := mil.BuildWeightBlob(mw.Embed, vocab, dim); err == nil {
 				o.clsFwd, err = compileFP16Kernel(
-					mil.GenClassifierForward(stories.Dim, stories.Vocab, seq),
+					mil.GenClassifierForward(dim, vocab, seq),
 					"@model_path/weights/embed.bin",
 					blob,
-					stories.Dim,
-					stories.Vocab,
+					dim,
+					vocab,
 					seq,
 				)
 				if err != nil {
@@ -153,7 +183,7 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 			}
 		}
 		if o.softmax == nil {
-			o.softmax, err = compileSoftmaxKernel(stories.Vocab, seq)
+			o.softmax, err = compileSoftmaxKernel(vocab, seq)
 			if err != nil {
 				o.notef("softmax compile failed: %v", err)
 			}
@@ -166,13 +196,13 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 			o.notef("classifier backward using dynamic vocab tile size %d", o.clsBwdTile)
 		}
 		if len(o.clsBwdDyn) == 0 {
-			if blob, err := mil.BuildTransposedWeightBlob(mw.Embed, stories.Vocab, stories.Dim); err == nil {
+			if blob, err := mil.BuildTransposedWeightBlob(mw.Embed, vocab, dim); err == nil {
 				o.clsBwd, err = compileFP16Kernel(
-					mil.GenClassifierBackward(stories.Dim, stories.Vocab, seq),
+					mil.GenClassifierBackward(dim, vocab, seq),
 					"@model_path/weights/embed_t.bin",
 					blob,
-					stories.Vocab,
-					stories.Dim,
+					vocab,
+					dim,
 					seq,
 				)
 				if err != nil {
@@ -191,7 +221,7 @@ func newOffloadWithState(mw *stories.ModelWeights, seq int, useANE bool, cpuClas
 			}
 		}
 		if len(o.clsBwdDyn) > 0 || len(o.clsBwdTil) > 0 {
-			o.clsBwdTmp = make([]float32, stories.Dim*seq)
+			o.clsBwdTmp = make([]float32, dim*seq)
 		}
 	}
 
@@ -209,6 +239,12 @@ func (o *offload) notef(format string, args ...any) {
 	o.diag = append(o.diag, fmt.Sprintf(format, args...))
 }
 
+func (o *offload) diagnosticSummary() string {
+	if o == nil || len(o.diag) == 0 {
+		return ""
+	}
+	return strings.Join(o.diag, "; ")
+}
 
 func compileFP16Kernel(milText, weightPath string, weightBlob []byte, inCh, outCh, seq int) (*model.Kernel, error) {
 	k, err := model.Compile(model.CompileOptions{
@@ -337,10 +373,12 @@ func disableKernel(k **model.Kernel) {
 }
 
 func (o *offload) runRMSForward(out, x []float32) error {
-	if err := o.rmsFwd.WriteInputFP16(1, o.rmsW); err != nil {
+	// Write activations to input[0], adapting to compiled layout.
+	if err := writeRMSInput(o.rmsFwd, 0, x); err != nil {
 		return err
 	}
-	if err := o.rmsFwd.WriteInputFP16(0, x); err != nil {
+	// Write weights to input[1], using pre-expanded buffer.
+	if err := writeRMSInput(o.rmsFwd, 1, o.rmsWExpanded); err != nil {
 		return err
 	}
 	if err := evalKernelTracked(o.metrics, o.rmsFwd); err != nil {
@@ -349,10 +387,63 @@ func (o *offload) runRMSForward(out, x []float32) error {
 	return o.rmsFwd.ReadOutputFP16(0, out)
 }
 
+// runRMSForwardFromSurface copies FFN output directly to RMS input, skipping CPU roundtrip.
+func (o *offload) runRMSForwardFromSurface(out []float32, src *model.Kernel, dim, seq int) error {
+	if o == nil || o.rmsFwd == nil || src == nil {
+		return fmt.Errorf("rms forward from surface: unavailable")
+	}
+	// Copy FFN output surface → RMS input[0] surface.
+	if err := model.CopyOutputRangeToInput(o.rmsFwd, 0, 0, 0, src, 0, 0, 0, dim, seq); err != nil {
+		return err
+	}
+	// Write weights to input[1] only on first call (weights don't change during inference).
+	if !o.rmsWeightsStaged {
+		if err := writeRMSInput(o.rmsFwd, 1, o.rmsWExpanded); err != nil {
+			return err
+		}
+		o.rmsWeightsStaged = true
+	}
+	if err := evalKernelTracked(o.metrics, o.rmsFwd); err != nil {
+		return err
+	}
+	return o.rmsFwd.ReadOutputFP16(0, out)
+}
+
+// writeRMSInput writes data to an RMS kernel input, handling cases where
+// the ANE compiler transforms the input layout dimensions.
+func writeRMSInput(k *model.Kernel, input int, data []float32) error {
+	layout := k.InputLayout(input)
+	need := layout.Channels * layout.Width
+	if need == len(data) || need <= 0 {
+		return k.WriteInputFP16(input, data)
+	}
+	// Expand or contract data to match compiled layout.
+	dim := layout.Channels
+	seq := layout.Width
+	if dim*seq != need {
+		return k.WriteInputFP16(input, data) // let it error naturally
+	}
+	buf := make([]float32, need)
+	srcSeq := len(data) / dim
+	if srcSeq <= 0 {
+		srcSeq = 1
+	}
+	for d := 0; d < dim; d++ {
+		for t := 0; t < seq; t++ {
+			srcT := t
+			if srcT >= srcSeq {
+				srcT = srcSeq - 1
+			}
+			buf[d*seq+t] = data[d*srcSeq+srcT]
+		}
+	}
+	return k.WriteInputFP16(input, buf)
+}
+
 func (o *offload) runClassifierForward(logits, xNorm []float32) error {
 	if len(o.clsFwdDyn) > 0 {
 		collectCustom := o.metrics != nil && o.metrics.wantsCustomMetrics()
-		seq := len(xNorm) / stories.Dim
+		seq := len(xNorm) / o.dim
 		for _, tile := range o.clsFwdDyn {
 			dst := logits[tile.start*seq : (tile.start+tile.size)*seq]
 			if collectCustom {
@@ -389,7 +480,7 @@ func (o *offload) runClassifierForward(logits, xNorm []float32) error {
 		if err := evalKernelTracked(o.metrics, tile.kernel); err != nil {
 			return err
 		}
-		seq := len(xNorm) / stories.Dim
+		seq := len(xNorm) / o.dim
 		dst := logits[tile.start*seq : (tile.start+tile.size)*seq]
 		if err := tile.kernel.ReadOutputFP16(0, dst); err != nil {
 			return err
@@ -431,7 +522,7 @@ func (o *offload) runClassifierSoftmax(probs, xNorm []float32) error {
 		if err := evalKernelTracked(o.metrics, o.clsFwd); err != nil {
 			return err
 		}
-		if err := model.CopyOutputChannelsToInput(o.softmax, 0, 0, o.clsFwd, 0, 0, stories.Vocab); err != nil {
+		if err := model.CopyOutputChannelsToInput(o.softmax, 0, 0, o.clsFwd, 0, 0, o.vocab); err != nil {
 			return err
 		}
 	} else {
@@ -469,7 +560,7 @@ func (o *offload) runClassifierBackward(dy, dLogits []float32) error {
 		for i := range dy {
 			dy[i] = 0
 		}
-		seq := len(dy) / stories.Dim
+		seq := len(dy) / o.dim
 		for _, tile := range o.clsBwdDyn {
 			src := dLogits[tile.start*seq : (tile.start+tile.size)*seq]
 			if collectCustom {
@@ -505,7 +596,7 @@ func (o *offload) runClassifierBackward(dy, dLogits []float32) error {
 	for i := range dy {
 		dy[i] = 0
 	}
-	seq := len(dy) / stories.Dim
+	seq := len(dy) / o.dim
 	for _, tile := range o.clsBwdTil {
 		src := dLogits[tile.start*seq : (tile.start+tile.size)*seq]
 		if err := tile.kernel.WriteInputFP16(0, src); err != nil {
@@ -553,8 +644,21 @@ func (o *offload) refreshWeights(mw *stories.ModelWeights) error {
 	if mw == nil {
 		return fmt.Errorf("refresh offload weights: model weights are nil")
 	}
-	// Parameterless RMSNorm: weight is always 1.0.
-	o.rmsW = onesSlice(stories.Dim)
+	o.rmsW = mw.RMSFinal
+	// Re-expand RMS weights if needed for ANE kernel.
+	if o.rmsFwd != nil && o.rmsWExpanded != nil && len(o.rmsWExpanded) > len(mw.RMSFinal) {
+		dim := len(mw.RMSFinal)
+		seq := len(o.rmsWExpanded) / dim
+		for d := 0; d < dim; d++ {
+			w := mw.RMSFinal[d]
+			base := d * seq
+			for t := 0; t < seq; t++ {
+				o.rmsWExpanded[base+t] = w
+			}
+		}
+	} else {
+		o.rmsWExpanded = mw.RMSFinal
+	}
 	forwardStart := time.Now()
 	if err := o.refreshClassifierForwardWeights(mw.Embed); err != nil {
 		return err
