@@ -10,6 +10,16 @@ package storiesane
 
 static void storiesane_cvt_f32_f16(_Float16 *dst, const float *src, size_t n) {
 	size_t i = 0;
+	for (; i + 15 < n; i += 16) {
+		float16x8_t h0 = vcombine_f16(
+			vcvt_f16_f32(vld1q_f32(src + i)),
+			vcvt_f16_f32(vld1q_f32(src + i + 4)));
+		float16x8_t h1 = vcombine_f16(
+			vcvt_f16_f32(vld1q_f32(src + i + 8)),
+			vcvt_f16_f32(vld1q_f32(src + i + 12)));
+		vst1q_f16((__fp16 *)(dst + i), h0);
+		vst1q_f16((__fp16 *)(dst + i + 8), h1);
+	}
 	for (; i + 7 < n; i += 8) {
 		float16x8_t h = vcombine_f16(
 			vcvt_f16_f32(vld1q_f32(src + i)),
@@ -23,6 +33,14 @@ static void storiesane_cvt_f32_f16(_Float16 *dst, const float *src, size_t n) {
 
 static void storiesane_cvt_f16_f32(float *dst, const _Float16 *src, size_t n) {
 	size_t i = 0;
+	for (; i + 15 < n; i += 16) {
+		float16x8_t h0 = vld1q_f16((const __fp16 *)(src + i));
+		float16x8_t h1 = vld1q_f16((const __fp16 *)(src + i + 8));
+		vst1q_f32(dst + i, vcvt_f32_f16(vget_low_f16(h0)));
+		vst1q_f32(dst + i + 4, vcvt_f32_f16(vget_high_f16(h0)));
+		vst1q_f32(dst + i + 8, vcvt_f32_f16(vget_low_f16(h1)));
+		vst1q_f32(dst + i + 12, vcvt_f32_f16(vget_high_f16(h1)));
+	}
 	for (; i + 7 < n; i += 8) {
 		float16x8_t h = vld1q_f16((const __fp16 *)(src + i));
 		vst1q_f32(dst + i, vcvt_f32_f16(vget_low_f16(h)));

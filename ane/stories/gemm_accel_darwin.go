@@ -19,7 +19,7 @@ func matMulVocabSeqAccelerate(logits, embed, x []float32, vocab, dim, seq int) b
 		return false
 	}
 	// Split vocab into chunks and compute concurrently.
-	const nSplit = 16
+	const nSplit = 24
 	chunk := vocab / nSplit
 	if chunk > 0 && vocab > 1000 {
 		var wg sync.WaitGroup
