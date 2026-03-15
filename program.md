@@ -81,9 +81,11 @@ benchstat bench_before.txt bench_after.txt
 ```
 
 This shows per-benchmark differences with p-values. The key metrics:
-- `BenchmarkEvalLoss` `val_loss` — **this is the metric you are optimizing**
-- `BenchmarkStep` `loss` and `step_ms` — training loss trajectory and throughput
-- `BenchmarkEvalLogits` — inference speed
+- `BenchmarkEvalLoss` `val_loss` — **this is the metric you are optimizing** (cross-entropy in nats, lower is better)
+- `BenchmarkStep` `loss` — training loss trajectory (should decrease over steps)
+- `BenchmarkStep` `tok/s` — training throughput (tokens per second)
+- `BenchmarkStep` `ane-compute-%` — ANE utilization during training
+- `BenchmarkEvalLogits` `ns/op` — inference latency per 256-token window
 
 A change is worth keeping if `val_loss` decreased with `p < 0.05`. If benchstat shows `~` (no significant difference), the change has no effect — discard it.
 
