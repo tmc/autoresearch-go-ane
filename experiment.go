@@ -59,7 +59,7 @@ func experimentConfig(modelPath string, tokens []int32) ane.Options {
 		GradClip:       GradClip,
 		LossScale:      LossScale,
 		UseANE:            UseANE,
-		CPUClassifierHead: true,
+		CPUClassifierHead: false,
 		HybridBackward:    HybridBackward,
 	}
 }
