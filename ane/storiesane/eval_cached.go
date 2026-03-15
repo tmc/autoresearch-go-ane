@@ -40,6 +40,8 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 	headDim := cfg.HeadDim()
 	vocab := cfg.Vocab
 
+	useFP16 := e.mw.FP16Layers != nil
+
 	// Lazily allocate the KV cache and scratch buffers.
 	if e.kvc == nil {
 		e.kvc = newKVCache(cfg.NLayers, kvDim, e.seq)
@@ -64,6 +66,26 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		e.cacheH1H3 = make([]float32, 2*hidden)
 	}
 
+	// Lazily allocate fp16 scratch and fused fp16 weight arrays.
+	if useFP16 && e.fp16Scratch == nil {
+		maxSize := 2 * hidden * dim // fused W1W3
+		if qkvSize := (qDim + 2*kvDim) * dim; qkvSize > maxSize {
+			maxSize = qkvSize
+		}
+		if woSize := dim * qDim; woSize > maxSize {
+			maxSize = woSize
+		}
+		if w2Size := dim * hidden; w2Size > maxSize {
+			maxSize = w2Size
+		}
+		if embedSize := vocab * dim; embedSize > maxSize {
+			maxSize = embedSize
+		}
+		e.fp16Scratch = make([]float32, maxSize)
+		e.fusedQKVFP16 = make([][]uint16, cfg.NLayers)
+		e.fusedW1W3FP16 = make([][]uint16, cfg.NLayers)
+	}
+
 	if e.kvc.pos >= e.kvc.maxSeq {
 		return nil, fmt.Errorf("storiesane eval next token: cache full (pos=%d, max=%d)", e.kvc.pos, e.kvc.maxSeq)
 	}
@@ -75,8 +97,13 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 	if tokInt >= vocab {
 		tokInt = 0
 	}
-	for d := 0; d < dim; d++ {
-		e.cacheX[d] = e.mw.Embed[tokInt*dim+d]
+	if useFP16 {
+		// Convert fp16 embedding row to fp32.
+		convertFP16ToF32(e.cacheX[:dim], e.mw.EmbedFP16[tokInt*dim:(tokInt+1)*dim])
+	} else {
+		for d := 0; d < dim; d++ {
+			e.cacheX[d] = e.mw.Embed[tokInt*dim+d]
+		}
 	}
 
 	cur := e.cacheX
@@ -88,22 +115,39 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		layer := e.mw.Layers[li]
 
 		// Attention sub-block: RMSNorm → Q,K,V → RoPE → cache → attention → Wo → residual
-		rmsNormSingle(e.cacheXNorm, cur, layer.RMSAtt, dim)
+		if useFP16 {
+			rmsNormSingle(e.cacheXNorm, cur, e.mw.FP16Layers[li].RMSAtt, dim)
+		} else {
+			rmsNormSingle(e.cacheXNorm, cur, layer.RMSAtt, dim)
+		}
 
 		// Fused QKV: one BLAS call instead of 3.
-		if e.fusedQKVW == nil {
-			e.fusedQKVW = make([][]float32, cfg.NLayers)
-			e.fusedW1W3 = make([][]float32, cfg.NLayers)
+		qkvSize := (qDim + 2*kvDim) * dim
+		if useFP16 {
+			if e.fusedQKVFP16[li] == nil {
+				fp16L := e.mw.FP16Layers[li]
+				fused := make([]uint16, qkvSize)
+				copy(fused[0:], fp16L.Wq)
+				copy(fused[qDim*dim:], fp16L.Wk)
+				copy(fused[(qDim+kvDim)*dim:], fp16L.Wv)
+				e.fusedQKVFP16[li] = fused
+			}
+			convertFP16ToF32(e.fp16Scratch[:qkvSize], e.fusedQKVFP16[li])
+			linearSingle(e.cacheQKV, e.fp16Scratch[:qkvSize], e.cacheXNorm, qDim+2*kvDim, dim)
+		} else {
+			if e.fusedQKVW == nil {
+				e.fusedQKVW = make([][]float32, cfg.NLayers)
+				e.fusedW1W3 = make([][]float32, cfg.NLayers)
+			}
+			if e.fusedQKVW[li] == nil {
+				fused := make([]float32, qkvSize)
+				copy(fused[0:], layer.Wq)
+				copy(fused[qDim*dim:], layer.Wk)
+				copy(fused[(qDim+kvDim)*dim:], layer.Wv)
+				e.fusedQKVW[li] = fused
+			}
+			linearSingle(e.cacheQKV, e.fusedQKVW[li], e.cacheXNorm, qDim+2*kvDim, dim)
 		}
-		if e.fusedQKVW[li] == nil {
-			// Build fused weight matrix: stack Wq, Wk, Wv vertically → [(qDim+2*kvDim), dim]
-			fused := make([]float32, (qDim+2*kvDim)*dim)
-			copy(fused[0:], layer.Wq)
-			copy(fused[qDim*dim:], layer.Wk)
-			copy(fused[(qDim+kvDim)*dim:], layer.Wv)
-			e.fusedQKVW[li] = fused
-		}
-		linearSingle(e.cacheQKV, e.fusedQKVW[li], e.cacheXNorm, qDim+2*kvDim, dim)
 		// Use slices directly from fused output to avoid copies.
 		fusedQ := e.cacheQKV[:qDim]
 		fusedK := e.cacheQKV[qDim : qDim+kvDim]
@@ -122,22 +166,56 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 			heads, kvHeads, headDim, pos+1, e.kvc.maxSeq)
 
 		// Wo projection: [dim, qDim] @ attOut[qDim] → x2[dim]
-		linearSingle(e.cacheX2, layer.Wo, e.cacheAttOut, dim, qDim)
+		if useFP16 {
+			woSize := dim * qDim
+			convertFP16ToF32(e.fp16Scratch[:woSize], e.mw.FP16Layers[li].Wo)
+			linearSingle(e.cacheX2, e.fp16Scratch[:woSize], e.cacheAttOut, dim, qDim)
+		} else {
+			linearSingle(e.cacheX2, layer.Wo, e.cacheAttOut, dim, qDim)
+		}
 
 		// Residual connection: x2 = cur + scale * x2
 		addScaledResidualSingle(e.cacheX2, cur, e.cacheX2, residualScale)
 
 		// FFN sub-block: RMSNorm → W1+W3 fused → SiLU → W2 → residual
-		rmsNormSingle(e.cacheXNorm, e.cacheX2, layer.RMSFFN, dim)
-		if e.fusedW1W3[li] == nil {
-			fused := make([]float32, 2*hidden*dim)
-			copy(fused[0:], layer.W1)
-			copy(fused[hidden*dim:], layer.W3)
-			e.fusedW1W3[li] = fused
+		if useFP16 {
+			rmsNormSingle(e.cacheXNorm, e.cacheX2, e.mw.FP16Layers[li].RMSFFN, dim)
+		} else {
+			rmsNormSingle(e.cacheXNorm, e.cacheX2, layer.RMSFFN, dim)
 		}
-		linearSingle(e.cacheH1H3, e.fusedW1W3[li], e.cacheXNorm, 2*hidden, dim)
+
+		w1w3Size := 2 * hidden * dim
+		if useFP16 {
+			if e.fusedW1W3FP16[li] == nil {
+				fp16L := e.mw.FP16Layers[li]
+				fused := make([]uint16, w1w3Size)
+				copy(fused[0:], fp16L.W1)
+				copy(fused[hidden*dim:], fp16L.W3)
+				e.fusedW1W3FP16[li] = fused
+			}
+			convertFP16ToF32(e.fp16Scratch[:w1w3Size], e.fusedW1W3FP16[li])
+			linearSingle(e.cacheH1H3, e.fp16Scratch[:w1w3Size], e.cacheXNorm, 2*hidden, dim)
+		} else {
+			if e.fusedW1W3 == nil {
+				e.fusedW1W3 = make([][]float32, cfg.NLayers)
+			}
+			if e.fusedW1W3[li] == nil {
+				fused := make([]float32, w1w3Size)
+				copy(fused[0:], layer.W1)
+				copy(fused[hidden*dim:], layer.W3)
+				e.fusedW1W3[li] = fused
+			}
+			linearSingle(e.cacheH1H3, e.fusedW1W3[li], e.cacheXNorm, 2*hidden, dim)
+		}
 		siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
-		linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
+
+		if useFP16 {
+			w2Size := dim * hidden
+			convertFP16ToF32(e.fp16Scratch[:w2Size], e.mw.FP16Layers[li].W2)
+			linearSingle(e.cacheFFOut, e.fp16Scratch[:w2Size], e.cacheGate, dim, hidden)
+		} else {
+			linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
+		}
 		addScaledResidualSingle(next, e.cacheX2, e.cacheFFOut, residualScale)
 
 		cur, next = next, cur
@@ -148,7 +226,13 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 	// Classifier: logits = Embed @ xNorm where Embed is [vocab, dim] row-major.
 	// Use BLAS matmul via linearCF with seq=1.
-	linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
+	if useFP16 {
+		embedSize := vocab * dim
+		convertFP16ToF32(e.fp16Scratch[:embedSize], e.mw.EmbedFP16)
+		linearSingle(e.cacheLogits, e.fp16Scratch[:embedSize], e.cacheXNorm, vocab, dim)
+	} else {
+		linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
+	}
 
 	e.kvc.advancePos()
 

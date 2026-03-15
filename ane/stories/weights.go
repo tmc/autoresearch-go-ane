@@ -8,6 +8,8 @@ import (
 	"math/rand"
 	"os"
 	"unsafe"
+
+	"github.com/tmc/autoresearch-go-ane/ane/mil"
 )
 
 type LayerWeights struct {
@@ -22,6 +24,19 @@ type ModelWeights struct {
 	RMSFinal []float32
 	Embed    []float32 // [vocab, dim] row-major
 	SharedCL bool
+
+	// FP16 compressed weights for memory-bandwidth-bound inference.
+	// When non-nil, these are used instead of the fp32 Layers for matmuls.
+	FP16Layers []LayerWeightsFP16
+	EmbedFP16  []uint16 // [vocab*dim] fp16
+}
+
+// LayerWeightsFP16 holds per-layer weight matrices in fp16 (uint16).
+// RMS norm weights remain in fp32 since they are tiny.
+type LayerWeightsFP16 struct {
+	Wq, Wk, Wv, Wo []uint16
+	W1, W2, W3     []uint16
+	RMSAtt, RMSFFN []float32 // kept in fp32 (tiny)
 }
 
 // NewModelWeights allocates weights for the legacy 110M model.
@@ -308,6 +323,36 @@ func readF32s(r io.Reader, dst []float32) error {
 		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[off : off+4]))
 	}
 	return nil
+}
+
+// CompressToFP16 populates FP16Layers and EmbedFP16 from the fp32 Layers.
+// This halves memory bandwidth for the KV-cached inference path.
+func (mw *ModelWeights) CompressToFP16() {
+	cfg := mw.Config
+	mw.FP16Layers = make([]LayerWeightsFP16, cfg.NLayers)
+	for i := range mw.Layers {
+		l := &mw.Layers[i]
+		mw.FP16Layers[i] = LayerWeightsFP16{
+			Wq:     convertSliceToFP16(l.Wq),
+			Wk:     convertSliceToFP16(l.Wk),
+			Wv:     convertSliceToFP16(l.Wv),
+			Wo:     convertSliceToFP16(l.Wo),
+			W1:     convertSliceToFP16(l.W1),
+			W2:     convertSliceToFP16(l.W2),
+			W3:     convertSliceToFP16(l.W3),
+			RMSAtt: l.RMSAtt,
+			RMSFFN: l.RMSFFN,
+		}
+	}
+	mw.EmbedFP16 = convertSliceToFP16(mw.Embed)
+}
+
+func convertSliceToFP16(src []float32) []uint16 {
+	dst := make([]uint16, len(src))
+	for i, v := range src {
+		dst[i] = mil.Float32ToFP16(v)
+	}
+	return dst
 }
 
 var nativeLittleEndian = func() bool {

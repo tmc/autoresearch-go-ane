@@ -51,6 +51,15 @@ static void storiesane_cvt_f16_f32(float *dst, const _Float16 *src, size_t n) {
 	}
 }
 
+// Thin wrappers accepting uint16_t* for Go-callable fp16 bulk conversion.
+static void storiesane_bulk_f16_to_f32(float *dst, const uint16_t *src, size_t n) {
+	storiesane_cvt_f16_f32(dst, (const _Float16 *)src, n);
+}
+
+static void storiesane_bulk_f32_to_f16(uint16_t *dst, const float *src, size_t n) {
+	storiesane_cvt_f32_f16((_Float16 *)dst, src, n);
+}
+
 static void storiesane_write_cf_fp16(
 	uint16_t *dst,
 	size_t dst_len,
@@ -182,6 +191,38 @@ import (
 
 	xane "github.com/tmc/apple/x/ane"
 )
+
+// convertFP16ToF32 converts a flat fp16 (uint16) slice to float32 using NEON.
+func convertFP16ToF32(dst []float32, src []uint16) {
+	if len(dst) == 0 || len(src) == 0 {
+		return
+	}
+	n := len(src)
+	if n > len(dst) {
+		n = len(dst)
+	}
+	C.storiesane_bulk_f16_to_f32(
+		(*C.float)(unsafe.Pointer(unsafe.SliceData(dst))),
+		(*C.uint16_t)(unsafe.Pointer(unsafe.SliceData(src))),
+		C.size_t(n),
+	)
+}
+
+// convertF32ToFP16 converts a flat float32 slice to fp16 (uint16) using NEON.
+func convertF32ToFP16(dst []uint16, src []float32) {
+	if len(dst) == 0 || len(src) == 0 {
+		return
+	}
+	n := len(src)
+	if n > len(dst) {
+		n = len(dst)
+	}
+	C.storiesane_bulk_f32_to_f16(
+		(*C.uint16_t)(unsafe.Pointer(unsafe.SliceData(dst))),
+		(*C.float)(unsafe.Pointer(unsafe.SliceData(src))),
+		C.size_t(n),
+	)
+}
 
 func writeChannelFirstActsOffsetFP16(data []uint16, layout xane.TensorLayout, channelOffset, widthOffset, width int, x []float32) {
 	if len(data) == 0 || len(x) == 0 || width <= 0 {

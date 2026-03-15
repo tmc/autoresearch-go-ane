@@ -162,6 +162,11 @@ type Engine struct {
 	cacheH1H3     []float32 // fused W1+W3 output [2*hidden]
 	fusedQKVW     [][]float32 // per-layer fused [qDim+2*kvDim, dim] weight matrices
 	fusedW1W3     [][]float32 // per-layer fused [2*hidden, dim] weight matrices
+
+	// FP16 inference: fused weight matrices in fp16 and scratch for fp16→fp32 conversion.
+	fusedQKVFP16  [][]uint16  // per-layer fused QKV in fp16
+	fusedW1W3FP16 [][]uint16  // per-layer fused W1+W3 in fp16
+	fp16Scratch   []float32   // scratch buffer for largest weight matrix (fp16→fp32)
 }
 
 const (
@@ -230,6 +235,14 @@ func Open(opts Options) (*Engine, error) {
 		}
 	}
 	cfg := mw.Config
+
+	// Compress weights to fp16 for memory-bandwidth-efficient KV-cached inference.
+	// Only beneficial for large models where memory bandwidth dominates over
+	// fp16→fp32 conversion overhead. Threshold: ~4GB of weight data.
+	weightBytes := int64(cfg.NLayers) * int64(cfg.WqSize()+cfg.WkSize()+cfg.WvSize()+cfg.WoSize()+cfg.W1Size()+cfg.W2Size()+cfg.W3Size()) * 4
+	if weightBytes > 4*1024*1024*1024 {
+		mw.CompressToFP16()
+	}
 
 	var opt *stories.OptimState
 	var accum *modelGrad
@@ -629,6 +642,9 @@ func (e *Engine) Close() {
 	e.cacheH1H3 = nil
 	e.fusedQKVW = nil
 	e.fusedW1W3 = nil
+	e.fusedQKVFP16 = nil
+	e.fusedW1W3FP16 = nil
+	e.fp16Scratch = nil
 }
 
 func (e *Engine) flushPending() time.Duration {
