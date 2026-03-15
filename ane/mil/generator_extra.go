@@ -88,8 +88,7 @@ func GenFinalRMSNorm(dim, seq int) string {
 			"        tensor<fp16, [1,1,1,%d]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];\n"+
 			"        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n"+
 			"        tensor<fp16, [1,1,1,%d]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];\n"+
-			"        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"+
-			"        tensor<fp16, [1,1,1,%d]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];\n"+
+			"        tensor<fp16, [1,1,1,%d]> rrms = rsqrt(x=ss3)[name=string(\"rrms\")];\n"+
 			"        tensor<fp16, [1,%d,1,%d]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];\n"+
 			"        tensor<fp16, [1,%d,1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_w.bin\"), offset=uint64(64)))];\n"+
 			"        tensor<fp16, [1,%d,1,%d]> out = mul(x=xr,y=rw)[name=string(\"out\")];\n"+
