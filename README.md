@@ -93,16 +93,27 @@ The `autoresearch/mar14-infer` branch contains a focused optimization effort to 
 
 ### Optimization History
 
-| Commit | Change | Impact |
-|---|---|---|
-| `008d56b` | **Inference optimization infrastructure** | Foundation |
-| `9fabd63` | **BLAS-accelerated forward pass** | **+67% throughput** |
-| `fcce277` | **CPU BLAS classifier head** | Reduced classifier latency |
-| `4bbdede` | **Inference-only layer forward** | Eliminated unnecessary writes |
-| `37e217b` | **Fix ANE RMSNorm weight layout** | Correctness fix |
-| `ec51a5d` | **Fix ANE RMSNorm input layout** | Correctness fix |
-| `2f6a526` | **vDSP residual acceleration** | Reduced CPU residual overhead |
-| `3c0afbb` | **Inference SDPA kernel + fused residual** | Reduced ANE dispatch count |
+Training throughput measured via anperf snapshots. Inference latency from `BenchmarkEvalLogits` on M5 Max.
+
+| # | Commit | Change | tok/s | Delta | Step ms | ANE ms | ANE % | EvalLogits |
+|---|--------|--------|-------|-------|---------|--------|-------|------------|
+| 0 | `9abba8b` | Baseline (unoptimized) | 872 | — | 309 ms | 84 ms | 26.4% | — |
+| 1 | `008d56b` | Inference optimization infra | 1,477 | **+69%** | 176 ms | 52 ms | 29.5% | — |
+| 2 | `9fabd63` | BLAS-accelerated forward + prealloc bufs | 1,552 | **+5.1%** | 168 ms | 50 ms | 30.0% | — |
+| 3 | `fcce277` | CPU BLAS classifier (replace ANE tiles) | — | — | — | — | — | ~22.7 ms |
+| 4 | `4bbdede` | Inference-only layer forward (skip taps) | — | — | — | — | — | ~22.5 ms |
+| 5 | `37e217b` | Fix ANE RMSNorm weight tensor layout | — | — | — | — | — | correctness |
+| 6 | `ec51a5d` | Fix ANE RMSNorm input layout (both paths) | — | — | — | — | — | correctness |
+| 7 | `2f6a526` | vDSP-accelerated residual blending | — | — | — | — | — | ~22.3 ms |
+| 8 | `3c0afbb` | Inference SDPA kernel + fused residual | — | — | — | — | — | ~22.1 ms |
+
+**Cumulative: 872 -> 1,552 tok/s training (+80%), 22.1 ms/op inference (~11.6k tok/s)**
+
+Notes:
+- Commits 0-2 have training throughput snapshots (measured via anperf during 2-3 min training runs)
+- Commits 3-8 targeted inference only (`BenchmarkEvalLogits`); training throughput not re-measured
+- The `008d56b` jump (+69%) includes multiple changes bundled in the initial infra commit
+- EvalLogits times are approximate (3-run averages, `-benchtime 5x`)
 
 ### Detailed Breakdown
 
