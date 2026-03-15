@@ -11,12 +11,12 @@ import (
 // Return false to stop generation early.
 type GenerateCallback func(token uint16, step int) bool
 
-// Generate runs autoregressive decoding using repeated full-sequence EvalLogits
-// calls (no KV cache). It returns the full token sequence (prompt + generated).
+// Generate runs autoregressive decoding using KV-cached incremental evaluation.
+// It returns the full token sequence (prompt + generated).
 //
-// The engine has a fixed sequence length (e.seq). The prompt is placed at the
-// right side of the window (left-padded with BOS). New tokens are appended,
-// shifting the window as needed.
+// The engine has a fixed sequence length (e.seq). The prompt is prefilled
+// through the KV cache, then each new token is generated in O(n) time
+// instead of O(n*seq) full-sequence recomputation.
 func Generate(e *Engine, prompt []uint16, opts stories.GenerateOptions) ([]uint16, error) {
 	var result []uint16
 	err := GenerateStream(e, prompt, opts, func(token uint16, step int) bool {
@@ -33,9 +33,11 @@ func Generate(e *Engine, prompt []uint16, opts stories.GenerateOptions) ([]uint1
 	return out, nil
 }
 
-// GenerateStream runs autoregressive decoding and calls cb after each new token.
-// If cb returns false, generation stops early. This uses full-sequence
-// recomputation at each step (O(n^2)) — correct but not optimized.
+// GenerateStream runs autoregressive decoding with KV cache and calls cb
+// after each new token. If cb returns false, generation stops early.
+//
+// The KV cache is reset at the start of each call, then the prompt is
+// prefilled. Each subsequent token is generated incrementally.
 func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb GenerateCallback) error {
 	if e == nil || e.mw == nil {
 		return fmt.Errorf("storiesane generate: engine is closed")
@@ -65,14 +67,105 @@ func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb
 	// Seed the RNG. Use the engine seed for reproducibility.
 	rng := rand.New(rand.NewSource(e.seed))
 
-	// Working token buffer: all tokens generated so far (prompt + new).
+	// Prepare prompt tokens.
+	promptToks := make([]uint16, len(prompt))
+	copy(promptToks, prompt)
+	if len(promptToks) == 0 {
+		promptToks = []uint16{storiesBOS}
+	}
+
+	// Truncate prompt if it exceeds sequence length (leave room for at least 1 generated token).
+	maxPrompt := seq - 1
+	if maxPrompt < 1 {
+		maxPrompt = 1
+	}
+	if len(promptToks) > maxPrompt {
+		promptToks = promptToks[len(promptToks)-maxPrompt:]
+	}
+
+	// Reset and prefill the KV cache with the prompt.
+	e.ResetCache()
+
+	var logits []float32
+	var err error
+	logits, err = e.EvalPrefill(promptToks)
+	if err != nil {
+		return fmt.Errorf("storiesane generate: prefill: %w", err)
+	}
+
+	row := make([]float32, vocab)
+
+	for step := 0; step < maxTokens; step++ {
+		// EvalNextToken returns flat [vocab] logits — copy directly.
+		copy(row, logits)
+
+		next := stories.SampleToken(row, vocab, temp, opts.TopP, rng)
+
+		// Check stop tokens before reporting.
+		if stopSet[next] {
+			if cb != nil {
+				cb(next, step)
+			}
+			return nil
+		}
+
+		if cb != nil {
+			if !cb(next, step) {
+				return nil
+			}
+		}
+
+		// Check if we have room in the cache for more tokens.
+		if e.kvc != nil && e.kvc.pos >= seq {
+			// Cache is full; cannot generate more tokens.
+			break
+		}
+
+		// Evaluate the next token incrementally.
+		logits, err = e.EvalNextToken(next)
+		if err != nil {
+			return fmt.Errorf("storiesane generate: step %d: %w", step, err)
+		}
+	}
+
+	return nil
+}
+
+// GenerateStreamNocache runs autoregressive decoding using full-sequence
+// recomputation (no KV cache). This is the legacy O(n^2) path, kept for
+// correctness testing.
+func GenerateStreamNocache(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb GenerateCallback) error {
+	if e == nil || e.mw == nil {
+		return fmt.Errorf("storiesane generate: engine is closed")
+	}
+	cfg := e.Config()
+	seq := e.seq
+	vocab := cfg.Vocab
+	if vocab <= 0 {
+		return fmt.Errorf("storiesane generate: invalid vocab size %d", vocab)
+	}
+
+	maxTokens := opts.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 64
+	}
+	temp := opts.Temperature
+	if temp < 0 {
+		temp = 0
+	}
+
+	stopSet := make(map[uint16]bool, len(opts.StopTokens))
+	for _, t := range opts.StopTokens {
+		stopSet[t] = true
+	}
+
+	rng := rand.New(rand.NewSource(e.seed))
+
 	tokens := make([]uint16, len(prompt))
 	copy(tokens, prompt)
 	if len(tokens) == 0 {
 		tokens = []uint16{storiesBOS}
 	}
-
-	// Truncate prompt if it already exceeds sequence length.
 	if len(tokens) > seq {
 		tokens = tokens[len(tokens)-seq:]
 	}
@@ -81,7 +174,6 @@ func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb
 	row := make([]float32, vocab)
 
 	for step := 0; step < maxTokens; step++ {
-		// Fill the fixed-size window: left-pad with BOS, right-align tokens.
 		fillWindow(window, tokens)
 
 		logits, err := e.EvalLogits(window)
@@ -89,8 +181,6 @@ func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb
 			return fmt.Errorf("storiesane generate: step %d: %w", step, err)
 		}
 
-		// Extract logits for the last position in the window.
-		// Layout: logits[v*seq + p] for vocab item v at position p.
 		lastPos := seq - 1
 		for v := 0; v < vocab; v++ {
 			row[v] = logits[v*seq+lastPos]
@@ -98,9 +188,7 @@ func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb
 
 		next := stories.SampleToken(row, vocab, temp, opts.TopP, rng)
 
-		// Check stop tokens before appending.
 		if stopSet[next] {
-			// Optionally report the stop token.
 			if cb != nil {
 				cb(next, step)
 			}
@@ -108,8 +196,6 @@ func GenerateStream(e *Engine, prompt []uint16, opts stories.GenerateOptions, cb
 		}
 
 		tokens = append(tokens, next)
-
-		// Keep the window from exceeding seq length.
 		if len(tokens) > seq {
 			tokens = tokens[len(tokens)-seq:]
 		}

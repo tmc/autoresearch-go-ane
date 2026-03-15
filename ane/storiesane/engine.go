@@ -140,6 +140,24 @@ type Engine struct {
 	embedGradDone    chan struct{}
 	asyncRefreshDone chan time.Duration // async weight refresh result
 	stepMetrics      aneStepMetrics
+
+	// KV cache state for incremental token generation.
+	kvc           *kvCache
+	cachedRopeCos []float32
+	cachedRopeSin []float32
+	cacheX        []float32
+	cacheXNorm    []float32
+	cacheQ        []float32
+	cacheK        []float32
+	cacheV        []float32
+	cacheAttOut   []float32
+	cacheX2       []float32
+	cacheH1       []float32
+	cacheH3       []float32
+	cacheGate     []float32
+	cacheFFOut    []float32
+	cacheNext     []float32
+	cacheLogits   []float32
 }
 
 const (
@@ -587,6 +605,22 @@ func (e *Engine) Close() {
 		e.gradTasks.Close()
 		e.gradTasks = nil
 	}
+	e.kvc = nil
+	e.cachedRopeCos = nil
+	e.cachedRopeSin = nil
+	e.cacheX = nil
+	e.cacheXNorm = nil
+	e.cacheQ = nil
+	e.cacheK = nil
+	e.cacheV = nil
+	e.cacheAttOut = nil
+	e.cacheX2 = nil
+	e.cacheH1 = nil
+	e.cacheH3 = nil
+	e.cacheGate = nil
+	e.cacheFFOut = nil
+	e.cacheNext = nil
+	e.cacheLogits = nil
 }
 
 func (e *Engine) flushPending() time.Duration {
