@@ -193,7 +193,7 @@ func buildRoPETables(seq, headDim int) ([]float32, []float32) {
 	for pos := 0; pos < seq; pos++ {
 		base := pos * half
 		for i := 0; i < half; i++ {
-			freq := float64(pos) / math.Pow(10000, float64(2*i)/float64(headDim))
+			freq := float64(pos) / math.Pow(100000, float64(2*i)/float64(headDim))
 			cos[base+i] = float32(math.Cos(freq))
 			sin[base+i] = float32(math.Sin(freq))
 		}
