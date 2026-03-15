@@ -69,6 +69,7 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 	useFP16 := e.mw.FP16Layers != nil
 	useInt8 := e.mw.Int8Layers != nil
+	useMetal := e.metalHandles != nil
 
 	// Lazily allocate the KV cache and scratch buffers.
 	if e.kvc == nil {
@@ -95,6 +96,7 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		// Note: ANE dispatch overhead (~20ms/kernel) makes batch=1 ANE slower
 		// than CPU BLAS. ANE is only beneficial at batch>=32 or with fused
 		// multi-layer kernels. Keep CPU BLAS for single-token path.
+		e.ensureMetalMatmuls()
 	}
 
 	// Lazily allocate fp16 scratch and fused fp16 weight arrays.
@@ -158,7 +160,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// Separate Q, K, V matmuls — avoids 15GB fused weight allocation for large models.
 		tQKV := time.Now()
-		if useInt8 {
+		if useMetal {
+			e.metalExecQKV(li, e.cacheQKV[:qDim], e.cacheQKV[qDim:qDim+kvDim], e.cacheQKV[qDim+kvDim:qDim+2*kvDim], e.cacheXNorm)
+		} else if useInt8 {
 			i8L := e.mw.Int8Layers[li]
 			linearSingleInt8(e.cacheQKV[:qDim], i8L.Wq.Data, i8L.Wq.Scales, e.cacheXNorm, qDim, dim)
 			linearSingleInt8(e.cacheQKV[qDim:qDim+kvDim], i8L.Wk.Data, i8L.Wk.Scales, e.cacheXNorm, kvDim, dim)
@@ -197,7 +201,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// Wo projection: [dim, qDim] @ attOut[qDim] → x2[dim]
 		tWo := time.Now()
-		if useInt8 {
+		if useMetal {
+			e.metalExecWo(li, e.cacheX2, e.cacheAttOut)
+		} else if useInt8 {
 			i8L := e.mw.Int8Layers[li]
 			linearSingleInt8(e.cacheX2, i8L.Wo.Data, i8L.Wo.Scales, e.cacheAttOut, dim, qDim)
 		} else if useFP16 {
@@ -225,7 +231,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// Separate W1, W3 matmuls — avoids fused weight allocation.
 		tFFN := time.Now()
-		if useInt8 {
+		if useMetal {
+			e.metalExecFFN(li, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:], e.cacheFFOut, e.cacheXNorm, e.cacheGate)
+		} else if useInt8 {
 			i8L := e.mw.Int8Layers[li]
 			linearSingleInt8(e.cacheH1H3[:hidden], i8L.W1.Data, i8L.W1.Scales, e.cacheXNorm, hidden, dim)
 			linearSingleInt8(e.cacheH1H3[hidden:], i8L.W3.Data, i8L.W3.Scales, e.cacheXNorm, hidden, dim)
@@ -260,7 +268,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 	// Classifier: logits = Embed @ xNorm where Embed is [vocab, dim] row-major.
 	tCls := time.Now()
-	linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
+	if !useMetal || !e.metalExecClassifier(e.cacheLogits, e.cacheXNorm) {
+		linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
+	}
 	timings.Classifier = time.Since(tCls)
 
 	e.kvc.advancePos()

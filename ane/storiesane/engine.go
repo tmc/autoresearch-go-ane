@@ -178,6 +178,10 @@ type Engine struct {
 	aneCls   *dynamicmatmul.Executor   // classifier [dim → vocab]
 	aneReady bool
 
+	// Cached Metal GPU matmul handles (darwin+cgo only).
+	// Typed as any to compile cross-platform; actual type is *metalLayerHandles.
+	metalHandles any
+
 	lastTokenTimings TokenTimings
 }
 
@@ -639,6 +643,7 @@ func (e *Engine) Close() {
 		e.gradTasks = nil
 	}
 	e.cleanupANEExecutors()
+	e.cleanupMetalMatmuls()
 	e.kvc = nil
 	e.cachedRopeCos = nil
 	e.cachedRopeSin = nil

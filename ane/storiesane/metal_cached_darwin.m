@@ -4,12 +4,15 @@
 #include <string.h>
 #include <stdint.h>
 
-// Cached Metal matmul handle — pre-creates weight buffer and MPS objects.
+// Cached Metal matmul handle — pre-creates all buffers and MPS objects.
 typedef struct {
-    void *wBuf;      // id<MTLBuffer>
+    void *wBuf;      // id<MTLBuffer> — weight buffer (pre-staged)
+    void *xBuf;      // id<MTLBuffer> — input buffer (reused)
+    void *oBuf;      // id<MTLBuffer> — output buffer (reused)
     void *wMat;      // MPSMatrix*
+    void *xMat;      // MPSMatrix*
+    void *oMat;      // MPSMatrix*
     void *mm;        // MPSMatrixMultiplication*
-    void *wDesc;     // MPSMatrixDescriptor*
     int outDim;
     int inDim;
 } MetalMatmulHandle;
@@ -46,40 +49,12 @@ MetalMatmulHandle* metalCachedCreate(const float *weights, int outDim, int inDim
                                                                           dataType:MPSDataTypeFloat32];
         MPSMatrix *wMat = [[MPSMatrix alloc] initWithBuffer:wBuf descriptor:wDesc];
 
-        MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:_cmtlDevice
-                                                                       transposeLeft:NO
-                                                                      transposeRight:NO
-                                                                          resultRows:outDim
-                                                                       resultColumns:1
-                                                                     interiorColumns:inDim
-                                                                               alpha:1.0
-                                                                                beta:0.0];
-
-        MetalMatmulHandle *h = (MetalMatmulHandle *)calloc(1, sizeof(MetalMatmulHandle));
-        h->wBuf = (__bridge_retained void *)wBuf;
-        h->wMat = (__bridge_retained void *)wMat;
-        h->mm = (__bridge_retained void *)mm;
-        h->wDesc = (__bridge_retained void *)wDesc;
-        h->outDim = outDim;
-        h->inDim = inDim;
-        return h;
-    }
-}
-
-// Execute cached matmul: out = weights @ x (weights pre-staged on GPU).
-int metalCachedExec(MetalMatmulHandle *h, float *out, const float *x) {
-    @autoreleasepool {
-        if (h == NULL || _cmtlDevice == nil || _cmtlQueue == nil) return -1;
-
-        int outDim = h->outDim;
-        int inDim = h->inDim;
+        // Pre-create input/output buffers (reused across calls).
         size_t xBytes = (size_t)inDim * sizeof(float);
         size_t oBytes = (size_t)outDim * sizeof(float);
-
-        // Create small input/output buffers (these are tiny, fast to create).
-        id<MTLBuffer> xBuf = [_cmtlDevice newBufferWithBytes:x length:xBytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf = [_cmtlDevice newBufferWithLength:xBytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> oBuf = [_cmtlDevice newBufferWithLength:oBytes options:MTLResourceStorageModeShared];
-        if (xBuf == nil || oBuf == nil) return -1;
+        if (xBuf == nil || oBuf == nil) return NULL;
 
         MPSMatrixDescriptor *xDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:inDim
                                                                            columns:1
@@ -92,15 +67,56 @@ int metalCachedExec(MetalMatmulHandle *h, float *out, const float *x) {
         MPSMatrix *xMat = [[MPSMatrix alloc] initWithBuffer:xBuf descriptor:xDesc];
         MPSMatrix *oMat = [[MPSMatrix alloc] initWithBuffer:oBuf descriptor:oDesc];
 
+        MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:_cmtlDevice
+                                                                       transposeLeft:NO
+                                                                      transposeRight:NO
+                                                                          resultRows:outDim
+                                                                       resultColumns:1
+                                                                     interiorColumns:inDim
+                                                                               alpha:1.0
+                                                                                beta:0.0];
+
+        MetalMatmulHandle *h = (MetalMatmulHandle *)calloc(1, sizeof(MetalMatmulHandle));
+        h->wBuf = (__bridge_retained void *)wBuf;
+        h->xBuf = (__bridge_retained void *)xBuf;
+        h->oBuf = (__bridge_retained void *)oBuf;
+        h->wMat = (__bridge_retained void *)wMat;
+        h->xMat = (__bridge_retained void *)xMat;
+        h->oMat = (__bridge_retained void *)oMat;
+        h->mm = (__bridge_retained void *)mm;
+        h->outDim = outDim;
+        h->inDim = inDim;
+        return h;
+    }
+}
+
+// Execute cached matmul: out = weights @ x (all buffers pre-staged).
+int metalCachedExec(MetalMatmulHandle *h, float *out, const float *x) {
+    @autoreleasepool {
+        if (h == NULL || _cmtlDevice == nil || _cmtlQueue == nil) return -1;
+
+        int inDim = h->inDim;
+        int outDim = h->outDim;
+
+        // Copy input to pre-staged GPU buffer.
+        id<MTLBuffer> xBuf = (__bridge id<MTLBuffer>)h->xBuf;
+        memcpy(xBuf.contents, x, (size_t)inDim * sizeof(float));
+
+        // Encode and execute.
         id<MTLCommandBuffer> cmdBuf = [_cmtlQueue commandBuffer];
         MPSMatrixMultiplication *mm = (__bridge MPSMatrixMultiplication *)h->mm;
         MPSMatrix *wMat = (__bridge MPSMatrix *)h->wMat;
+        MPSMatrix *xMat = (__bridge MPSMatrix *)h->xMat;
+        MPSMatrix *oMat = (__bridge MPSMatrix *)h->oMat;
         [mm encodeToCommandBuffer:cmdBuf leftMatrix:wMat rightMatrix:xMat resultMatrix:oMat];
         [cmdBuf commit];
         [cmdBuf waitUntilCompleted];
 
         if (cmdBuf.error != nil) return -1;
-        memcpy(out, oBuf.contents, oBytes);
+
+        // Copy output from GPU buffer.
+        id<MTLBuffer> oBuf = (__bridge id<MTLBuffer>)h->oBuf;
+        memcpy(out, oBuf.contents, (size_t)outDim * sizeof(float));
         return 0;
     }
 }
