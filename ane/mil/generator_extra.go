@@ -88,7 +88,9 @@ func GenFinalRMSNorm(dim, seq int) string {
 			"        tensor<fp16, [1,1,1,%d]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];\n"+
 			"        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n"+
 			"        tensor<fp16, [1,1,1,%d]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];\n"+
-			"        tensor<fp16, [1,1,1,%d]> rrms = rsqrt(x=ss3)[name=string(\"rrms\")];\n"+
+			"        tensor<fp16, [1,1,1,%d]> rrms_sqrt = sqrt(x=ss3)[name=string(\"rrms_sqrt\")];\n"+
+			"        fp16 one = const()[name=string(\"one\"), val=fp16(1.0)];\n"+
+			"        tensor<fp16, [1,1,1,%d]> rrms = real_div(x=one,y=rrms_sqrt)[name=string(\"rrms\")];\n"+
 			"        tensor<fp16, [1,%d,1,%d]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];\n"+
 			"        tensor<fp16, [1,%d,1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_w.bin\"), offset=uint64(64)))];\n"+
 			"        tensor<fp16, [1,%d,1,%d]> out = mul(x=xr,y=rw)[name=string(\"out\")];\n"+
@@ -96,6 +98,7 @@ func GenFinalRMSNorm(dim, seq int) string {
 			"}\n",
 		dim, seq,
 		dim, seq,
+		seq,
 		seq,
 		invd,
 		seq,
@@ -122,7 +125,9 @@ func GenFinalRMSNormDynamic(dim, seq int) string {
 			"        tensor<fp16, [1,1,1,%d]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];\n"+
 			"        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n"+
 			"        tensor<fp16, [1,1,1,%d]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];\n"+
-			"        tensor<fp16, [1,1,1,%d]> rrms = rsqrt(x=ss3)[name=string(\"rrms\")];\n"+
+			"        tensor<fp16, [1,1,1,%d]> rrms_sqrt = sqrt(x=ss3)[name=string(\"rrms_sqrt\")];\n"+
+			"        fp16 one_b = const()[name=string(\"one_b\"), val=fp16(1.0)];\n"+
+			"        tensor<fp16, [1,1,1,%d]> rrms = real_div(x=one_b,y=rrms_sqrt)[name=string(\"rrms\")];\n"+
 			"        tensor<fp16, [1,%d,1,%d]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];\n"+
 			"        tensor<fp16, [1,%d,1,%d]> out = mul(x=xr,y=rw)[name=string(\"out\")];\n"+
 			"    } -> (out);\n"+
@@ -131,6 +136,7 @@ func GenFinalRMSNormDynamic(dim, seq int) string {
 		dim, seq,
 		seq,
 		invd,
+		seq,
 		seq,
 		seq,
 		seq,
