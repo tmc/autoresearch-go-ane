@@ -181,6 +181,17 @@ func accumLinearGrad3CFAccelerate(dW1, dy1, dW2, dy2, dW3, dy3, x []float32, out
 	return true
 }
 
+// --- residual blending (saxpy) ---
+
+// scaleAddAccel computes out[i] += scale * src[i] for i in [0, n).
+func scaleAddAccel(out, src []float32, scale float32, n int) bool {
+	if n <= 0 || len(out) < n || len(src) < n {
+		return false
+	}
+	accelerate.Cblas_saxpy(n, scale, src, 1, out, 1)
+	return true
+}
+
 // --- linearCF BLAS ---
 
 func linearCFAccelerate(out, weights, in []float32, outCh, inCh, seq int) bool {
