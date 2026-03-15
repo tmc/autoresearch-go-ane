@@ -839,10 +839,17 @@ func (e *Engine) ensureInferLayers() error {
 		e.inferLayerInitErr = fmt.Errorf("ane layer forward is disabled")
 		return e.inferLayerInitErr
 	}
+	cfg := e.cfg
 	layers, err := compileParallel(len(e.mw.Layers), func(i int) (*layerForward, error) {
+		// Try monolithic inference kernel first.
 		lf, err := compileStoriesLayerForwardInference(e.mw.Layers[i], e.seq)
-		if err != nil {
-			return nil, fmt.Errorf("storiesane eval logits: compile infer layer %d: %w", i, err)
+		if err == nil {
+			return lf, nil
+		}
+		// Fall back to tiled compilation for large models.
+		lf, tiledErr := compileStoriesLayerForwardTiled(cfg, e.mw.Layers[i], e.seq)
+		if tiledErr != nil {
+			return nil, fmt.Errorf("storiesane eval logits: compile infer layer %d: monolithic: %v, tiled: %w", i, err, tiledErr)
 		}
 		return lf, nil
 	}, func(lf *layerForward) {

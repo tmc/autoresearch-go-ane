@@ -47,6 +47,10 @@ type layerForward struct {
 	inferScaled   bool // Wo and W2 pre-scaled by layerResidualScale
 	attInputReady bool // Attention input already staged by previous layer
 
+	// Tiled forward path: each matmul is a separate dynamicmatmul.Executor.
+	tiled        *tiledExecutors
+	tiledScratch *tiledScratchBuffers
+
 	qkvOut []float32
 	attOut []float32
 	ffnOut []float32
@@ -199,6 +203,7 @@ func (lf *layerForward) close() {
 	closeKernel(lf.ffn)
 	closeKernel(lf.inferAtt)
 	closeKernel(lf.inferFFN)
+	lf.closeTiled()
 	lf.qkv = nil
 	lf.att = nil
 	lf.ffn = nil
@@ -213,6 +218,9 @@ func (lf *layerForward) close() {
 }
 
 func (lf *layerForward) run(out, x []float32) error {
+	if lf != nil && lf.tiled != nil {
+		return lf.runTiled(out, x)
+	}
 	if lf != nil && lf.dynamic {
 		return lf.runDynamicInferenceOnly(out, x)
 	}
