@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/tmc/autoresearch-go-ane/ane/dynamicmatmul"
 	"github.com/tmc/autoresearch-go-ane/ane/stories"
 )
 
@@ -167,6 +168,15 @@ type Engine struct {
 	fusedQKVFP16  [][]uint16  // per-layer fused QKV in fp16
 	fusedW1W3FP16 [][]uint16  // per-layer fused W1+W3 in fp16
 	fp16Scratch   []float32   // scratch buffer for largest weight matrix (fp16→fp32)
+
+	// ANE executors for single-token KV-cached inference.
+	// Compiled with batch=1 for EvalNextToken.
+	aneQKV   []*dynamicmatmul.Executor // per-layer fused QKV [dim → qDim+2*kvDim]
+	aneWo    []*dynamicmatmul.Executor // per-layer Wo [qDim → dim]
+	aneW1W3  []*dynamicmatmul.Executor // per-layer fused W1+W3 [dim → 2*hidden]
+	aneW2    []*dynamicmatmul.Executor // per-layer W2 [hidden → dim]
+	aneCls   *dynamicmatmul.Executor   // classifier [dim → vocab]
+	aneReady bool
 
 	lastTokenTimings TokenTimings
 }
@@ -624,6 +634,7 @@ func (e *Engine) Close() {
 		e.gradTasks.Close()
 		e.gradTasks = nil
 	}
+	e.cleanupANEExecutors()
 	e.kvc = nil
 	e.cachedRopeCos = nil
 	e.cachedRopeSin = nil

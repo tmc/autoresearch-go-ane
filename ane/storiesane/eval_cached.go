@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/tmc/autoresearch-go-ane/ane/dynamicmatmul"
 )
 
 // TokenTimings holds per-token timing breakdown for EvalNextToken.
@@ -91,6 +93,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		e.cacheH1H3 = make([]float32, 2*hidden)
 		// Pre-build fused weight matrices to avoid cold-start overhead.
 		e.ensureFusedWeights()
+		// Note: ANE dispatch overhead (~20ms/kernel) makes batch=1 ANE slower
+		// than CPU BLAS. ANE is only beneficial at batch>=32 or with fused
+		// multi-layer kernels. Keep CPU BLAS for single-token path.
 	}
 
 	// Lazily allocate fp16 scratch and fused fp16 weight arrays.
@@ -138,6 +143,8 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 	tLayerStart := time.Now()
 	for li := range e.mw.Layers {
 		layer := e.mw.Layers[li]
+
+		// --- CPU BLAS path (ANE dispatch overhead too high for batch=1) ---
 
 		// Attention sub-block: RMSNorm → Q,K,V → RoPE → cache → attention → Wo → residual
 		tRMS := time.Now()
@@ -281,7 +288,6 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 	timings.RMSNorm += time.Since(tRMS)
 
 	// Classifier: logits = Embed @ xNorm where Embed is [vocab, dim] row-major.
-	// Always use fp32 embedding — too large to convert per token (~1.5GB for 151K vocab).
 	tCls := time.Now()
 	linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
 	timings.Classifier = time.Since(tCls)
@@ -327,6 +333,139 @@ func (e *Engine) ensureFusedWeights() {
 			e.fusedW1W3[li] = fused
 		}
 	}
+}
+
+// ensureANEExecutors compiles and primes ANE executors for single-token inference.
+func (e *Engine) ensureANEExecutors() bool {
+	if e.aneReady {
+		return true
+	}
+	if !e.useANE {
+		return false
+	}
+
+	cfg := e.cfg
+	dim := cfg.Dim
+	qDim := cfg.QDim()
+	kvDim := cfg.KVDim()
+	hidden := cfg.Hidden
+	vocab := cfg.Vocab
+
+	opts := dynamicmatmul.Options{}
+
+	e.aneQKV = make([]*dynamicmatmul.Executor, cfg.NLayers)
+	e.aneWo = make([]*dynamicmatmul.Executor, cfg.NLayers)
+	e.aneW1W3 = make([]*dynamicmatmul.Executor, cfg.NLayers)
+	e.aneW2 = make([]*dynamicmatmul.Executor, cfg.NLayers)
+
+	for li := range e.mw.Layers {
+		layer := e.mw.Layers[li]
+		var err error
+
+		// Fused QKV: [dim → qDim+2*kvDim]
+		e.aneQKV[li], err = dynamicmatmul.New(1, dim, qDim+2*kvDim, opts)
+		if err != nil {
+			e.cleanupANEExecutors()
+			return false
+		}
+		fusedQKV := make([]float32, (qDim+2*kvDim)*dim)
+		copy(fusedQKV[0:], layer.Wq)
+		copy(fusedQKV[qDim*dim:], layer.Wk)
+		copy(fusedQKV[(qDim+kvDim)*dim:], layer.Wv)
+		fusedQKVT := transposeWeights(fusedQKV, qDim+2*kvDim, dim)
+		if err := e.aneQKV[li].PrimeWeightsIO(fusedQKVT); err != nil {
+			e.cleanupANEExecutors()
+			return false
+		}
+
+		// Wo: [qDim → dim]
+		e.aneWo[li], err = dynamicmatmul.New(1, qDim, dim, opts)
+		if err != nil {
+			e.cleanupANEExecutors()
+			return false
+		}
+		woT := transposeWeights(layer.Wo, dim, qDim)
+		if err := e.aneWo[li].PrimeWeightsIO(woT); err != nil {
+			e.cleanupANEExecutors()
+			return false
+		}
+
+		// Fused W1+W3: [dim → 2*hidden]
+		e.aneW1W3[li], err = dynamicmatmul.New(1, dim, 2*hidden, opts)
+		if err != nil {
+			e.cleanupANEExecutors()
+			return false
+		}
+		fusedW1W3 := make([]float32, 2*hidden*dim)
+		copy(fusedW1W3[0:], layer.W1)
+		copy(fusedW1W3[hidden*dim:], layer.W3)
+		fusedW1W3T := transposeWeights(fusedW1W3, 2*hidden, dim)
+		if err := e.aneW1W3[li].PrimeWeightsIO(fusedW1W3T); err != nil {
+			e.cleanupANEExecutors()
+			return false
+		}
+
+		// W2: [hidden → dim]
+		e.aneW2[li], err = dynamicmatmul.New(1, hidden, dim, opts)
+		if err != nil {
+			e.cleanupANEExecutors()
+			return false
+		}
+		w2T := transposeWeights(layer.W2, dim, hidden)
+		if err := e.aneW2[li].PrimeWeightsIO(w2T); err != nil {
+			e.cleanupANEExecutors()
+			return false
+		}
+	}
+
+	// Classifier: [dim → vocab]
+	var err error
+	e.aneCls, err = dynamicmatmul.New(1, dim, vocab, opts)
+	if err != nil {
+		// Classifier may be too large for ANE — fall back to CPU for it.
+		e.aneCls = nil
+	} else {
+		embedT := transposeWeights(e.mw.Embed, vocab, dim)
+		if err := e.aneCls.PrimeWeightsIO(embedT); err != nil {
+			e.aneCls.Close()
+			e.aneCls = nil
+		}
+	}
+
+	e.aneReady = true
+	return true
+}
+
+func (e *Engine) cleanupANEExecutors() {
+	for _, ex := range e.aneQKV {
+		if ex != nil {
+			ex.Close()
+		}
+	}
+	e.aneQKV = nil
+	for _, ex := range e.aneWo {
+		if ex != nil {
+			ex.Close()
+		}
+	}
+	e.aneWo = nil
+	for _, ex := range e.aneW1W3 {
+		if ex != nil {
+			ex.Close()
+		}
+	}
+	e.aneW1W3 = nil
+	for _, ex := range e.aneW2 {
+		if ex != nil {
+			ex.Close()
+		}
+	}
+	e.aneW2 = nil
+	if e.aneCls != nil {
+		e.aneCls.Close()
+		e.aneCls = nil
+	}
+	e.aneReady = false
 }
 
 // EvalPrefill processes a full prompt through EvalNextToken, populating the

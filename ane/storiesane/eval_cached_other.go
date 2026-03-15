@@ -40,3 +40,5 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 func (e *Engine) EvalPrefill(tokens []int32) ([]float32, error) {
 	return nil, fmt.Errorf("storiesane eval prefill: unavailable on this platform")
 }
+
+func (e *Engine) cleanupANEExecutors() {}
