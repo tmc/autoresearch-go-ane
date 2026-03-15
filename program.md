@@ -124,11 +124,11 @@ The `-count 6` flag runs each benchmark 6 times for meaningful statistics. Use `
 
 ## Ensue integration
 
-The ensue.dev coordinator (`scripts/coordinator.py`) provides persistent memory across sessions for tracking experiments, insights, and the current best configuration.
+The ensue.dev coordinator (`scripts/coordinator.py`) provides persistent memory across sessions for tracking experiments, insights, hypotheses, and the current best configuration. In collaborative mode (see `collab.md`), it also provides work claiming, swarm analysis, and per-agent/per-tier bests.
 
-**Key commands**:
+**Solo commands** (always available):
 ```bash
-# Review all prior work
+# Review prior work (local summary)
 python3 scripts/coordinator.py analyze
 
 # Check if an idea was already tried
@@ -146,8 +146,35 @@ python3 scripts/coordinator.py publish_hypothesis '<title>' '<hypothesis>' [prio
 # See current best
 python3 scripts/coordinator.py pull_best
 
-# Semantic search over all data
-python3 scripts/coordinator.py ask '<query>'
+# Semantic search over results and insights
+python3 scripts/coordinator.py ask '<query>' [namespace]
+```
+
+**Collaborative commands** (when running with other agents, see `collab.md`):
+```bash
+# Join the shared hub
+python3 scripts/coordinator.py join_hub
+
+# Print startup banner with swarm state
+python3 scripts/coordinator.py announce
+
+# Claim an experiment before starting (prevents duplicates)
+python3 scripts/coordinator.py claim '<description>'
+
+# Full swarm analysis (global best, per-agent, per-tier, claims, hypotheses)
+python3 scripts/coordinator.py analyze_swarm
+
+# Browse namespaces (results, claims, insights, hypotheses)
+python3 scripts/coordinator.py list_namespace '<namespace>'
+
+# Search insights by topic
+python3 scripts/coordinator.py get_swarm_insights '<topic>'
+
+# Get unclaimed hypotheses from other agents
+python3 scripts/coordinator.py get_unclaimed_hypotheses
+
+# Pull best config for your chip tier (falls back to global best)
+python3 scripts/coordinator.py pull_best_for_tier [tier]
 ```
 
 The `scripts/parse_bench.py` script converts raw Go benchmark output to JSON:
@@ -200,6 +227,7 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar15`).
 LOOP FOREVER:
 
 0. Check if idea was already tried: `python3 scripts/coordinator.py check_tried '<idea>'`
+0b. (Collaborative mode) Claim the experiment: `python3 scripts/coordinator.py claim '<description>'`. If claim fails, pick another idea (up to 5 tries).
 1. Edit files with an experimental idea (see editable files above).
 2. Verify correctness: `go test -run TestInferenceCorrectness`
 3. Verify it compiles: `go test -c -o /dev/null .`
@@ -228,7 +256,7 @@ LOOP FOREVER:
 
 **Crashes**: Use your judgment. If it's a dumb mistake (e.g. a constant out of range), fix it. If the idea itself is broken (e.g. tiled layer size too large for ANE), skip it and move on.
 
-**NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep or away from the computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the editable files for new angles, try combining previous near-misses, try more radical changes. Check ensue for insights and hypotheses: `python3 scripts/coordinator.py analyze`. The loop runs until the human interrupts you, period.
+**NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep or away from the computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the editable files for new angles, try combining previous near-misses, try more radical changes. Check ensue for insights and hypotheses: `python3 scripts/coordinator.py analyze` (solo) or `python3 scripts/coordinator.py analyze_swarm` (collaborative). The loop runs until the human interrupts you, period.
 
 As a use case: the user might leave you running while they sleep. If each experiment takes ~2-3 minutes then you can run 20-30 per hour, for a total of about 150-200 over a night. The user wakes up to experimental results, all completed by you while they slept.
 
