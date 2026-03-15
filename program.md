@@ -6,7 +6,7 @@ This is an experiment to have the LLM do its own ML research, optimizing inferen
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar14`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar15`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main.
 3. **Read the in-scope files**: Read these files for full context:
    - `experiment.go` — primary experiment file. Inference config, dispatch strategy, tuning knobs.
@@ -21,7 +21,7 @@ To set up a new experiment, work with the user to:
    - `ane/kvcache.go` — KV cache for incremental generation. Editable.
    - `ane/layer_tiled_darwin.go` — Tiled ANE layer forward for large models. Editable.
    - `ane/storiesane/metal_gemv_darwin.go` — Custom Metal compute shader for fp16 matvec. Editable.
-4. **Verify model exists**: Check that a model `.bin` file is available (e.g. `qwen3-0.6b.bin`). If not, tell the human to run `python3 scripts/convert_hf.py Qwen/Qwen3-0.6B --output qwen3-0.6b.bin`.
+4. **Verify model exists**: Check that a model `.bin` file is available (e.g. `stories110M.bin` or `qwen3-0.6b.bin`). If not, run `bash scripts/setup.sh` or `python3 scripts/convert_hf.py Qwen/Qwen3-0.6B --output qwen3-0.6b.bin`.
 5. **Install benchstat**: `go install golang.org/x/perf/cmd/benchstat@latest`
 6. **Build bench-note**: `go build -o bench-note ./cmd/bench-note/`
 7. **Verify ensue connectivity**: `python3 scripts/coordinator.py analyze`
@@ -140,8 +140,14 @@ python3 scripts/coordinator.py publish_result '<desc>' '<bench_json>' '<git_diff
 # Post a research insight
 python3 scripts/coordinator.py post_insight '<learning>'
 
+# Publish a hypothesis for future experiments
+python3 scripts/coordinator.py publish_hypothesis '<title>' '<hypothesis>' [priority]
+
 # See current best
 python3 scripts/coordinator.py pull_best
+
+# Semantic search over all data
+python3 scripts/coordinator.py ask '<query>'
 ```
 
 The `scripts/parse_bench.py` script converts raw Go benchmark output to JSON:
@@ -189,7 +195,7 @@ NOTE: do not commit `results.tsv` — leave it untracked by git.
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar14`).
+The experiment runs on a dedicated branch (e.g. `autoresearch/mar15`).
 
 LOOP FOREVER:
 
@@ -214,8 +220,9 @@ LOOP FOREVER:
    - If it's something easy to fix (typo, bad constant), fix and re-run.
    - If the idea is fundamentally broken, `git reset --hard HEAD~1`, log `crash`, move on.
    - Publish to ensue: `python3 scripts/coordinator.py publish_result '<desc>' '{"error":"<reason>"}' '' crash`
-10. Periodically post insights: `python3 scripts/coordinator.py post_insight '<learning>'`
-11. Go to step 0.
+10. Post an insight after every experiment: `python3 scripts/coordinator.py post_insight '<learning>'`
+11. Publish a hypothesis for the next experiment: `python3 scripts/coordinator.py publish_hypothesis '<title>' '<hypothesis>'`
+12. Go to step 0.
 
 **Timeout**: Each benchmark run should take ~1-2 minutes. If a run exceeds 5 minutes, kill it and treat it as a failure.
 
@@ -232,6 +239,7 @@ As a use case: the user might leave you running while they sleep. If each experi
 #### Constants
 - `UseMetal` — enable Metal GPU matmul for large layers
 - `UseBNNS` — enable BNNS fp16-weight GEMV
+- `UseANE` — enable Apple Neural Engine acceleration
 - `TileSize` — tile dimensions for tiled ANE layers
 - `PreallocBuffers` — pre-allocate scratch buffers at init
 
