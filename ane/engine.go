@@ -1029,9 +1029,16 @@ func (e *Engine) evalLogitsCPUInto(tokens []int32, logits []float32) error {
 		}()
 		linearCF(qf, layer.Wq, xNorm, qDim, dim, e.seq)
 		wkwg.Wait()
+		// Run Wv concurrently with RoPE (Wv doesn't need RoPE).
+		var wvwg sync.WaitGroup
+		wvwg.Add(1)
+		go func() {
+			linearCF(vf, layer.Wv, xNorm, kvDim, dim, e.seq)
+			wvwg.Done()
+		}()
 		applyRoPECFInPlace(qf, heads, headDim, e.seq, e.ropeCos, e.ropeSin)
 		applyRoPECFInPlace(kf, kvHeads, headDim, e.seq, e.ropeCos, e.ropeSin)
-		linearCF(vf, layer.Wv, xNorm, kvDim, dim, e.seq)
+		wvwg.Wait()
 		gqaCausalAttentionCF(attOut, qf, kf, vf, heads, kvHeads, headDim, e.seq)
 		linearCF(x2, layer.Wo, attOut, dim, qDim, e.seq)
 		addScaledResidual(x2, cur, x2)
