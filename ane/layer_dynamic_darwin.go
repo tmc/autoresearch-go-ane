@@ -4,6 +4,7 @@ package ane
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"unsafe"
 
@@ -55,7 +56,7 @@ func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build mask blob: %w", err)
 	}
-	ropeCosBlob, ropeSinBlob, err := mil.BuildRoPECosSinBlobs(seq, dim/heads)
+	ropeCosBlob, ropeSinBlob, err := buildRoPEBlobsLocal(seq, dim/heads)
 	if err != nil {
 		return nil, fmt.Errorf("build rope blobs: %w", err)
 	}
@@ -752,4 +753,42 @@ func writeTransposedMatrixFP16(data []uint16, layout xane.TensorLayout, channelO
 
 func iosurfaceRef(ref coregraphics.IOSurfaceRef) appleiosurface.IOSurfaceRef {
 	return appleiosurface.IOSurfaceRef(ref)
+}
+
+// ropeTheta is the base frequency for RoPE. Nanochat uses 100000.
+const ropeTheta = 100000.0
+
+// buildRoPEBlobsLocal builds fp16 RoPE cos/sin blobs using our local theta.
+func buildRoPEBlobsLocal(seq, headDim int) ([]byte, []byte, error) {
+	if seq <= 0 {
+		return nil, nil, fmt.Errorf("seq=%d must be > 0", seq)
+	}
+	if headDim <= 0 || headDim%2 != 0 {
+		return nil, nil, fmt.Errorf("headDim=%d must be even and > 0", headDim)
+	}
+	half := headDim / 2
+	cosTbl := make([]float32, seq*headDim)
+	sinTbl := make([]float32, seq*headDim)
+	for pos := 0; pos < seq; pos++ {
+		row := pos * headDim
+		for i := 0; i < half; i++ {
+			freq := float64(pos) / math.Pow(ropeTheta, float64(2*i)/float64(headDim))
+			c := float32(math.Cos(freq))
+			s := float32(math.Sin(freq))
+			even := row + 2*i
+			cosTbl[even] = c
+			cosTbl[even+1] = c
+			sinTbl[even] = s
+			sinTbl[even+1] = s
+		}
+	}
+	cosBlob, err := mil.BuildFP16Blob(cosTbl)
+	if err != nil {
+		return nil, nil, err
+	}
+	sinBlob, err := mil.BuildFP16Blob(sinTbl)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cosBlob, sinBlob, nil
 }
