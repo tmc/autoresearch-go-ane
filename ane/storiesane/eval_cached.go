@@ -68,6 +68,7 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 	vocab := cfg.Vocab
 
 	useFP16 := e.mw.FP16Layers != nil
+	useInt8 := e.mw.Int8Layers != nil
 
 	// Lazily allocate the KV cache and scratch buffers.
 	if e.kvc == nil {
@@ -146,7 +147,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// Attention sub-block: RMSNorm → Q,K,V → RoPE → cache → attention → Wo → residual
 		tRMS := time.Now()
-		if useFP16 {
+		if useInt8 {
+			rmsNormSingle(e.cacheXNorm, cur, e.mw.Int8Layers[li].RMSAtt, dim)
+		} else if useFP16 {
 			rmsNormSingle(e.cacheXNorm, cur, e.mw.FP16Layers[li].RMSAtt, dim)
 		} else {
 			rmsNormSingle(e.cacheXNorm, cur, layer.RMSAtt, dim)
@@ -155,7 +158,12 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// Separate Q, K, V matmuls — avoids 15GB fused weight allocation for large models.
 		tQKV := time.Now()
-		if useFP16 {
+		if useInt8 {
+			i8L := e.mw.Int8Layers[li]
+			linearSingleInt8(e.cacheQKV[:qDim], i8L.Wq.Data, i8L.Wq.Scales, e.cacheXNorm, qDim, dim)
+			linearSingleInt8(e.cacheQKV[qDim:qDim+kvDim], i8L.Wk.Data, i8L.Wk.Scales, e.cacheXNorm, kvDim, dim)
+			linearSingleInt8(e.cacheQKV[qDim+kvDim:qDim+2*kvDim], i8L.Wv.Data, i8L.Wv.Scales, e.cacheXNorm, kvDim, dim)
+		} else if useFP16 {
 			fp16L := e.mw.FP16Layers[li]
 			linearSingleFP16Weights(e.cacheQKV[:qDim], fp16L.Wq, e.cacheXNorm, qDim, dim)
 			linearSingleFP16Weights(e.cacheQKV[qDim:qDim+kvDim], fp16L.Wk, e.cacheXNorm, kvDim, dim)
@@ -189,7 +197,10 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// Wo projection: [dim, qDim] @ attOut[qDim] → x2[dim]
 		tWo := time.Now()
-		if useFP16 {
+		if useInt8 {
+			i8L := e.mw.Int8Layers[li]
+			linearSingleInt8(e.cacheX2, i8L.Wo.Data, i8L.Wo.Scales, e.cacheAttOut, dim, qDim)
+		} else if useFP16 {
 			linearSingleFP16Weights(e.cacheX2, e.mw.FP16Layers[li].Wo, e.cacheAttOut, dim, qDim)
 		} else {
 			linearSingle(e.cacheX2, layer.Wo, e.cacheAttOut, dim, qDim)
@@ -203,7 +214,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// FFN sub-block: RMSNorm → W1+W3 fused → SiLU → W2 → residual
 		tRMS = time.Now()
-		if useFP16 {
+		if useInt8 {
+			rmsNormSingle(e.cacheXNorm, e.cacheX2, e.mw.Int8Layers[li].RMSFFN, dim)
+		} else if useFP16 {
 			rmsNormSingle(e.cacheXNorm, e.cacheX2, e.mw.FP16Layers[li].RMSFFN, dim)
 		} else {
 			rmsNormSingle(e.cacheXNorm, e.cacheX2, layer.RMSFFN, dim)
@@ -212,7 +225,13 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 
 		// Separate W1, W3 matmuls — avoids fused weight allocation.
 		tFFN := time.Now()
-		if useFP16 {
+		if useInt8 {
+			i8L := e.mw.Int8Layers[li]
+			linearSingleInt8(e.cacheH1H3[:hidden], i8L.W1.Data, i8L.W1.Scales, e.cacheXNorm, hidden, dim)
+			linearSingleInt8(e.cacheH1H3[hidden:], i8L.W3.Data, i8L.W3.Scales, e.cacheXNorm, hidden, dim)
+			siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
+			linearSingleInt8(e.cacheFFOut, i8L.W2.Data, i8L.W2.Scales, e.cacheGate, dim, hidden)
+		} else if useFP16 {
 			fp16L := e.mw.FP16Layers[li]
 			linearSingleFP16Weights(e.cacheH1H3[:hidden], fp16L.W1, e.cacheXNorm, hidden, dim)
 			linearSingleFP16Weights(e.cacheH1H3[hidden:], fp16L.W3, e.cacheXNorm, hidden, dim)

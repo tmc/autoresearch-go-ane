@@ -29,6 +29,11 @@ type ModelWeights struct {
 	// When non-nil, these are used instead of the fp32 Layers for matmuls.
 	FP16Layers []LayerWeightsFP16
 	EmbedFP16  []uint16 // [vocab*dim] fp16
+
+	// Int8 compressed weights for memory-bandwidth-bound inference.
+	// When non-nil, these are used instead of fp32 Layers for matmuls.
+	// Uses symmetric per-row quantization: w_fp32 = w_int8 * scale.
+	Int8Layers []LayerWeightsInt8
 }
 
 // LayerWeightsFP16 holds per-layer weight matrices in fp16 (uint16).
@@ -37,6 +42,24 @@ type LayerWeightsFP16 struct {
 	Wq, Wk, Wv, Wo []uint16
 	W1, W2, W3     []uint16
 	RMSAtt, RMSFFN []float32 // kept in fp32 (tiny)
+}
+
+// QuantizedMatrix holds per-row symmetric int8 quantized weights.
+// Dequantization: w_fp32 = w_int8 * scale (per-row).
+type QuantizedMatrix struct {
+	Data   []int8    // [OutDim * InDim] row-major
+	Scales []float32 // [OutDim] per-row scale
+	Zeros  []float32 // [OutDim] per-row zero point (0 for symmetric)
+	OutDim int
+	InDim  int
+}
+
+// LayerWeightsInt8 holds per-layer int8 quantized weight matrices.
+// RMS norm weights remain in fp32 since they are tiny.
+type LayerWeightsInt8 struct {
+	Wq, Wk, Wv, Wo QuantizedMatrix
+	W1, W2, W3     QuantizedMatrix
+	RMSAtt, RMSFFN []float32 // norms stay fp32
 }
 
 // NewModelWeights allocates weights for the legacy 110M model.
@@ -345,6 +368,69 @@ func (mw *ModelWeights) CompressToFP16() {
 		}
 	}
 	mw.EmbedFP16 = convertSliceToFP16(mw.Embed)
+}
+
+// CompressToInt8 populates Int8Layers from the fp32 Layers using symmetric
+// per-row quantization. This reduces weight memory by 4x compared to fp32.
+func (mw *ModelWeights) CompressToInt8() {
+	cfg := mw.Config
+	mw.Int8Layers = make([]LayerWeightsInt8, cfg.NLayers)
+	for i := range mw.Layers {
+		l := &mw.Layers[i]
+		mw.Int8Layers[i] = LayerWeightsInt8{
+			Wq:     quantizeMatrix(l.Wq, cfg.QDim(), cfg.Dim),
+			Wk:     quantizeMatrix(l.Wk, cfg.KVDim(), cfg.Dim),
+			Wv:     quantizeMatrix(l.Wv, cfg.KVDim(), cfg.Dim),
+			Wo:     quantizeMatrix(l.Wo, cfg.Dim, cfg.QDim()),
+			W1:     quantizeMatrix(l.W1, cfg.Hidden, cfg.Dim),
+			W2:     quantizeMatrix(l.W2, cfg.Dim, cfg.Hidden),
+			W3:     quantizeMatrix(l.W3, cfg.Hidden, cfg.Dim),
+			RMSAtt: l.RMSAtt,
+			RMSFFN: l.RMSFFN,
+		}
+	}
+}
+
+func quantizeMatrix(w []float32, outDim, inDim int) QuantizedMatrix {
+	data := make([]int8, outDim*inDim)
+	scales := make([]float32, outDim)
+	zeros := make([]float32, outDim)
+	for o := 0; o < outDim; o++ {
+		row := w[o*inDim : (o+1)*inDim]
+		// Find min/max for the row.
+		minVal, maxVal := row[0], row[0]
+		for _, v := range row[1:] {
+			if v < minVal {
+				minVal = v
+			}
+			if v > maxVal {
+				maxVal = v
+			}
+		}
+		// Symmetric quantization: scale = max(|min|, |max|) / 127.
+		absMax := maxVal
+		if -minVal > absMax {
+			absMax = -minVal
+		}
+		if absMax == 0 {
+			absMax = 1e-10
+		}
+		scale := absMax / 127.0
+		scales[o] = scale
+		zeros[o] = 0 // symmetric: zero point is 0
+		invScale := 1.0 / scale
+		for d := 0; d < inDim; d++ {
+			v := row[d] * invScale
+			if v > 127 {
+				v = 127
+			}
+			if v < -128 {
+				v = -128
+			}
+			data[o*inDim+d] = int8(v)
+		}
+	}
+	return QuantizedMatrix{Data: data, Scales: scales, Zeros: zeros, OutDim: outDim, InDim: inDim}
 }
 
 func convertSliceToFP16(src []float32) []uint16 {

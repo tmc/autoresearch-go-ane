@@ -256,6 +256,10 @@ func Open(opts Options) (*Engine, error) {
 		mw.CompressToFP16()
 	}
 
+	// Int8 quantization: 24% faster in microbench but NEON can't compete with
+	// Accelerate AMX sgemv in the full pipeline. Disabled until AMX int8 path available.
+	// if weightBytes > 4*1024*1024*1024 { mw.CompressToInt8() }
+
 	var opt *stories.OptimState
 	var accum *modelGrad
 	if len(opts.Tokens) > 0 {

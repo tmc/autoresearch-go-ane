@@ -3,7 +3,7 @@
 package storiesane
 
 /*
-#cgo darwin CFLAGS: -Wno-deprecated-declarations
+#cgo darwin CFLAGS: -DACCELERATE_NEW_LAPACK -Wno-deprecated-declarations
 #cgo darwin LDFLAGS: -framework Accelerate
 #include <Accelerate/Accelerate.h>
 
