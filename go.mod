@@ -2,7 +2,9 @@ module github.com/tmc/autoresearch-go-ane
 
 go 1.25.2
 
-require github.com/tmc/apple v0.3.0
+require github.com/tmc/apple v0.3.2
+
+require golang.org/x/tools v0.43.0 // indirect
 
 require (
 	github.com/ebitengine/purego v0.10.0 // indirect
