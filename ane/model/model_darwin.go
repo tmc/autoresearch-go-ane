@@ -715,6 +715,16 @@ func copySurfaceRange(
 	srcAlloc := srcLayout.AllocSize()
 	dstBytes := unsafe.Slice((*byte)(dstBase), dstAlloc)
 	srcBytes := unsafe.Slice((*byte)(srcBase), srcAlloc)
+	// Fast path: if plane strides match, copy all channels at once.
+	if dstLayout.PlaneStride == srcLayout.PlaneStride && dstOffset == srcOffset {
+		dstOff := dstChannel*dstLayout.PlaneStride + dstOffset*dstLayout.ElemSize
+		srcOff := srcChannel*srcLayout.PlaneStride + srcOffset*srcLayout.ElemSize
+		totalBytes := channels * dstLayout.PlaneStride
+		if dstOff >= 0 && dstOff+totalBytes <= dstAlloc && srcOff >= 0 && srcOff+totalBytes <= srcAlloc {
+			copy(dstBytes[dstOff:dstOff+totalBytes], srcBytes[srcOff:srcOff+totalBytes])
+			return nil
+		}
+	}
 	for c := 0; c < channels; c++ {
 		dstOff := (dstChannel+c)*dstLayout.PlaneStride + dstOffset*dstLayout.ElemSize
 		srcOff := (srcChannel+c)*srcLayout.PlaneStride + srcOffset*srcLayout.ElemSize
