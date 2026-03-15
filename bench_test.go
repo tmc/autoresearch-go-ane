@@ -36,8 +36,6 @@ func TestMain(m *testing.M) {
 	}
 	fmt.Fprintf(os.Stderr, "loaded %d tokens\n", len(testTokens))
 
-	// Default to pretrained model (fast to load). Set MODEL=randinit to
-	// create a random-init checkpoint instead (slow: writes ~600MB).
 	modelPath := os.Getenv("MODEL")
 	if modelPath == "" {
 		modelPath = "stories110M.bin"
@@ -63,7 +61,6 @@ func TestMain(m *testing.M) {
 	testSampler, err = aneperf.NewSampler()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aneperf sampler: %v\n", err)
-		// Non-fatal: benchmarks still run, just without ANE metrics.
 	}
 
 	code := m.Run()
@@ -74,16 +71,17 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// BenchmarkStep measures training step throughput. Each iteration is one
-// gradient accumulation cycle (AccumSteps micro-batches). Reports:
-//   - tokens/s:  training throughput
-//   - loss:      final training loss of the last iteration
-//   - step_ms:   per-step wall time
-//   - ane_ms:    ANE eval time per step
-//   - adam_ms:   optimizer time per step
-//   - ane-watts, ane-compute-%, etc. from aneperf
+// BenchmarkStep measures one training step (AccumSteps micro-batches).
+//
+// Key metrics:
+//   - loss:       training loss
+//   - tok/s:      training throughput
+//   - step_ms:    wall time per step
+//   - ane_ms:     ANE forward eval time
+//   - adam_ms:    optimizer time
+//   - ane-watts:  ANE power draw
+//   - ane-compute-%: ANE utilization
 func BenchmarkStep(b *testing.B) {
-	// Warmup: first few steps have compilation overhead.
 	for range 3 {
 		if _, err := testEngine.Step(); err != nil {
 			b.Fatal(err)
@@ -93,7 +91,6 @@ func BenchmarkStep(b *testing.B) {
 	tokensPerStep := int64(SequenceLength) * int64(AccumSteps)
 	var lastRes ane.StepResult
 
-	b.SetBytes(tokensPerStep * 2) // uint16 tokens
 	b.ResetTimer()
 	for b.Loop() {
 		snap := startANESample()
@@ -106,24 +103,29 @@ func BenchmarkStep(b *testing.B) {
 	}
 	b.StopTimer()
 
+	stepSec := lastRes.StepDuration.Seconds()
+	if stepSec > 0 {
+		b.ReportMetric(float64(tokensPerStep)/stepSec, "tok/s")
+	}
 	b.ReportMetric(float64(lastRes.Loss), "loss")
 	b.ReportMetric(float64(lastRes.StepDuration.Milliseconds()), "step_ms")
 	b.ReportMetric(float64(lastRes.ANEEvalDuration.Milliseconds()), "ane_ms")
 	b.ReportMetric(float64(lastRes.AdamDuration.Milliseconds()), "adam_ms")
 }
 
-// BenchmarkEvalLogits measures single-window inference throughput. Reports:
-//   - tokens/s: inference throughput
-//   - ane-watts, ane-compute-%, etc. from aneperf
+// BenchmarkEvalLogits measures single-window inference speed.
+//
+// Key metrics:
+//   - tok/s:         inference throughput (256 tokens per call)
+//   - ane-watts:     ANE power draw
+//   - ane-compute-%: ANE utilization
 func BenchmarkEvalLogits(b *testing.B) {
 	window := testTokens[:evalSeqLen]
 
-	// Warmup.
 	if _, err := testEngine.EvalLogits(window); err != nil {
 		b.Fatal(err)
 	}
 
-	b.SetBytes(int64(evalSeqLen) * 2)
 	b.ResetTimer()
 	for b.Loop() {
 		snap := startANESample()
@@ -134,13 +136,13 @@ func BenchmarkEvalLogits(b *testing.B) {
 	}
 }
 
-// BenchmarkEvalLoss measures the full validation pass over evalTokens tokens.
-// Reports:
-//   - val_loss: cross-entropy in nats
-//   - windows:  number of eval windows processed
-//   - ane-watts, ane-compute-%, etc. from aneperf
+// BenchmarkEvalLoss measures the full validation pass.
+//
+// Key metrics:
+//   - val_loss:      cross-entropy in nats (THE optimization target)
+//   - ane-watts:     ANE power draw
+//   - ane-compute-%: ANE utilization
 func BenchmarkEvalLoss(b *testing.B) {
-	windows := (evalTokens - 1) / (evalSeqLen - 1)
 	for b.Loop() {
 		snap := startANESample()
 		loss, err := evalLoss(testEngine, testTokens)
@@ -150,10 +152,9 @@ func BenchmarkEvalLoss(b *testing.B) {
 		stopANESample(snap, b)
 		b.ReportMetric(loss, "val_loss")
 	}
-	b.ReportMetric(float64(windows), "windows")
 }
 
-// BenchmarkLRSchedule validates the LR schedule is cheap (no allocation, fast math).
+// BenchmarkLRSchedule validates the LR schedule is cheap.
 func BenchmarkLRSchedule(b *testing.B) {
 	var i int
 	for b.Loop() {

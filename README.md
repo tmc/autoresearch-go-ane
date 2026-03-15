@@ -59,10 +59,10 @@ ane/            — ANE training engine (agent can modify for deeper experiments
 
 | Benchmark | Key metrics |
 |---|---|
-| `BenchmarkStep` | training loss, step time, ANE eval time, optimizer time, ANE watts/compute |
-| `BenchmarkEvalLogits` | single-window inference throughput, ANE utilization |
-| `BenchmarkEvalLoss` | **val_loss** (the optimization target), ANE power |
-| `BenchmarkLRSchedule` | LR schedule computation overhead |
+| `BenchmarkStep` | `loss`, `tok/s`, `step_ms`, `ane_ms`, `adam_ms`, `ane-watts`, `ane-compute-%` |
+| `BenchmarkEvalLogits` | `ns/op` (inference latency), `ane-watts`, `ane-compute-%` |
+| `BenchmarkEvalLoss` | **`val_loss`** (the optimization target), `ane-watts`, `ane-compute-%` |
+| `BenchmarkLRSchedule` | `ns/op` (schedule overhead) |
 
 Compare experiments:
 
