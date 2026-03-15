@@ -45,8 +45,9 @@ type offload struct {
 	rmsBwd    *model.Kernel
 	rmsBwdIn  []float32
 	clsBwdTmp []float32
-	rmsW         []float32
-	rmsWExpanded []float32
+	rmsW             []float32
+	rmsWExpanded     []float32
+	rmsWeightsStaged bool
 
 	clsFwdTile int
 	clsBwdTile int
@@ -386,9 +387,12 @@ func (o *offload) runRMSForwardFromSurface(out []float32, src *model.Kernel, dim
 	if err := model.CopyOutputRangeToInput(o.rmsFwd, 0, 0, 0, src, 0, 0, 0, dim, seq); err != nil {
 		return err
 	}
-	// Write weights to input[1].
-	if err := writeRMSInput(o.rmsFwd, 1, o.rmsWExpanded); err != nil {
-		return err
+	// Write weights to input[1] only on first call (weights don't change during inference).
+	if !o.rmsWeightsStaged {
+		if err := writeRMSInput(o.rmsFwd, 1, o.rmsWExpanded); err != nil {
+			return err
+		}
+		o.rmsWeightsStaged = true
 	}
 	if err := evalKernelTracked(o.metrics, o.rmsFwd); err != nil {
 		return err
