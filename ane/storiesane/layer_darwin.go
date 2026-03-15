@@ -42,8 +42,9 @@ type layerForward struct {
 	attTaps  bool
 	ffnTaps  bool
 
-	rmsAtt []float32
-	rmsFFN []float32
+	rmsAtt      []float32
+	rmsFFN      []float32
+	inferScaled bool // Wo and W2 pre-scaled by layerResidualScale
 
 	qkvOut []float32
 	attOut []float32

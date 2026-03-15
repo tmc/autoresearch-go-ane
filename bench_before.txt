@@ -1,0 +1,13 @@
+loading tokens from tinystories_data00.bin...
+loaded 20658981 tokens
+opening engine with stories110M.bin...
+engine ready
+goos: darwin
+goarch: arm64
+pkg: github.com/tmc/autoresearch-go-ane
+cpu: Apple M5 Max
+BenchmarkEvalLogits-18    	       5	  22506008 ns/op	   0.02 MB/s
+BenchmarkEvalLogits-18    	       5	  22127600 ns/op	   0.02 MB/s
+BenchmarkEvalLogits-18    	       5	  22121300 ns/op	   0.02 MB/s
+PASS
+ok  	github.com/tmc/autoresearch-go-ane	1.435s

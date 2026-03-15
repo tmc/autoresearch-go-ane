@@ -1,0 +1,11 @@
+commit	val_loss	steps	train_secs	status	description
+9abba8b	14.214422	1438	300.1	ok	baseline
+9abba8b	12.781843	883	180.1	ok	baseline
+9abba8b	12.628560	426	120.2	ok	baseline
+9abba8b	12.494606	399	120.2	ok	baseline
+9abba8b	12.478863	389	120.1	ok	baseline
+9abba8b	12.710869	478	120.0	ok	baseline
+9abba8b	12.701246	476	120.0	ok	baseline
+008d56b	12.997822	1009	180.2	ok	baseline
+008d56b	13.340474	1057	180.1	ok	baseline
+9fabd63	12.683785	725	120.0	ok	baseline

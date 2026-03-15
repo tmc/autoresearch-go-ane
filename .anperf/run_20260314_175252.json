@@ -1,0 +1,41 @@
+{
+  "id": "run_20260314_175252",
+  "name": "9abba8b",
+  "timestamp": "2026-03-14T17:52:52.954112-07:00",
+  "chip": "Apple Silicon",
+  "git_commit": "9abba8b",
+  "params": {
+    "accum_steps": 4,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "grad_clip": 1,
+    "hybrid_backward": true,
+    "learning_rate": 0.0003,
+    "loss_scale": 256,
+    "seed": 42,
+    "seq_length": 256,
+    "use_ane": true,
+    "weight_decay": 0.01
+  },
+  "total_steps": 399,
+  "duration_secs": 155.7,
+  "avg_step_ms": 309.32,
+  "avg_ane_ms": 84.08,
+  "avg_cpu_ms": 221.55,
+  "avg_adam_ms": 7.36,
+  "avg_tokens_sec": 862,
+  "ane_utilization": 27.2,
+  "final_loss": 6.393622,
+  "components": {
+    "ANEEval": 84.082,
+    "Adam": 7.363,
+    "Compile": 3.684,
+    "DWGEMM": 199.205,
+    "DWWait": 7.176,
+    "EmbedGrad": 36.531,
+    "FinalHead": 100.113,
+    "RMSDW": 8.649,
+    "StartupCompile": 3.684,
+    "WeightRefresh": 0
+  }
+}
