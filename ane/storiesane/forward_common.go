@@ -33,6 +33,9 @@ func causalAttentionCF(out, qf, kf, vf []float32, heads, headDim, seq int) {
 }
 
 func linearCF(out, weights, in []float32, outCh, inCh, seq int) {
+	if linearCFAccelerate(out, weights, in, outCh, inCh, seq) {
+		return
+	}
 	for o := 0; o < outCh; o++ {
 		row := weights[o*inCh : (o+1)*inCh]
 		for t := 0; t < seq; t++ {

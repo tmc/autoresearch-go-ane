@@ -129,6 +129,35 @@ func siluBackwardAccel(dh1, dh3, dGate, h1, h3 []float32) {
 	)
 }
 
+// linearCFAccelerate computes out = weights @ x using BLAS.
+// Layout: weights [outCh x inCh] row-major, x [inCh x seq] channel-first,
+// out [outCh x seq] channel-first.
+func linearCFAccelerate(out, weights, x []float32, outCh, inCh, seq int) bool {
+	if outCh <= 0 || inCh <= 0 || seq <= 0 {
+		return false
+	}
+	if len(out) < outCh*seq || len(weights) < outCh*inCh || len(x) < inCh*seq {
+		return false
+	}
+	C.cblas_sgemm(
+		C.CblasRowMajor,
+		C.CblasNoTrans,
+		C.CblasNoTrans,
+		C.int(outCh),
+		C.int(seq),
+		C.int(inCh),
+		C.float(1.0),
+		(*C.float)(unsafe.Pointer(&weights[0])),
+		C.int(inCh),
+		(*C.float)(unsafe.Pointer(&x[0])),
+		C.int(seq),
+		C.float(0.0),
+		(*C.float)(unsafe.Pointer(&out[0])),
+		C.int(seq),
+	)
+	return true
+}
+
 func softmaxRowAccel(out, in []float32) {
 	n := len(in)
 	if n == 0 {

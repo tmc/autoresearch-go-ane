@@ -37,6 +37,10 @@ func siluBackwardAccel(dh1, dh3, dGate, h1, h3 []float32) {
 	}
 }
 
+func linearCFAccelerate(out, weights, x []float32, outCh, inCh, seq int) bool {
+	return false
+}
+
 func softmaxRowAccel(out, in []float32) {
 	maxv := in[0]
 	for i := 1; i < len(in); i++ {

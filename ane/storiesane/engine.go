@@ -123,6 +123,16 @@ type Engine struct {
 	gradPrev      []float32
 	ropeCos       []float32
 	ropeSin       []float32
+	// Pre-allocated CPU inference scratch buffers.
+	cpuQF    []float32
+	cpuKF    []float32
+	cpuVF    []float32
+	cpuAttO  []float32
+	cpuX2    []float32
+	cpuH1    []float32
+	cpuH3    []float32
+	cpuGate  []float32
+	cpuFFOut []float32
 	embedGradDone    chan struct{}
 	asyncRefreshDone chan time.Duration // async weight refresh result
 	stepMetrics      aneStepMetrics
@@ -256,6 +266,15 @@ func Open(opts Options) (*Engine, error) {
 		gradPrev:                make([]float32, stories.Dim*seq),
 		ropeCos:                 ropeCos,
 		ropeSin:                 ropeSin,
+		cpuQF:                   make([]float32, stories.Dim*seq),
+		cpuKF:                   make([]float32, stories.Dim*seq),
+		cpuVF:                   make([]float32, stories.Dim*seq),
+		cpuAttO:                 make([]float32, stories.Dim*seq),
+		cpuX2:                   make([]float32, stories.Dim*seq),
+		cpuH1:                   make([]float32, stories.Hidden*seq),
+		cpuH3:                   make([]float32, stories.Hidden*seq),
+		cpuGate:                 make([]float32, stories.Hidden*seq),
+		cpuFFOut:                make([]float32, stories.Dim*seq),
 	}, nil
 }
 
@@ -514,6 +533,15 @@ func (e *Engine) Close() {
 	e.gradPrev = nil
 	e.ropeCos = nil
 	e.ropeSin = nil
+	e.cpuQF = nil
+	e.cpuKF = nil
+	e.cpuVF = nil
+	e.cpuAttO = nil
+	e.cpuX2 = nil
+	e.cpuH1 = nil
+	e.cpuH3 = nil
+	e.cpuGate = nil
+	e.cpuFFOut = nil
 	if e.gradTasks != nil {
 		e.gradTasks.Close()
 		e.gradTasks = nil
@@ -788,15 +816,15 @@ func (e *Engine) evalLogitsCPUInto(tokens []uint16, logits []float32) error {
 	x := e.x
 	xNorm := e.xNorm
 	next := e.tmpHidden
-	qf := make([]float32, stories.Dim*e.seq)
-	kf := make([]float32, stories.Dim*e.seq)
-	vf := make([]float32, stories.Dim*e.seq)
-	attOut := make([]float32, stories.Dim*e.seq)
-	x2 := make([]float32, stories.Dim*e.seq)
-	h1 := make([]float32, stories.Hidden*e.seq)
-	h3 := make([]float32, stories.Hidden*e.seq)
-	gate := make([]float32, stories.Hidden*e.seq)
-	ffOut := make([]float32, stories.Dim*e.seq)
+	qf := e.cpuQF
+	kf := e.cpuKF
+	vf := e.cpuVF
+	attOut := e.cpuAttO
+	x2 := e.cpuX2
+	h1 := e.cpuH1
+	h3 := e.cpuH3
+	gate := e.cpuGate
+	ffOut := e.cpuFFOut
 
 	stories.EmbedLookup(x, e.mw.Embed, tokens, stories.Dim, e.seq)
 	cur := x
