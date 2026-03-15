@@ -8,12 +8,10 @@ package storiesane
 #include <Accelerate/Accelerate.h>
 #include <string.h>
 
-// BNNS-based fp16 weight GEMV: reads fp16 weights, fp32 input/output.
-// Creates a filter, applies it, destroys it. For repeated use, cache the filter.
-static int bnns_gemv_f16(
-	float *out,
+// Create a cached BNNS fully-connected filter with fp16 weights.
+// Returns NULL on failure. Caller must destroy with BNNSFilterDestroy.
+static BNNSFilter bnns_fc_create_f16(
 	const uint16_t *weights_f16,
-	const float *x,
 	int outDim, int inDim
 ) {
 	BNNSLayerParametersFullyConnected params;
@@ -42,41 +40,74 @@ static int bnns_gemv_f16(
 	BNNSFilterParameters filterParams;
 	memset(&filterParams, 0, sizeof(filterParams));
 
-	BNNSFilter filter = BNNSFilterCreateLayerFullyConnected(&params, &filterParams);
-	if (filter == NULL) {
-		return -1;
-	}
+	return BNNSFilterCreateLayerFullyConnected(&params, &filterParams);
+}
 
-	int status = BNNSFilterApply(filter, x, out);
-	BNNSFilterDestroy(filter);
-	return status;
+// Apply a cached BNNS filter. Returns 0 on success.
+static int bnns_fc_apply(BNNSFilter filter, const float *x, float *out) {
+	return BNNSFilterApply(filter, x, out);
+}
+
+// Destroy a BNNS filter.
+static void bnns_fc_destroy(BNNSFilter filter) {
+	if (filter != NULL) {
+		BNNSFilterDestroy(filter);
+	}
 }
 */
 import "C"
 
 import "unsafe"
 
-// BNNSLinearFP16 performs a matrix-vector multiply with fp16 weights.
+// BNNSFilter wraps a cached Apple BNNS fully-connected filter.
+// Create once with fp16 weights, then Apply repeatedly for fast inference.
+type BNNSFilter struct {
+	filter C.BNNSFilter
+}
+
+// NewBNNSFilter creates a cached BNNS fully-connected filter with fp16 weights.
 // weights: [outDim * inDim] uint16 (fp16, row-major)
-// x: [inDim] float32
-// out: [outDim] float32
-//
-// Uses Apple's BNNS framework which can read fp16 weights directly,
-// avoiding the fp16->fp32 conversion overhead.
-// Returns false if BNNS fails (caller should fall back to fp32 path).
-func BNNSLinearFP16(out []float32, weights []uint16, x []float32, outDim, inDim int) bool {
-	if outDim <= 0 || inDim <= 0 {
-		return false
+// The filter reads fp16 weights and produces fp32 output.
+// Returns nil if creation fails.
+func NewBNNSFilter(weights []uint16, outDim, inDim int) *BNNSFilter {
+	if outDim <= 0 || inDim <= 0 || len(weights) < outDim*inDim {
+		return nil
 	}
-	if len(out) < outDim || len(weights) < outDim*inDim || len(x) < inDim {
-		return false
-	}
-	status := C.bnns_gemv_f16(
-		(*C.float)(unsafe.Pointer(&out[0])),
+	f := C.bnns_fc_create_f16(
 		(*C.uint16_t)(unsafe.Pointer(&weights[0])),
-		(*C.float)(unsafe.Pointer(&x[0])),
 		C.int(outDim),
 		C.int(inDim),
 	)
-	return status == 0
+	if f == nil {
+		return nil
+	}
+	return &BNNSFilter{filter: f}
+}
+
+// Apply runs the filter: out = weights @ x.
+// x: [inDim] float32, out: [outDim] float32.
+func (f *BNNSFilter) Apply(out, x []float32) bool {
+	if f == nil || f.filter == nil {
+		return false
+	}
+	return C.bnns_fc_apply(f.filter, (*C.float)(unsafe.Pointer(&x[0])), (*C.float)(unsafe.Pointer(&out[0]))) == 0
+}
+
+// Close destroys the BNNS filter.
+func (f *BNNSFilter) Close() {
+	if f != nil && f.filter != nil {
+		C.bnns_fc_destroy(f.filter)
+		f.filter = nil
+	}
+}
+
+// BNNSLinearFP16 performs a one-shot matrix-vector multiply with fp16 weights.
+// Creates and destroys a filter per call — use NewBNNSFilter for repeated use.
+func BNNSLinearFP16(out []float32, weights []uint16, x []float32, outDim, inDim int) bool {
+	f := NewBNNSFilter(weights, outDim, inDim)
+	if f == nil {
+		return false
+	}
+	defer f.Close()
+	return f.Apply(out, x)
 }
