@@ -1,17 +1,1 @@
-# Binaries
-autoresearch
-*.test
-
-# Data and model files
-*.bin
-*.bin.tmp
-
-# Run artifacts
-results.tsv
-run.log
-bench_*.txt
-
-# Go workspace
-go.work
-go.work.sum
-/bench-note
+.claude

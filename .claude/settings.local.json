@@ -23,7 +23,28 @@
       "Bash(./bench-note show *)",
       "Bash(./bench-note raw *)",
       "Bash(./bench-note compare *)",
-      "Bash(./bench-note history *)"
+      "Bash(./bench-note history *)",
+      "Bash(git reset HEAD .\ngit status --short | wc -l)",
+      "Bash(git reset HEAD -- . 2>&1 | tail -5\ngit status --short 2>&1 | wc -l)",
+      "Bash(go build ./... 2>&1 && go vet ./... 2>&1 && echo \"BUILD+VET PASS\")",
+      "Bash(git add ane/gqa_dynamic.go ane/gqa_dynamic_test.go ane/mil_stories.go)",
+      "Bash(git reset HEAD)",
+      "Bash(~/bin/git-auto-commit-message --auto)",
+      "Bash(git commit -m \"$\\(cat <<'EOF'\nane: add GQA MIL generator and residual-scale MIL programs\n\nAdd Grouped-Query Attention \\(GQA\\) MIL program generator for models\nwhere KV heads < Q heads \\(e.g., Qwen3-4B: 32 Q heads, 8 KV heads\\).\nKV heads are tiled to match Q head count before attention computation.\n\nUpdate MIL program generators to accept residualScale parameter for\nmodels that use post-normalization residual scaling.\n\nIncludes tests for MHA fallback, GQA tiling, and edge cases.\nEOF\n\\)\")",
+      "Bash(git add ane/kvcache.go ane/eval_cached.go ane/eval_cached_other.go && git diff --cached --stat)",
+      "Bash(git commit -m \"$\\(cat <<'EOF'\nane: add KV cache and cached single-token inference\n\nAdd KVCache for incremental autoregressive generation, storing\nkey/value tensors per layer to avoid recomputation.\n\nAdd EvalNextToken for single-token inference using the KV cache,\nwith per-component timing breakdown \\(qkv, attention, wo, ffn,\nclassifier, fp16 conversion\\).\nEOF\n\\)\")",
+      "Bash(git add ane/generate.go ane/decode.go && git diff --cached --stat)",
+      "Bash(git commit -m \"$\\(cat <<'EOF'\nane: add autoregressive generation and token decoding\n\nAdd Generate and GenerateStream for autoregressive text generation\nwith KV-cached inference. GenerateStream yields tokens via callback\nfor streaming output.\n\nAdd decode utilities for detokenization \\(BPE byte-pair merging,\nspecial token handling, whitespace normalization\\).\nEOF\n\\)\")",
+      "Bash(git add ane/bnns_darwin.go ane/bnns_other.go ane/metal_darwin.go ane/metal_darwin.m ane/metal_other.go ane/fp16_pack_darwin.go ane/fp16_pack_stub.go ane/layer_tiled_darwin.go ane/moe_layer_darwin.go ane/residual.go ane/capability_darwin.go ane/diagnostics.go ane/dynamic_status.go ane/dynamic_status_darwin.go ane/dynamic_status_other.go && git diff --cached --stat)",
+      "Bash(git commit -m \"$\\(cat <<'EOF'\nane: add Metal, BNNS, FP16, tiled layers, and MoE dispatch\n\nAdd hardware acceleration backends:\n- BNNS fp16-weight GEMV for memory-bandwidth-bound inference\n- Metal MPS GPU matmul for large models\n- NEON fp16/fp32 conversion for weight compression\n\nAdd tiled ANE layer forward for models exceeding single-dispatch\nsurface limits \\(Qwen3-4B\\).\n\nAdd MoE expert dispatch with top-k gating for Qwen3-Coder-Next.\n\nAdd runtime capability detection and diagnostics.\nEOF\n\\)\")",
+      "Bash(git add ane/engine.go ane/common.go ane/accel_darwin.go ane/accel_other.go ane/layer_darwin.go ane/layer_dynamic_darwin.go ane/offload_darwin.go ane/offload_other.go ane/backward_darwin.go ane/backward_other.go ane/runtime.go ane/train_full.go ane/train_util.go ane/adam_accel_darwin.go ane/adam_accel_stub.go ane/gemm_accel_darwin.go ane/gemm_accel_stub.go ane/grad_ops_accel_darwin.go ane/grad_ops_stub.go ane/grad_tasks_other.go ane/parallel_other.go && git diff --cached --stat)",
+      "Bash(git commit -m \"$\\(cat <<'EOF'\nane: thread ModelConfig through engine, add platform stubs\n\nUpdate Engine to use ModelConfig for flexible model dimensions,\nGQA head counts, and explicit head_dim. Support int32 token IDs\nthroughout for Qwen3's 151K vocabulary.\n\nAdd Accelerate BLAS helpers \\(sgemv, siluMul, Adam\\), GEMM wrappers,\nand gradient ops with darwin/stub pairs for cross-platform builds.\n\nUpdate layer forward to support GQA, tiled dispatch, and dynamic\nMIL program selection based on model config.\nEOF\n\\)\")",
+      "Bash(git commit -m \"ane: thread ModelConfig through engine, add platform stubs\n\nUpdate Engine to use ModelConfig for flexible model dimensions,\nGQA head counts, and explicit head_dim. Support int32 token IDs\nthroughout for Qwen3 151K vocabulary.\n\nAdd Accelerate BLAS helpers \\(sgemv, siluMul, Adam\\), GEMM wrappers,\nand gradient ops with darwin/stub pairs for cross-platform builds.\n\nUpdate layer forward to support GQA, tiled dispatch, and dynamic\nMIL program selection based on model config.\")",
+      "Bash(git add cmd/generate/main.go scripts/convert_hf.py scripts/convert_hf_moe.py scripts/tokenize.py scripts/profile_4b.sh scripts/bench_infer.sh scripts/parse_bench.py scripts/coordinator.py && git diff --cached --stat)",
+      "Bash(git commit -m \"cmd/generate: add text generation CLI with profiling\n\nAdd generate command for autoregressive text generation supporting\nTinyStories, Qwen3-0.6B, and Qwen3-4B models. Includes CPU/memory\nprofiling flags and Go-native BPE tokenization.\n\nAdd model conversion scripts \\(HuggingFace dense and MoE\\), profiling\nsuite, benchmark parsing, and experiment coordinator.\")",
+      "Bash(git add bench_test.go correctness_test.go experiment.go harness.go main_other.go go.mod go.sum CLAUDE.md && git diff --cached --stat)",
+      "Bash(git commit -m \"all: update top-level harness for Qwen3, add correctness oracle\n\nUpdate bench_test.go and experiment.go for int32 tokens and\nModelConfig-based engine initialization.\n\nAdd correctness_test.go for golden-logit regression testing with\nfp16 tolerance.\n\nUpdate CLAUDE.md with Qwen3 usage, profiling, and project structure.\")",
+      "Bash(go test -run='TestGen' ./ane/ -v -count=1 2>&1)"
     ]
   }
 }
