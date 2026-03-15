@@ -1,8 +1,15 @@
-//go:build darwin
+//go:build darwin && cgo
 
 package stories
 
-import "github.com/tmc/apple/accelerate"
+/*
+#cgo darwin CFLAGS: -Wno-deprecated-declarations
+#cgo darwin LDFLAGS: -framework Accelerate
+#include <Accelerate/Accelerate.h>
+*/
+import "C"
+
+import "sync"
 
 func matMulVocabSeqAccelerate(logits, embed, x []float32, vocab, dim, seq int) bool {
 	if vocab <= 0 || dim <= 0 || seq <= 0 {
@@ -11,17 +18,55 @@ func matMulVocabSeqAccelerate(logits, embed, x []float32, vocab, dim, seq int) b
 	if len(logits) < vocab*seq || len(embed) < vocab*dim || len(x) < dim*seq {
 		return false
 	}
-	// logits = embed @ x  (vocab x dim) @ (dim x seq) = (vocab x seq)
-	accelerate.Cblas_sgemm(
-		accelerate.CblasRowMajor,
-		accelerate.CblasNoTrans,
-		accelerate.CblasNoTrans,
-		vocab, seq, dim,
-		1.0, embed, dim,
-		x, seq,
-		0.0, logits, seq,
+	// Split vocab into chunks and compute concurrently.
+	const nSplit = 24
+	chunk := vocab / nSplit
+	if chunk > 0 && vocab > 1000 {
+		var wg sync.WaitGroup
+		for s := 0; s < nSplit; s++ {
+			start := s * chunk
+			size := chunk
+			if s == nSplit-1 {
+				size = vocab - start
+			}
+			wg.Add(1)
+			go func(start, size int) {
+				defer wg.Done()
+				C.cblas_sgemm(
+					C.CblasRowMajor, C.CblasNoTrans, C.CblasNoTrans,
+					C.int(size), C.int(seq), C.int(dim),
+					C.float(1.0),
+					(*C.float)(&embed[start*dim]), C.int(dim),
+					(*C.float)(&x[0]), C.int(seq),
+					C.float(0.0),
+					(*C.float)(&logits[start*seq]), C.int(seq),
+				)
+			}(start, size)
+		}
+		wg.Wait()
+		return true
+	}
+	C.cblas_sgemm(
+		C.CblasRowMajor,
+		C.CblasNoTrans,
+		C.CblasNoTrans,
+		C.int(vocab),
+		C.int(seq),
+		C.int(dim),
+		C.float(1.0),
+		(*C.float)(&embed[0]),
+		C.int(dim),
+		(*C.float)(&x[0]),
+		C.int(seq),
+		C.float(0.0),
+		(*C.float)(&logits[0]),
+		C.int(seq),
 	)
 	return true
+}
+
+func matMulEmbedTAccelerate(dx, embed, dLogits []float32, vocab, dim, seq int) bool {
+	return matMulEmbedTAccelerateScale(dx, embed, dLogits, vocab, dim, seq, 1.0)
 }
 
 func matMulEmbedTAccelerateScale(dx, embed, dLogits []float32, vocab, dim, seq int, scale float32) bool {
@@ -31,17 +76,27 @@ func matMulEmbedTAccelerateScale(dx, embed, dLogits []float32, vocab, dim, seq i
 	if len(dx) < dim*seq || len(embed) < vocab*dim || len(dLogits) < vocab*seq {
 		return false
 	}
-	// dx = embed^T @ dLogits * scale  (dim x vocab) @ (vocab x seq) = (dim x seq)
-	accelerate.Cblas_sgemm(
-		accelerate.CblasRowMajor,
-		accelerate.CblasTrans,
-		accelerate.CblasNoTrans,
-		dim, seq, vocab,
-		scale, embed, dim,
-		dLogits, seq,
-		0.0, dx, seq,
+	C.cblas_sgemm(
+		C.CblasRowMajor,
+		C.CblasTrans,
+		C.CblasNoTrans,
+		C.int(dim),
+		C.int(seq),
+		C.int(vocab),
+		C.float(scale),
+		(*C.float)(&embed[0]),
+		C.int(dim),
+		(*C.float)(&dLogits[0]),
+		C.int(seq),
+		C.float(0.0),
+		(*C.float)(&dx[0]),
+		C.int(seq),
 	)
 	return true
+}
+
+func matMulGradEmbedAccelerate(dEmbed, dLogits, x []float32, vocab, dim, seq int) bool {
+	return matMulGradEmbedAccelerateScale(dEmbed, dLogits, x, vocab, dim, seq, 1.0)
 }
 
 func matMulGradEmbedAccelerateScale(dEmbed, dLogits, x []float32, vocab, dim, seq int, scale float32) bool {
@@ -51,15 +106,21 @@ func matMulGradEmbedAccelerateScale(dEmbed, dLogits, x []float32, vocab, dim, se
 	if len(dEmbed) < vocab*dim || len(dLogits) < vocab*seq || len(x) < dim*seq {
 		return false
 	}
-	// dEmbed = dLogits @ x^T * scale  (vocab x seq) @ (seq x dim) = (vocab x dim)
-	accelerate.Cblas_sgemm(
-		accelerate.CblasRowMajor,
-		accelerate.CblasNoTrans,
-		accelerate.CblasTrans,
-		vocab, dim, seq,
-		scale, dLogits, seq,
-		x, seq,
-		0.0, dEmbed, dim,
+	C.cblas_sgemm(
+		C.CblasRowMajor,
+		C.CblasNoTrans,
+		C.CblasTrans,
+		C.int(vocab),
+		C.int(dim),
+		C.int(seq),
+		C.float(scale),
+		(*C.float)(&dLogits[0]),
+		C.int(seq),
+		(*C.float)(&x[0]),
+		C.int(seq),
+		C.float(0.0),
+		(*C.float)(&dEmbed[0]),
+		C.int(dim),
 	)
 	return true
 }
