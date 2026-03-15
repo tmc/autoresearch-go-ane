@@ -9,6 +9,6 @@ require (
 	github.com/tmc/aneperf v0.0.0
 )
 
-replace github.com/ebitengine/purego => github.com/tmc/purego v0.10.0-alpha.2.0.20260130081008-0b23e28544a2
+replace github.com/ebitengine/purego => github.com/tmc/purego v0.10.0-alpha.2.0.20260315005611-7a4926ded181
 
 replace github.com/tmc/aneperf => /Users/tmc/go/src/github.com/tmc/aneperf
