@@ -7,6 +7,7 @@ enabling distributed research across multiple Apple Silicon participants.
 Uses `requests` for JSON-RPC calls. Zero new deps beyond requests.
 
 Usage (CLI):
+    python3 scripts/coordinator.py set_agent '<codename>'
     python3 scripts/coordinator.py analyze
     python3 scripts/coordinator.py analyze_swarm
     python3 scripts/coordinator.py publish_result '<desc>' '<bench_json>' '<git_diff>' keep
@@ -44,6 +45,7 @@ import requests
 HUB_ORG = "austin_mac"
 API_URL = "https://api.ensue-network.ai/"
 KEY_FILE = ".autoresearch-key"
+AGENT_FILE = ".autoresearch-agent"
 NAMESPACE = "autoresearch-go-ane-infer"
 INVITE_TOKEN = "596e13c30e7848e7b50e3bb2bf5f319d5eaa99eeb5df4337bab90310bfd76385"
 
@@ -79,6 +81,30 @@ def _get_api_key() -> Optional[str]:
         with open(KEY_FILE) as f:
             return f.read().strip()
     return None
+
+
+def _get_agent_id() -> Optional[str]:
+    """Read agent codename from env var or agent file.
+
+    Checked in order:
+      1. AUTORESEARCH_AGENT env var
+      2. .autoresearch-agent file in repo root
+    """
+    agent = os.environ.get("AUTORESEARCH_AGENT")
+    if agent:
+        return agent.strip()
+    if os.path.exists(AGENT_FILE):
+        with open(AGENT_FILE) as f:
+            val = f.read().strip()
+            if val:
+                return val
+    return None
+
+
+def _set_agent_id(codename: str) -> None:
+    """Persist agent codename to .autoresearch-agent file."""
+    with open(AGENT_FILE, "w") as f:
+        f.write(codename.strip() + "\n")
 
 
 def _experiment_hash(description: str) -> str:
@@ -151,8 +177,6 @@ def detect_chip_info() -> tuple[Optional[str], Optional[int]]:
         chip = subprocess.check_output(
             ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, stderr=subprocess.DEVNULL
         ).strip()
-        # Parse ANE TOPS from chip name
-        # M1: 11, M2: 15.8, M3: 18, M4: 38
         if "M4" in chip:
             return chip, 38
         elif "M3" in chip:
@@ -161,6 +185,8 @@ def detect_chip_info() -> tuple[Optional[str], Optional[int]]:
             return chip, 16
         elif "M1" in chip:
             return chip, 11
+        elif "M5" in chip:
+            return chip, 42
         return chip, None
     except Exception:
         return None, None
@@ -227,17 +253,16 @@ class Coordinator:
     never crashes due to network issues.
     """
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, agent_id: Optional[str] = None):
         self.api_key = api_key or _get_api_key()
-        self.agent_id: Optional[str] = None
+        self.agent_id: str = agent_id or _get_agent_id() or "unknown"
         self.experiment_count = 0
         self.chip_name, self.ane_tops = detect_chip_info()
         self.chip_tier: Optional[str] = get_chip_tier(self.ane_tops) if self.ane_tops is not None else None
 
     def _log(self, msg: str) -> None:
         """Print with agent identity prefix."""
-        tag = self.agent_id or "coordinator"
-        print(f"[{tag}] {msg}")
+        print(f"[{self.agent_id}] {msg}")
 
     @property
     def connected(self) -> bool:
@@ -251,12 +276,23 @@ class Coordinator:
 
     def _make_key(self, description: str) -> str:
         """Create a human-readable experiment key using agent_id."""
-        return _experiment_key(self.agent_id or "unknown", description)
+        return _experiment_key(self.agent_id, description)
+
+    def _chip_context(self) -> str:
+        """One-line chip context string for embedding in records."""
+        parts = []
+        if self.chip_name:
+            parts.append(self.chip_name)
+        if self.chip_tier:
+            parts.append(f"tier={self.chip_tier}")
+        if self.ane_tops:
+            parts.append(f"{self.ane_tops} TOPS")
+        return ", ".join(parts) if parts else "unknown chip"
 
     # --- Onboarding ---
 
     def join_hub(self) -> dict[str, Any]:
-        """Claim the hub invite to join autoresearch-at-home."""
+        """Claim the hub invite to join austin_mac."""
         try:
             result = self._rpc("claim_invite", {"token": INVITE_TOKEN})
             self._log(f"Joined hub: {result}")
@@ -276,8 +312,6 @@ class Coordinator:
     def announce(self) -> None:
         """Print a startup banner with swarm state."""
         try:
-            tag = self.agent_id or "unknown"
-
             # Get global best
             meta_key = f"@{HUB_ORG}/best/metadata"
             meta = self._rpc("get_memory", {"key_names": [meta_key]})
@@ -287,7 +321,8 @@ class Coordinator:
                 current = json.loads(meta_results[0].get("value", "{}"))
                 best_tps = current.get("tokens_per_sec", "?")
                 best_by = current.get("agent_id", current.get("achieved_by", "?"))
-                best_line = f"tokens/s={best_tps} (by {best_by})"
+                best_desc = current.get("description", "")
+                best_line = f"tokens/s={best_tps} (by {best_by}: {best_desc})"
 
             # Count results
             result_list = self._rpc("list_keys", {
@@ -305,15 +340,11 @@ class Coordinator:
             active_claims = len(claim_list.get("keys", []))
 
             # Chip info
-            chip_line = "unknown"
-            if self.chip_name:
-                chip_line = f"{self.chip_name}"
-                if self.ane_tops:
-                    chip_line += f" ({self.ane_tops} ANE TOPS, tier: {self.chip_tier})"
+            chip_line = self._chip_context()
 
             banner = f"""
 {'=' * 54}
-  AUTORESEARCH AGENT: {tag}
+  AUTORESEARCH AGENT: {self.agent_id}
   Swarm: {HUB_ORG}
   Chip: {chip_line}
   Global best: {best_line}
@@ -323,7 +354,7 @@ class Coordinator:
             print(banner)
         except Exception as e:
             self._log(f"announce error (non-fatal): {e}")
-            print(f"\n  AUTORESEARCH AGENT: {self.agent_id or 'unknown'}\n")
+            print(f"\n  AUTORESEARCH AGENT: {self.agent_id}\n")
 
     # --- Work Claiming ---
 
@@ -421,17 +452,21 @@ class Coordinator:
 
             claim_key = f"@{HUB_ORG}/claims/{exp_key}"
             claim_data = {
-                "agent_id": self.agent_id or "unknown",
+                "agent_id": self.agent_id,
                 "description": description,
                 "experiment_key": exp_key,
+                "chip_name": self.chip_name,
+                "chip_tier": self.chip_tier,
                 "claimed_at": _now_iso(),
                 "expected_duration_seconds": 300,
                 "status": "claimed",
             }
             value_b64 = base64.b64encode(json.dumps(claim_data).encode()).decode()
+
+            embed_desc = f"Agent {self.agent_id} on {self._chip_context()} is working on: {description}"
             self._rpc("create_memory", {"items": [{
                 "key_name": claim_key,
-                "description": f"[autoresearch] Claim: {description}",
+                "description": embed_desc,
                 "value": value_b64,
                 "base64": True,
                 "embed": True,
@@ -443,7 +478,7 @@ class Coordinator:
             verify_results = verify.get("results", [])
             if verify_results and verify_results[0].get("status") == "success":
                 value = json.loads(verify_results[0].get("value", "{}"))
-                if value.get("agent_id") == (self.agent_id or "unknown"):
+                if value.get("agent_id") == self.agent_id:
                     self._log(f"Claimed experiment: {exp_key}")
                     return exp_key
 
@@ -463,7 +498,12 @@ class Coordinator:
         git_diff: str = "",
         status: str = "keep",
     ) -> str:
-        """Publish an experiment result to the hub."""
+        """Publish an experiment result to the hub.
+
+        Each result is a self-contained record: it includes everything needed
+        to understand the experiment without looking up other keys. Agents can
+        search results and get the full picture from any single match.
+        """
         if isinstance(benchmark_json, str):
             benchmark_json = json.loads(benchmark_json)
 
@@ -473,6 +513,8 @@ class Coordinator:
         repo_url = _git_remote_url()
 
         tokens_per_sec = benchmark_json.get("tokens_per_sec", 0)
+        ns_per_op = benchmark_json.get("ns_per_op", 0)
+        runs = benchmark_json.get("runs", 0)
 
         # Get current bests for delta calculations
         global_best_tps = self._get_global_best_tps()
@@ -481,39 +523,53 @@ class Coordinator:
         delta_vs_own_best = (tokens_per_sec - agent_best_tps) if agent_best_tps is not None else None
 
         result_data = {
-            "agent_id": self.agent_id or "unknown",
-            "tokens_per_sec": tokens_per_sec,
+            # Identity
+            "agent_id": self.agent_id,
             "chip_name": self.chip_name,
             "chip_tier": self.chip_tier,
             "ane_tops": self.ane_tops,
+            # Experiment
+            "description": description,
             "status": status,
             "commit": commit,
-            "description": description,
-            "git_diff": git_diff,
-            "benchmark": benchmark_json,
-            "repo_url": repo_url,
             "branch": branch,
+            "repo_url": repo_url,
             "commit_url": f"{repo_url}/commit/{commit}" if repo_url and commit else None,
             "completed_at": _now_iso(),
+            # Benchmark metrics (inlined for self-containedness)
+            "tokens_per_sec": tokens_per_sec,
+            "ns_per_op": ns_per_op,
+            "runs": runs,
+            "benchmark": benchmark_json,
+            # Deltas at time of publish
             "delta_vs_best": delta_vs_best,
             "global_best_at_publish": global_best_tps,
             "delta_vs_own_best": delta_vs_own_best,
             "agent_best_at_publish": agent_best_tps,
+            # Code change
+            "git_diff": git_diff,
         }
 
         result_key = f"@{HUB_ORG}/results/{exp_key}"
         value_b64 = base64.b64encode(json.dumps(result_data).encode()).decode()
 
-        agent = self.agent_id or "unknown"
-        desc_prefix = f"[{agent} {status.upper()}] tokens/s={tokens_per_sec:.1f}"
+        # Rich embed description: agents searching results will match on this text.
+        # Include what changed, the outcome, chip context, and whether it helped.
+        delta_str = ""
         if delta_vs_best is not None:
-            desc_prefix += f" (delta={delta_vs_best:+.1f})"
-        desc_prefix += f" | {description}"
+            delta_str = f", delta={delta_vs_best:+.1f} vs global best {global_best_tps:.1f}"
+        outcome = "improved" if status == "keep" else ("no improvement" if status == "discard" else "crashed")
+        embed_desc = (
+            f"Experiment by {self.agent_id} on {self._chip_context()}: "
+            f"{description}. "
+            f"Result: {outcome}, tokens/s={tokens_per_sec:.1f}, ns/op={ns_per_op}{delta_str}. "
+            f"Status: {status}."
+        )
 
         try:
             self._rpc("create_memory", {"items": [{
                 "key_name": result_key,
-                "description": f"[autoresearch] Result: {desc_prefix}",
+                "description": embed_desc,
                 "value": value_b64,
                 "base64": True,
                 "embed": True,
@@ -527,10 +583,10 @@ class Coordinator:
                 "base64": True,
             })
 
-        delta_str = ""
+        delta_log = ""
         if delta_vs_best is not None:
-            delta_str = f" (delta={delta_vs_best:+.1f} vs global best {global_best_tps:.1f})"
-        self._log(f"RESULT: tokens/s={tokens_per_sec:.1f}{delta_str} ({status})")
+            delta_log = f" (delta={delta_vs_best:+.1f} vs global best {global_best_tps:.1f})"
+        self._log(f"RESULT: tokens/s={tokens_per_sec:.1f}{delta_log} ({status})")
 
         # Update bests if this is a keep
         if status == "keep":
@@ -557,7 +613,7 @@ class Coordinator:
 
     def _get_agent_best_tps(self, agent_id: str = None) -> Optional[float]:
         """Read an agent's personal best tokens_per_sec."""
-        agent = agent_id or self.agent_id or "unknown"
+        agent = agent_id or self.agent_id
         try:
             key = f"@{HUB_ORG}/best/agent/{agent}"
             result = self._rpc("get_memory", {"key_names": [key]})
@@ -571,9 +627,8 @@ class Coordinator:
 
     def _update_agent_best(self, tokens_per_sec: float, result_data: dict) -> None:
         """Update this agent's personal best if this result beats it."""
-        agent = self.agent_id or "unknown"
         try:
-            key = f"@{HUB_ORG}/best/agent/{agent}"
+            key = f"@{HUB_ORG}/best/agent/{self.agent_id}"
             current = self._get_agent_best_tps()
 
             # Higher is better for tokens_per_sec
@@ -581,7 +636,7 @@ class Coordinator:
                 return
 
             best_data = {
-                "agent_id": agent,
+                "agent_id": self.agent_id,
                 "tokens_per_sec": tokens_per_sec,
                 "description": result_data.get("description"),
                 "chip_name": self.chip_name,
@@ -600,7 +655,7 @@ class Coordinator:
             except Exception:
                 self._rpc("create_memory", {"items": [{
                     "key_name": key,
-                    "description": f"[autoresearch] Personal best for {agent}: tokens/s={tokens_per_sec:.1f}",
+                    "description": f"Personal best for agent {self.agent_id} on {self._chip_context()}: tokens/s={tokens_per_sec:.1f}",
                     "value": value_b64,
                     "base64": True,
                 }]})
@@ -667,7 +722,8 @@ class Coordinator:
             best_data = {
                 **{k: v for k, v in result_data.items() if k != "git_diff"},
                 "tokens_per_sec": tokens_per_sec,
-                "achieved_by": self.agent_id or "unknown",
+                "agent_id": self.agent_id,
+                "achieved_by": self.agent_id,
                 "achieved_at": _now_iso(),
                 "previous_best_tokens_per_sec": previous_best_tps,
                 "previous_best_by": previous_best_by,
@@ -688,7 +744,7 @@ class Coordinator:
                 except Exception:
                     self._rpc("create_memory", {"items": [{
                         "key_name": code_key,
-                        "description": "[autoresearch] Current best config (git diff)",
+                        "description": f"Git diff for current global best config ({self.agent_id}: {result_data.get('description', '')})",
                         "value": code_b64,
                         "base64": True,
                     }]})
@@ -704,7 +760,7 @@ class Coordinator:
             except Exception:
                 self._rpc("create_memory", {"items": [{
                     "key_name": meta_key,
-                    "description": "[autoresearch] Metadata for current best ANE inference config",
+                    "description": f"Global best ANE inference: tokens/s={tokens_per_sec:.1f} by {self.agent_id} ({result_data.get('description', '')})",
                     "value": meta_b64,
                     "base64": True,
                 }]})
@@ -762,7 +818,8 @@ class Coordinator:
                 **{k: v for k, v in result_data.items() if k != "git_diff"},
                 "chip_tier": tier,
                 "tokens_per_sec": tokens_per_sec,
-                "achieved_by": self.agent_id or "unknown",
+                "agent_id": self.agent_id,
+                "achieved_by": self.agent_id,
                 "achieved_at": _now_iso(),
                 "previous_best_tokens_per_sec": previous_best_tps,
                 "previous_best_by": previous_best_by,
@@ -780,7 +837,7 @@ class Coordinator:
                 except Exception:
                     self._rpc("create_memory", {"items": [{
                         "key_name": code_key,
-                        "description": f"[autoresearch] Best config for chip tier '{tier}'",
+                        "description": f"Best config for chip tier '{tier}': tokens/s={tokens_per_sec:.1f} by {self.agent_id}",
                         "value": code_b64,
                         "base64": True,
                     }]})
@@ -796,7 +853,7 @@ class Coordinator:
             except Exception:
                 self._rpc("create_memory", {"items": [{
                     "key_name": meta_key,
-                    "description": f"[autoresearch] Metadata for best config in chip tier '{tier}'",
+                    "description": f"Best ANE inference for chip tier '{tier}': tokens/s={tokens_per_sec:.1f} by {self.agent_id} on {self._chip_context()}",
                     "value": meta_b64,
                     "base64": True,
                 }]})
@@ -921,7 +978,10 @@ class Coordinator:
     # --- Collective Intelligence ---
 
     def ask_swarm(self, question: str, namespace: str = None) -> dict:
-        """Ask the swarm a question via semantic search. Scope with namespace."""
+        """Ask the swarm a question via semantic search. Scope with namespace.
+
+        Returns rich context for each match so agents don't need follow-up lookups.
+        """
         try:
             prefix = f"@{HUB_ORG}/"
             if namespace:
@@ -945,27 +1005,48 @@ class Coordinator:
                     pass
 
             relevant.sort(key=lambda x: x.get("_score", 0), reverse=True)
-            best_match = relevant[0] if relevant else None
 
             lines = [f"Swarm answer for: {question}"]
             lines.append(f"Namespace: {namespace or 'all'} | {len(relevant)} results")
             lines.append("")
-            for r in relevant[:5]:
+            for r in relevant[:8]:
+                score = r.get("_score", 0)
                 agent = r.get("agent_id", "?")
+                chip = r.get("chip_name", "")
+                tier = r.get("chip_tier", "")
+                chip_tag = f" [{chip}]" if chip else (f" [tier={tier}]" if tier else "")
+
+                # Adapt display based on record type
                 tps = r.get("tokens_per_sec")
                 status = r.get("status", "")
                 desc = r.get("description", r.get("title", r.get("insight", "?")))
-                score = r.get("_score", 0)
-                if tps is not None:
-                    lines.append(f"  [{agent}] tokens/s={tps:.1f} ({status}) — {desc} (relevance={score:.2f})")
+                hyp = r.get("hypothesis", "")
+                insight_text = r.get("insight", "")
+
+                if tps is not None and status:
+                    # Result record
+                    delta = r.get("delta_vs_best")
+                    delta_str = f" delta={delta:+.1f}" if delta is not None else ""
+                    lines.append(f"  [{agent}{chip_tag}] {status.upper()} tokens/s={tps:.1f}{delta_str} — {desc} (score={score:.2f})")
+                    if r.get("git_diff"):
+                        diff_preview = r["git_diff"][:200].replace('\n', ' | ')
+                        lines.append(f"    diff: {diff_preview}")
+                elif insight_text:
+                    # Insight record
+                    lines.append(f"  [{agent}{chip_tag}] INSIGHT: {insight_text[:120]} (score={score:.2f})")
+                elif hyp:
+                    # Hypothesis record
+                    priority = r.get("priority", "?")
+                    lines.append(f"  [{agent}] HYPOTHESIS [P{priority}]: {desc} (score={score:.2f})")
+                    lines.append(f"    {hyp[:150]}")
                 else:
-                    lines.append(f"  [{agent}] {desc} (relevance={score:.2f})")
+                    lines.append(f"  [{agent}] {desc} (score={score:.2f})")
 
             summary = "\n".join(lines)
             print(summary)
             return {
                 "relevant_results": relevant,
-                "best_match": best_match,
+                "best_match": relevant[0] if relevant else None,
                 "namespace_searched": namespace or "all",
                 "summary": summary,
             }
@@ -975,21 +1056,84 @@ class Coordinator:
             return {"relevant_results": [], "best_match": None, "namespace_searched": namespace or "all", "summary": f"Error: {e}"}
 
     def list_namespace(self, namespace: str, limit: int = 50) -> list[dict]:
-        """List all keys under a namespace prefix (results, claims, insights, hypotheses)."""
+        """List all keys under a namespace prefix and fetch their values for display."""
         try:
             result = self._rpc("list_keys", {
                 "prefix": f"@{HUB_ORG}/{namespace}/",
                 "limit": limit,
             })
             keys = result.get("keys", [])
-            entries = []
+
+            # Collect key names
+            key_names = []
             for k in keys:
                 if isinstance(k, dict):
-                    entries.append(k)
+                    name = k.get("key_name", "")
                 elif isinstance(k, str):
-                    entries.append({"key_name": k})
+                    name = k
+                else:
+                    continue
+                if not name.startswith(f"@{HUB_ORG}/"):
+                    name = f"@{HUB_ORG}/{name}"
+                key_names.append(name)
+
+            if not key_names:
+                print(f"No entries in {namespace}/")
+                return []
+
+            # Fetch values for richer display
+            entries = []
+            for kn in key_names:
+                entry = {"key_name": kn}
+                try:
+                    r = self._rpc("get_memory", {"key_names": [kn]})
+                    results = r.get("results", [])
+                    if results and results[0].get("status") == "success":
+                        data = json.loads(results[0].get("value", "{}"))
+                        entry.update(data)
+                except Exception:
+                    pass
+                entries.append(entry)
+
+            # Display based on namespace type
+            print(f"\n{namespace}/ ({len(entries)} entries):")
+            print("-" * 60)
             for e in entries:
-                print(f"  {e.get('key_name', e)}")
+                agent = e.get("agent_id", "?")
+                kn = e.get("key_name", "?")
+                short_key = kn.rsplit("/", 1)[-1] if "/" in kn else kn
+
+                if namespace == "results":
+                    tps = e.get("tokens_per_sec", "?")
+                    status = e.get("status", "?")
+                    desc = e.get("description", "?")
+                    chip = e.get("chip_name", "")
+                    chip_tag = f" [{chip}]" if chip else ""
+                    print(f"  {short_key}")
+                    print(f"    [{agent}{chip_tag}] {status.upper()} tokens/s={tps} — {desc}")
+                elif namespace == "insights":
+                    text = e.get("insight", e.get("text", "?"))
+                    chip = e.get("chip_name", "")
+                    chip_tag = f" [{chip}]" if chip else ""
+                    print(f"  {short_key}")
+                    print(f"    [{agent}{chip_tag}] {text[:120]}")
+                elif namespace == "hypotheses":
+                    title = e.get("title", "?")
+                    hyp = e.get("hypothesis", "")
+                    priority = e.get("priority", "?")
+                    print(f"  {short_key}")
+                    print(f"    [{agent}] [P{priority}] {title}")
+                    if hyp:
+                        print(f"    {hyp[:150]}")
+                elif namespace == "claims":
+                    desc = e.get("description", "?")
+                    claimed_at = e.get("claimed_at", "?")
+                    print(f"  {short_key}")
+                    print(f"    [{agent}] {desc} (claimed {claimed_at})")
+                else:
+                    print(f"  {short_key}: {json.dumps(e, default=str)[:120]}")
+
+            print()
             return entries
 
         except Exception as e:
@@ -997,7 +1141,11 @@ class Coordinator:
             return []
 
     def get_swarm_insights(self, topic: str) -> list[dict]:
-        """Search insights by topic to see what the group has learned."""
+        """Search insights by topic to see what the group has learned.
+
+        Returns full insight records so agents can see chip context,
+        evidence, and the complete insight text without further lookups.
+        """
         try:
             result = self._rpc("search_memories", {
                 "query": topic,
@@ -1014,10 +1162,23 @@ class Coordinator:
                 except (json.JSONDecodeError, KeyError):
                     pass
 
+            if not insights:
+                print(f"No insights found for topic: {topic}")
+                return []
+
+            print(f"\nInsights matching '{topic}' ({len(insights)} results):")
+            print("-" * 60)
             for i in insights:
                 agent = i.get("agent_id", "?")
                 text = i.get("insight", i.get("text", "?"))
-                print(f"  [{agent}] {text[:80]}")
+                chip = i.get("chip_name", "")
+                chip_tag = f" [{chip}]" if chip else ""
+                tps = i.get("tokens_per_sec")
+                tps_tag = f" tokens/s={tps:.1f}" if tps else ""
+                score = i.get("_score", 0)
+                print(f"  [{agent}{chip_tag}{tps_tag}] (score={score:.2f})")
+                print(f"    {text}")
+                print()
             return insights
 
         except Exception as e:
@@ -1025,10 +1186,14 @@ class Coordinator:
             return []
 
     def get_unclaimed_hypotheses(self, limit: int = 10) -> list[dict]:
-        """Get hypotheses that haven't been claimed/tested yet."""
+        """Get hypotheses that haven't been claimed/tested yet.
+
+        Returns full hypothesis records with title, reasoning, priority,
+        and who proposed it — so agents can evaluate without further lookups.
+        """
         try:
             result = self._rpc("search_memories", {
-                "query": "autoresearch hypothesis experiment suggestion ANE inference",
+                "query": "hypothesis experiment suggestion optimization inference speed",
                 "limit": limit,
                 "prefix": f"@{HUB_ORG}/hypotheses/",
             })
@@ -1036,12 +1201,32 @@ class Coordinator:
             for match in result.get("results", []):
                 try:
                     hyp = json.loads(match.get("value", "{}"))
+                    hyp["_score"] = match.get("score", 0)
+                    hyp["_key"] = match.get("key_name", "")
                     hypotheses.append(hyp)
                 except (json.JSONDecodeError, KeyError):
                     pass
 
+            # Sort by priority (lower number = higher priority)
+            hypotheses.sort(key=lambda h: h.get("priority", 99))
+
+            if not hypotheses:
+                print("No unclaimed hypotheses.")
+                return hypotheses
+
+            print(f"\nUnclaimed hypotheses ({len(hypotheses)}):")
+            print("-" * 60)
             for h in hypotheses:
-                print(f"  [P{h.get('priority', '?')}] {h.get('title', '?')}")
+                agent = h.get("agent_id", "?")
+                title = h.get("title", "?")
+                hyp_text = h.get("hypothesis", "")
+                priority = h.get("priority", "?")
+                created = h.get("created_at", "?")
+                print(f"  [P{priority}] {title}")
+                print(f"    By: {agent} | Created: {created}")
+                if hyp_text:
+                    print(f"    Reasoning: {hyp_text[:200]}")
+                print()
             return hypotheses
 
         except Exception as e:
@@ -1052,7 +1237,7 @@ class Coordinator:
         """Get recent experiment results from the swarm."""
         try:
             result = self._rpc("search_memories", {
-                "query": "autoresearch experiment result tokens_per_sec ANE inference",
+                "query": "experiment result tokens per second inference benchmark",
                 "limit": limit,
                 "prefix": f"@{HUB_ORG}/results/",
             })
@@ -1074,31 +1259,44 @@ class Coordinator:
     # --- Insights & Hypotheses ---
 
     def post_insight(self, insight: str, evidence_keys: list[str] = None) -> None:
-        """Post an observation/learning to the collective."""
+        """Post an observation/learning to the collective.
+
+        Each insight is self-contained: includes the agent's chip context and
+        a rich embed description so other agents find it via semantic search.
+        """
         try:
             slug = _slugify(insight)
-            agent = _slugify(self.agent_id or "unknown", max_len=20)
+            agent = _slugify(self.agent_id, max_len=20)
             short_hash = hashlib.sha256(insight.encode()).hexdigest()[:6]
             insight_key = f"@{HUB_ORG}/insights/{agent}--{slug}--{short_hash}"
 
             insight_data = {
-                "agent_id": self.agent_id or "unknown",
+                "agent_id": self.agent_id,
+                "chip_name": self.chip_name,
+                "chip_tier": self.chip_tier,
+                "ane_tops": self.ane_tops,
                 "insight": insight,
                 "evidence_keys": evidence_keys or [],
                 "posted_at": _now_iso(),
             }
 
+            # Rich embed: include the full insight text + chip context so semantic
+            # search surfaces this insight for relevant queries.
+            embed_desc = (
+                f"Insight by {self.agent_id} on {self._chip_context()}: {insight}"
+            )
+
             value_b64 = base64.b64encode(json.dumps(insight_data).encode()).decode()
             self._rpc("create_memory", {"items": [{
                 "key_name": insight_key,
-                "description": f"[autoresearch] Insight by {self.agent_id or 'unknown'}: {insight}",
+                "description": embed_desc,
                 "value": value_b64,
                 "base64": True,
                 "embed": True,
                 "embed_source": "description",
             }]})
 
-            self._log(f"Published insight: {insight}")
+            self._log(f"Published insight: {insight[:80]}")
 
         except Exception as e:
             self._log(f"post_insight error: {e}")
@@ -1111,15 +1309,21 @@ class Coordinator:
         evidence_keys: Optional[list[str]] = None,
         priority: int = 3,
     ) -> None:
-        """Publish a research hypothesis for other agents to consider."""
+        """Publish a research hypothesis for other agents to consider.
+
+        Each hypothesis is self-contained: includes the full reasoning,
+        who proposed it, their chip context, and a rich embed description.
+        """
         try:
             slug = _slugify(title)
-            agent = _slugify(self.agent_id or "unknown", max_len=20)
+            agent = _slugify(self.agent_id, max_len=20)
             short_hash = hashlib.sha256(title.encode()).hexdigest()[:6]
             hyp_key = f"@{HUB_ORG}/hypotheses/{agent}--{slug}--{short_hash}"
 
             hyp_data = {
-                "agent_id": self.agent_id or "unknown",
+                "agent_id": self.agent_id,
+                "chip_name": self.chip_name,
+                "chip_tier": self.chip_tier,
                 "title": title,
                 "hypothesis": hypothesis,
                 "suggested_config": suggested_config,
@@ -1128,17 +1332,24 @@ class Coordinator:
                 "created_at": _now_iso(),
             }
 
+            # Rich embed: include title + full hypothesis text so semantic search
+            # finds this when agents search for related optimization topics.
+            embed_desc = (
+                f"Hypothesis by {self.agent_id} [priority {priority}]: {title}. "
+                f"Reasoning: {hypothesis}"
+            )
+
             value_b64 = base64.b64encode(json.dumps(hyp_data).encode()).decode()
             self._rpc("create_memory", {"items": [{
                 "key_name": hyp_key,
-                "description": f"[autoresearch] Hypothesis: {title}",
+                "description": embed_desc,
                 "value": value_b64,
                 "base64": True,
                 "embed": True,
                 "embed_source": "description",
             }]})
 
-            self._log(f"Published hypothesis: {title}")
+            self._log(f"Published hypothesis [P{priority}]: {title}")
 
         except Exception as e:
             self._log(f"publish_hypothesis error: {e}")
@@ -1174,12 +1385,17 @@ class Coordinator:
             best = self.pull_best()
             lines = []
             lines.append("=" * 60)
-            lines.append("ANE Inference Speed Research Summary")
+            lines.append(f"ANE Inference Speed Research Summary (agent: {self.agent_id})")
             lines.append("=" * 60)
 
             lines.append(f"\nBest config: {best.get('description', 'none')}")
             if best.get("tokens_per_sec"):
                 lines.append(f"  tokens/s: {best['tokens_per_sec']:.1f}")
+                by = best.get("agent_id", best.get("achieved_by", "?"))
+                lines.append(f"  achieved by: {by}")
+                chip = best.get("chip_name", "")
+                if chip:
+                    lines.append(f"  chip: {chip}")
 
             output = "\n".join(lines)
             print(output)
@@ -1189,7 +1405,7 @@ class Coordinator:
             return f"Error: {e}"
 
     def analyze_swarm(self) -> dict:
-        """Comprehensive swarm state analysis."""
+        """Comprehensive swarm state analysis with full context."""
         try:
             # Global best
             global_best = None
@@ -1201,7 +1417,7 @@ class Coordinator:
 
             # Recent results
             result_search = self._rpc("search_memories", {
-                "query": "experiment result tokens_per_sec ANE inference",
+                "query": "experiment result tokens per second inference benchmark",
                 "limit": 30,
                 "prefix": f"@{HUB_ORG}/results/",
             })
@@ -1224,7 +1440,7 @@ class Coordinator:
 
             # Active claims
             claim_search = self._rpc("search_memories", {
-                "query": "autoresearch claim experiment",
+                "query": "agent working on experiment claim",
                 "limit": 20,
                 "prefix": f"@{HUB_ORG}/claims/",
             })
@@ -1241,8 +1457,20 @@ class Coordinator:
                 except Exception:
                     pass
 
-            # Unclaimed hypotheses
-            unclaimed = self.get_unclaimed_hypotheses(limit=5)
+            # Unclaimed hypotheses (fetch but don't print — we print our own summary)
+            hyp_search = self._rpc("search_memories", {
+                "query": "hypothesis experiment suggestion optimization inference speed",
+                "limit": 10,
+                "prefix": f"@{HUB_ORG}/hypotheses/",
+            })
+            unclaimed = []
+            for match in hyp_search.get("results", []):
+                try:
+                    hyp = json.loads(match.get("value", "{}"))
+                    unclaimed.append(hyp)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            unclaimed.sort(key=lambda h: h.get("priority", 99))
 
             # Per-agent bests
             agent_bests = self.get_all_agent_bests()
@@ -1252,9 +1480,14 @@ class Coordinator:
             has_tier_data = any(v is not None for v in tier_bests.values())
 
             # Build summary
-            lines = ["=" * 54, "  SWARM ANALYSIS", "=" * 54]
+            lines = ["=" * 60, "  SWARM ANALYSIS", "=" * 60]
+
+            # Global best
             if global_best:
-                lines.append(f"Global best: tokens/s={global_best.get('tokens_per_sec', '?'):.1f} by {global_best.get('agent_id', global_best.get('achieved_by', '?'))}")
+                best_by = global_best.get("agent_id", global_best.get("achieved_by", "?"))
+                best_chip = global_best.get("chip_name", "")
+                chip_tag = f" on {best_chip}" if best_chip else ""
+                lines.append(f"Global best: tokens/s={global_best.get('tokens_per_sec', '?'):.1f} by {best_by}{chip_tag}")
                 if global_best.get("achieved_at"):
                     lines.append(f"  Achieved at: {global_best['achieved_at']}")
                 if global_best.get("description"):
@@ -1262,40 +1495,76 @@ class Coordinator:
             else:
                 lines.append("Global best: none yet")
 
+            # Keeps
             lines.append(f"\nKeeps ({len(recent_keeps)}):")
-            for r in recent_keeps[:5]:
-                lines.append(f"  [{r.get('agent_id', '?')}] tokens/s={r.get('tokens_per_sec', 0):.1f} — {r.get('description', '?')}")
+            for r in recent_keeps[:8]:
+                agent = r.get("agent_id", "?")
+                tps = r.get("tokens_per_sec", 0)
+                desc = r.get("description", "?")
+                chip = r.get("chip_name", "")
+                chip_tag = f" [{chip}]" if chip else ""
+                delta = r.get("delta_vs_best")
+                delta_str = f" delta={delta:+.1f}" if delta is not None else ""
+                lines.append(f"  [{agent}{chip_tag}] tokens/s={tps:.1f}{delta_str} — {desc}")
 
+            # Failures
             lines.append(f"\nFailures ({len(recent_failures)}):")
             for r in recent_failures[:5]:
-                lines.append(f"  [{r.get('agent_id', '?')}] {r.get('status', '?')} — {r.get('description', '?')}")
+                agent = r.get("agent_id", "?")
+                desc = r.get("description", "?")
+                status = r.get("status", "?")
+                chip = r.get("chip_name", "")
+                chip_tag = f" [{chip}]" if chip else ""
+                lines.append(f"  [{agent}{chip_tag}] {status} — {desc}")
 
+            # Active claims
             lines.append(f"\nActive claims ({len(active_claims)}):")
             for c in active_claims:
-                lines.append(f"  [{c.get('agent_id', '?')}] {c.get('description', '?')}")
+                agent = c.get("agent_id", "?")
+                desc = c.get("description", "?")
+                chip = c.get("chip_name", "")
+                chip_tag = f" [{chip}]" if chip else ""
+                lines.append(f"  [{agent}{chip_tag}] {desc}")
 
+            # Hypotheses
             lines.append(f"\nUnclaimed hypotheses ({len(unclaimed)}):")
-            for h in unclaimed[:3]:
-                lines.append(f"  {h.get('title', '?')} (priority={h.get('priority', '?')})")
+            for h in unclaimed[:5]:
+                agent = h.get("agent_id", "?")
+                title = h.get("title", "?")
+                priority = h.get("priority", "?")
+                hyp_text = h.get("hypothesis", "")
+                lines.append(f"  [P{priority}] {title} (by {agent})")
+                if hyp_text:
+                    lines.append(f"    {hyp_text[:120]}")
 
+            # Agent bests
             lines.append(f"\nAgent personal bests ({len(agent_bests)}):")
             for ab in agent_bests:
+                agent = ab.get("agent_id", "?")
+                tps = ab.get("tokens_per_sec", 0)
+                desc = ab.get("description", "?")
+                chip = ab.get("chip_name", "")
+                chip_tag = f" [{chip}]" if chip else ""
                 prev = ab.get("previous_best_tokens_per_sec")
-                improvement = f" (improved +{ab['tokens_per_sec'] - prev:.1f} from {prev:.1f})" if prev else ""
-                tier_tag = f" [{ab.get('chip_tier', '?')}]" if ab.get("chip_tier") else ""
-                lines.append(f"  [{ab.get('agent_id', '?')}]{tier_tag} tokens/s={ab.get('tokens_per_sec', 0):.1f}{improvement} — {ab.get('description', '?')}")
+                improvement = f" (improved +{tps - prev:.1f} from {prev:.1f})" if prev else ""
+                tier_tag = f" [tier={ab.get('chip_tier', '?')}]" if ab.get("chip_tier") else ""
+                lines.append(f"  [{agent}{chip_tag}{tier_tag}] tokens/s={tps:.1f}{improvement} — {desc}")
 
+            # Tier bests
             if has_tier_data:
                 lines.append(f"\nChip tier bests:")
                 for tier_name, tb in tier_bests.items():
                     tops = CHIP_TIERS[tier_name]
                     label = f"≤{tops} TOPS"
                     if tb:
-                        lines.append(f"  {tier_name} ({label}): tokens/s={tb.get('tokens_per_sec', 0):.1f} by {tb.get('agent_id', tb.get('achieved_by', '?'))} — {tb.get('description', '?')}")
+                        by = tb.get("agent_id", tb.get("achieved_by", "?"))
+                        chip = tb.get("chip_name", "")
+                        chip_tag = f" [{chip}]" if chip else ""
+                        lines.append(f"  {tier_name} ({label}): tokens/s={tb.get('tokens_per_sec', 0):.1f} by {by}{chip_tag} — {tb.get('description', '?')}")
                     else:
                         lines.append(f"  {tier_name} ({label}): no results yet")
 
-            lines.append("=" * 54)
+            lines.append("=" * 60)
 
             summary = "\n".join(lines)
             print(summary)
@@ -1321,8 +1590,8 @@ class Coordinator:
 
     # --- Dedup / Prior Art (backward compat) ---
 
-    def check_tried(self, description: str, limit: int = 3) -> list[dict]:
-        """Search for similar past experiments."""
+    def check_tried(self, description: str, limit: int = 5) -> list[dict]:
+        """Search for similar past experiments. Shows full context per match."""
         matches = []
         try:
             result = self._rpc("search_memories", {
@@ -1347,18 +1616,29 @@ class Coordinator:
                 pass
 
         if matches:
-            print(f"Found {len(matches)} similar past experiments:")
+            print(f"\nSimilar past experiments ({len(matches)} found):")
+            print("-" * 60)
             for m in matches:
                 if isinstance(m, dict):
                     val = m.get("value", "")
+                    score = m.get("score", 0)
                     try:
                         data = json.loads(val) if isinstance(val, str) else val
+                        agent = data.get("agent_id", "?")
                         desc = data.get("description", m.get("key_name", ""))
                         status = data.get("status", "?")
                         tps = data.get("tokens_per_sec", data.get("benchmark", {}).get("tokens_per_sec", "?"))
-                        print(f"  [{status}] {str(desc)[:60]} (tokens/s={tps})")
+                        chip = data.get("chip_name", "")
+                        chip_tag = f" [{chip}]" if chip else ""
+                        print(f"  [{agent}{chip_tag}] {status.upper()} tokens/s={tps} — {desc} (match={score:.2f})")
+                        # Show diff preview if available
+                        diff = data.get("git_diff", "")
+                        if diff:
+                            diff_preview = diff[:150].replace('\n', ' | ')
+                            print(f"    diff: {diff_preview}")
                     except (json.JSONDecodeError, AttributeError):
                         print(f"  {m.get('key_name', m)}")
+            print()
         else:
             print("No similar experiments found.")
         return matches
@@ -1374,10 +1654,11 @@ def _cli():
         print("Usage: python3 scripts/coordinator.py <command> [args...]")
         print()
         print("Commands:")
+        print("  set_agent            '<codename>'  Set agent identity (persisted to .autoresearch-agent)")
+        print("  announce             Print startup banner with swarm state")
         print("  analyze              Local summary of best result")
         print("  analyze_swarm        Full swarm state (claims, results, hypotheses, bests)")
-        print("  announce             Print startup banner with swarm state")
-        print("  join_hub             Join the autoresearch-at-home hub")
+        print("  join_hub             Join the austin_mac hub")
         print("  publish_result       '<desc>' '<bench_json>' ['<git_diff>'] [status]")
         print("  check_tried          '<idea>'")
         print("  claim                '<description>'")
@@ -1392,8 +1673,20 @@ def _cli():
         print("  list_namespace       '<namespace>'")
         sys.exit(1)
 
-    coord = Coordinator()
     cmd = sys.argv[1]
+
+    # set_agent doesn't need a full Coordinator
+    if cmd == "set_agent":
+        if len(sys.argv) < 3:
+            print("Usage: set_agent '<codename>'")
+            sys.exit(1)
+        codename = sys.argv[2].strip()
+        _set_agent_id(codename)
+        print(f"Agent identity set to: {codename}")
+        print(f"Saved to: {AGENT_FILE}")
+        return
+
+    coord = Coordinator()
 
     if cmd == "analyze":
         if not coord.connected:
@@ -1449,14 +1742,10 @@ def _cli():
         coord.publish_hypothesis(title, hypothesis, priority=priority)
 
     elif cmd == "list_hypotheses":
-        hypotheses = coord.get_unclaimed_hypotheses()
-        if not hypotheses:
-            print("No hypotheses found.")
+        coord.get_unclaimed_hypotheses()
 
     elif cmd == "get_unclaimed_hypotheses":
-        hypotheses = coord.get_unclaimed_hypotheses()
-        if not hypotheses:
-            print("No unclaimed hypotheses.")
+        coord.get_unclaimed_hypotheses()
 
     elif cmd == "post_insight":
         if len(sys.argv) < 3:
