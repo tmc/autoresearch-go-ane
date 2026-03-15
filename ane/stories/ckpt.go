@@ -65,10 +65,6 @@ func SaveCheckpoint(path string, meta TrainMeta, mw *ModelWeights, opt *OptimSta
 	return saveCheckpoint(path, ckptVersionV3, meta, mw, opt)
 }
 
-func SaveCheckpointV2(path string, meta TrainMeta, mw *ModelWeights, opt *OptimState) error {
-	return saveCheckpoint(path, ckptVersionV2, meta, mw, opt)
-}
-
 func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights, opt *OptimState) error {
 	if len(mw.Layers) != NLayers {
 		return fmt.Errorf("layers=%d want=%d", len(mw.Layers), NLayers)
@@ -241,10 +237,6 @@ func LoadCheckpoint(path string, mw *ModelWeights, opt *OptimState) (TrainMeta, 
 	}
 	defer f.Close()
 	return loadCheckpointFile(f, mw, opt)
-}
-
-func LoadCheckpointV2(path string, mw *ModelWeights, opt *OptimState) (TrainMeta, error) {
-	return LoadCheckpoint(path, mw, opt)
 }
 
 func loadCheckpointFile(f *os.File, mw *ModelWeights, opt *OptimState) (TrainMeta, error) {
