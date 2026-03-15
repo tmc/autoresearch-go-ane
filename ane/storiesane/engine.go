@@ -755,12 +755,22 @@ func (e *Engine) evalLogitsInto(tokens []uint16, logits []float32) error {
 		return fmt.Errorf("storiesane eval logits: logits len=%d want=%d", len(logits), stories.Vocab*e.seq)
 	}
 	e.ensureOffload()
-	if e.useANE && e.ensureLayers() == nil {
-		err := e.evalLogitsANEInto(tokens, logits)
-		if err == nil {
-			return nil
+	if e.useANE {
+		// Try inference-only layers first (skip taps layer compilation).
+		if e.ensureInferLayers() == nil {
+			err := e.evalLogitsANEInto(tokens, logits)
+			if err == nil {
+				return nil
+			}
 		}
-		e.disableLayerForward(err)
+		// Fallback to taps layers.
+		if e.ensureLayers() == nil {
+			err := e.evalLogitsANEInto(tokens, logits)
+			if err == nil {
+				return nil
+			}
+			e.disableLayerForward(err)
+		}
 	}
 	return e.evalLogitsCPUInto(tokens, logits)
 }
