@@ -169,6 +169,10 @@ As a use case: the user might leave you running while they sleep. If each experi
 - `UseANE` — enable Apple Neural Engine acceleration
 - `HybridBackward` — enable ANE backward pass
 - `Seed` — random seed for initialization
+- `EmbedLRMult` — LR multiplier for embedding params (Embed, VEEmbed)
+- `ScalarLRMult` — LR multiplier for scalar params (VEGate, SmearLambda, BackoutLambda)
+- `LambdaLRMult` — LR multiplier for lambda params, relative to scalar LR (default 0.01)
+- `LambdaBeta1`, `LambdaBeta2` — custom Adam betas for lambda params (default 0.96, 0.95)
 
 #### Learning rate schedule
 The `lrSchedule(progress float64) float64` function controls how learning rate varies during training. `progress` goes from 0.0 to 1.0 over the training budget.

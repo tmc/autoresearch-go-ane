@@ -945,14 +945,20 @@ func (e *Engine) backwardAndApply(input []uint16, stepT int, useHybrid bool) tim
 	}
 	e.clipLayerGradients(e.applyGrads, e.gEmbed)
 	adamStart := time.Now()
+	// Matrix params: base LR, base betas, weight decay.
 	invBC1, invBC2 := adamBiasCorrectionInv(stepT, e.adamBeta1, e.adamBeta2)
 	e.applyLayerAdamAll(e.applyGrads, stepT, invBC1, invBC2)
-	adamUpdateCFWithInv(e.mw.Embed, e.gEmbed, &e.opt.Embed, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, e.weightDecay, invBC1, invBC2, true)
-	adamUpdateCFWithInv(e.mw.ResidLambdas, e.gResidLambdas, &e.opt.ResidLambdas, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
-	adamUpdateCFWithInv(e.mw.X0Lambdas, e.gX0Lambdas, &e.opt.X0Lambdas, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
-	adamUpdateCFWithInv(e.mw.SmearGate, e.gSmearGate, &e.opt.SmearGate, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
-	adamUpdateCFWithInv(e.mw.SmearLambda, e.gSmearLambda, &e.opt.SmearLambda, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
-	adamUpdateCFWithInv(e.mw.BackoutLambda, e.gBackoutLambda, &e.opt.BackoutLambda, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	// SmearGate is a matrix param.
+	adamUpdateCFWithInv(e.mw.SmearGate, e.gSmearGate, &e.opt.SmearGate, e.lr, e.adamBeta1, e.adamBeta2, e.adamEps, e.weightDecay, invBC1, invBC2, false)
+	// Embed params: embed LR, no weight decay.
+	adamUpdateCFWithInv(e.mw.Embed, e.gEmbed, &e.opt.Embed, e.embedLR, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, true)
+	// Scalar params: scalar LR, no weight decay.
+	adamUpdateCFWithInv(e.mw.SmearLambda, e.gSmearLambda, &e.opt.SmearLambda, e.scalarLR, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	adamUpdateCFWithInv(e.mw.BackoutLambda, e.gBackoutLambda, &e.opt.BackoutLambda, e.scalarLR, e.adamBeta1, e.adamBeta2, e.adamEps, 0, invBC1, invBC2, false)
+	// Lambda params: lambda LR, custom betas.
+	invBC1l, invBC2l := adamBiasCorrectionInv(stepT, e.lambdaBeta1, e.lambdaBeta2)
+	adamUpdateCFWithInv(e.mw.ResidLambdas, e.gResidLambdas, &e.opt.ResidLambdas, e.lambdaLR, e.lambdaBeta1, e.lambdaBeta2, e.adamEps, 0, invBC1l, invBC2l, false)
+	adamUpdateCFWithInv(e.mw.X0Lambdas, e.gX0Lambdas, &e.opt.X0Lambdas, e.lambdaLR, e.lambdaBeta1, e.lambdaBeta2, e.adamEps, 0, invBC1l, invBC2l, false)
 	e.stepMetrics.addAdam(time.Since(adamStart))
 	compileDur := e.refreshANERuntimeForWeights()
 	e.state.AdamT = uint32(stepT)
@@ -998,6 +1004,8 @@ func (e *Engine) applyLayerAdamAll(grads []stories.LayerWeights, t int, invBC1, 
 			e.weightDecay,
 			invBC1,
 			invBC2,
+			e.embedLR,
+			e.scalarLR,
 		)
 		return struct{}{}, nil
 	}, func(struct{}) {})
@@ -1014,6 +1022,8 @@ func (e *Engine) applyLayerAdamAll(grads []stories.LayerWeights, t int, invBC1, 
 				e.weightDecay,
 				invBC1,
 				invBC2,
+				e.embedLR,
+				e.scalarLR,
 			)
 		}
 	}
@@ -1075,15 +1085,18 @@ func veBackwardCF(dVEEmbed, dVEGate, dPrev, dv, ve, veGateAct, veEmbed, veGate, 
 	}
 }
 
-func applyLayerAdam(dst *stories.LayerWeights, grad *stories.LayerWeights, st *stories.LayerOptimState, lr, b1, b2, eps, wd, invBC1, invBC2 float32) {
+func applyLayerAdam(dst *stories.LayerWeights, grad *stories.LayerWeights, st *stories.LayerOptimState, lr, b1, b2, eps, wd, invBC1, invBC2, embedLR, scalarLR float32) {
+	// Matrix params: base LR, weight decay.
 	adamUpdateCFWithInv(dst.Wq, grad.Wq, &st.Wq, lr, b1, b2, eps, wd, invBC1, invBC2, false)
 	adamUpdateCFWithInv(dst.Wk, grad.Wk, &st.Wk, lr, b1, b2, eps, wd, invBC1, invBC2, false)
 	adamUpdateCFWithInv(dst.Wv, grad.Wv, &st.Wv, lr, b1, b2, eps, wd, invBC1, invBC2, false)
 	adamUpdateCFWithInv(dst.Wo, grad.Wo, &st.Wo, lr, b1, b2, eps, wd, invBC1, invBC2, false)
 	adamUpdateCFWithInv(dst.W1, grad.W1, &st.W1, lr, b1, b2, eps, wd, invBC1, invBC2, false)
 	adamUpdateCFWithInv(dst.W2, grad.W2, &st.W2, lr, b1, b2, eps, wd, invBC1, invBC2, false)
-	adamUpdateCFWithInv(dst.VEEmbed, grad.VEEmbed, &st.VEEmbed, lr, b1, b2, eps, 0, invBC1, invBC2, true)
-	adamUpdateCFWithInv(dst.VEGate, grad.VEGate, &st.VEGate, lr, b1, b2, eps, 0, invBC1, invBC2, false)
+	// VEEmbed: embed LR, no weight decay.
+	adamUpdateCFWithInv(dst.VEEmbed, grad.VEEmbed, &st.VEEmbed, embedLR, b1, b2, eps, 0, invBC1, invBC2, true)
+	// VEGate: scalar LR, no weight decay.
+	adamUpdateCFWithInv(dst.VEGate, grad.VEGate, &st.VEGate, scalarLR, b1, b2, eps, 0, invBC1, invBC2, false)
 }
 
 func adamUpdateCF(w, g []float32, st *stories.AdamState, t int, lr, b1, b2, eps, wd float32) {
