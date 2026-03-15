@@ -843,15 +843,20 @@ func (e *Engine) ensureInferLayers() error {
 	}
 	cfg := e.cfg
 	layers, err := compileParallel(len(e.mw.Layers), func(i int) (*layerForward, error) {
-		// Try monolithic inference kernel first.
+		// Try monolithic inference kernel first (legacy MHA path).
 		lf, err := compileStoriesLayerForwardInference(e.mw.Layers[i], e.seq)
 		if err == nil {
+			return lf, nil
+		}
+		// Try GQA monolithic path (handles qDim != dim).
+		lf, gqaErr := compileGQALayerForwardInference(cfg, e.mw.Layers[i], e.seq)
+		if gqaErr == nil {
 			return lf, nil
 		}
 		// Fall back to tiled compilation for large models.
 		lf, tiledErr := compileStoriesLayerForwardTiled(cfg, e.mw.Layers[i], e.seq)
 		if tiledErr != nil {
-			return nil, fmt.Errorf("storiesane eval logits: compile infer layer %d: monolithic: %v, tiled: %w", i, err, tiledErr)
+			return nil, fmt.Errorf("storiesane eval logits: compile infer layer %d: monolithic: %v, gqa: %v, tiled: %w", i, err, gqaErr, tiledErr)
 		}
 		return lf, nil
 	}, func(lf *layerForward) {
