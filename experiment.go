@@ -45,8 +45,9 @@ func experimentConfig(modelPath string, tokens []uint16) storiesane.Options {
 		WeightDecay:    WeightDecay,
 		GradClip:       GradClip,
 		LossScale:      LossScale,
-		UseANE:         UseANE,
-		HybridBackward: HybridBackward,
+		UseANE:            UseANE,
+		CPUClassifierHead: true,
+		HybridBackward:    HybridBackward,
 	}
 }
 
