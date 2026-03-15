@@ -457,11 +457,10 @@ func (e *Engine) EvalLogits(tokens []int32) ([]float32, error) {
 	if len(tokens) != e.seq {
 		return nil, fmt.Errorf("storiesane eval logits: token len=%d want=%d", len(tokens), e.seq)
 	}
-	out := make([]float32, len(e.logits))
-	if err := e.evalLogitsInto(tokens, out); err != nil {
+	if err := e.evalLogitsInto(tokens, e.logits); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return e.logits, nil
 }
 
 func (e *Engine) attachStepMetrics() {
