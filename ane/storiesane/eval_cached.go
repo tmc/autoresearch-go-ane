@@ -103,20 +103,21 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 			e.fusedQKVW[li] = fused
 		}
 		linearSingle(e.cacheQKV, e.fusedQKVW[li], e.cacheXNorm, qDim+2*kvDim, dim)
-		copy(e.cacheQ, e.cacheQKV[:qDim])
-		copy(e.cacheK, e.cacheQKV[qDim:qDim+kvDim])
-		copy(e.cacheV, e.cacheQKV[qDim+kvDim:])
+		// Use slices directly from fused output to avoid copies.
+		fusedQ := e.cacheQKV[:qDim]
+		fusedK := e.cacheQKV[qDim : qDim+kvDim]
+		fusedV := e.cacheQKV[qDim+kvDim:]
 
-		applyRoPESinglePos(e.cacheQ, heads, headDim, pos, e.cachedRopeCos, e.cachedRopeSin)
-		applyRoPESinglePos(e.cacheK, kvHeads, headDim, pos, e.cachedRopeCos, e.cachedRopeSin)
+		applyRoPESinglePos(fusedQ, heads, headDim, pos, e.cachedRopeCos, e.cachedRopeSin)
+		applyRoPESinglePos(fusedK, kvHeads, headDim, pos, e.cachedRopeCos, e.cachedRopeSin)
 
 		// Append K, V to cache.
-		e.kvc.appendKV(li, e.cacheK, e.cacheV)
+		e.kvc.appendKV(li, fusedK, fusedV)
 
 		// Single-query attention against cached KV.
 		cachedK := e.kvc.getK(li)
 		cachedV := e.kvc.getV(li)
-		singleQueryGQAAttention(e.cacheAttOut, e.cacheQ, cachedK, cachedV,
+		singleQueryGQAAttention(e.cacheAttOut, fusedQ, cachedK, cachedV,
 			heads, kvHeads, headDim, pos+1, e.kvc.maxSeq)
 
 		// Wo projection: [dim, qDim] @ attOut[qDim] → x2[dim]
@@ -134,9 +135,7 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 			e.fusedW1W3[li] = fused
 		}
 		linearSingle(e.cacheH1H3, e.fusedW1W3[li], e.cacheXNorm, 2*hidden, dim)
-		copy(e.cacheH1, e.cacheH1H3[:hidden])
-		copy(e.cacheH3, e.cacheH1H3[hidden:])
-		siluMulAccel(e.cacheGate, e.cacheH1, e.cacheH3)
+		siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
 		linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
 		addScaledResidualSingle(next, e.cacheX2, e.cacheFFOut, dim)
 
@@ -152,10 +151,8 @@ func (e *Engine) EvalNextToken(token uint16) ([]float32, error) {
 
 	e.kvc.advancePos()
 
-	// Return a copy so the caller can hold it.
-	out := make([]float32, vocab)
-	copy(out, e.cacheLogits)
-	return out, nil
+	// Return the internal buffer directly — caller must consume before next call.
+	return e.cacheLogits, nil
 }
 
 // EvalPrefill processes a full prompt through EvalNextToken, populating the
