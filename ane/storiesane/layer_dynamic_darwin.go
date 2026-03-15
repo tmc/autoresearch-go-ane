@@ -40,30 +40,43 @@ type dynamicLayerCompileSpec struct {
 }
 
 func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
+	return dynamicLayerSpecForConfig(stories.DefaultConfig(), seq)
+}
+
+// dynamicLayerSpecForConfig returns a cached compile spec for the given model config and sequence length.
+func dynamicLayerSpecForConfig(cfg stories.ModelConfig, seq int) (*dynamicLayerCompileSpec, error) {
+	// Cache key includes config dimensions so different models get different specs.
+	type specKey struct {
+		dim, hidden, heads, kvHeads, nLayers, seq int
+	}
+	key := specKey{cfg.Dim, cfg.Hidden, cfg.Heads, cfg.EffectiveKVHeads(), cfg.NLayers, seq}
+
 	dynamicLayerSpecs.mu.Lock()
 	if dynamicLayerSpecs.m == nil {
 		dynamicLayerSpecs.m = make(map[int]*dynamicLayerCompileSpec)
 	}
-	if spec := dynamicLayerSpecs.m[seq]; spec != nil {
+	// Use a simple hash for the map key (legacy path uses seq only).
+	mapKey := key.dim*1000000 + key.hidden*1000 + key.heads*100 + key.kvHeads*10 + key.seq
+	if spec := dynamicLayerSpecs.m[mapKey]; spec != nil {
 		dynamicLayerSpecs.mu.Unlock()
 		return spec, nil
 	}
 	dynamicLayerSpecs.mu.Unlock()
 
-	const (
-		dim    = stories.Dim
-		hidden = stories.Hidden
-		heads  = stories.Heads
-	)
+	dim := cfg.Dim
+	hidden := cfg.Hidden
+	heads := cfg.Heads
+	kvHeads := cfg.EffectiveKVHeads()
+
 	maskBlob, err := mil.BuildCausalMaskBlob(seq)
 	if err != nil {
 		return nil, fmt.Errorf("build mask blob: %w", err)
 	}
-	ropeCosBlob, ropeSinBlob, err := mil.BuildRoPECosSinBlobs(seq, dim/heads)
+	ropeCosBlob, ropeSinBlob, err := mil.BuildRoPECosSinBlobs(seq, cfg.HeadDim())
 	if err != nil {
 		return nil, fmt.Errorf("build rope blobs: %w", err)
 	}
-	residualScale := float64(layerResidualScale)
+	residualScale := cfg.ResidualScale()
 	spec := &dynamicLayerCompileSpec{
 		maskBlob:    maskBlob,
 		ropeCosBlob: ropeCosBlob,
@@ -76,16 +89,16 @@ func dynamicLayerSpec(seq int) (*dynamicLayerCompileSpec, error) {
 		sdpa1MIL:    mil.GenStoriesSDPABackward1Dynamic(dim, heads, seq),
 		sdpa2MIL:    mil.GenSDPABackward2(dim, heads, seq),
 		qkvMIL:      mil.GenStoriesQKVBackwardDynamic(dim, heads, seq),
-		attInferMIL: mil.GenStoriesSDPAForwardInference(dim, heads, seq, residualScale),
+		attInferMIL: mil.GenGQASDPAForwardInference(dim, heads, kvHeads, seq, residualScale),
 		ffnInferMIL: mil.GenStoriesFFNForwardInference(dim, hidden, seq, residualScale),
 	}
 
 	dynamicLayerSpecs.mu.Lock()
-	if existing := dynamicLayerSpecs.m[seq]; existing != nil {
+	if existing := dynamicLayerSpecs.m[mapKey]; existing != nil {
 		dynamicLayerSpecs.mu.Unlock()
 		return existing, nil
 	}
-	dynamicLayerSpecs.m[seq] = spec
+	dynamicLayerSpecs.m[mapKey] = spec
 	dynamicLayerSpecs.mu.Unlock()
 	return spec, nil
 }
@@ -712,6 +725,42 @@ func stageStoriesAttentionForwardWeights(k *model.Kernel, seq int, w layerForwar
 		writeTransposedMatrixFP16(data, layout, 0, seq+1+stories.Dim, stories.Dim, stories.Dim, w.Wk)
 		writeTransposedMatrixFP16(data, layout, 0, seq+1+2*stories.Dim, stories.Dim, stories.Dim, w.Wv)
 		writeTransposedMatrixFP16(data, layout, 0, seq+1+3*stories.Dim, stories.Dim, stories.Dim, w.Wo)
+		return nil
+	})
+}
+
+// stageGQAAttentionForwardWeights stages weights for a GQA attention kernel where Wk/Wv have kvDim columns.
+// Layout: x[seq], rms[1], Wq[dim], Wk[kvDim], Wv[kvDim], Wo[dim]
+func stageGQAAttentionForwardWeights(k *model.Kernel, seq, dim, kvDim int, w layerForwardWeights) error {
+	width := seq + 1 + 2*dim + 2*kvDim
+	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
+		if err := requireFP16InputLayout("stage gqa attention forward weights", layout, dim, width); err != nil {
+			return err
+		}
+		for d := 0; d < dim; d++ {
+			row := inputRowFP16(data, layout, d)
+			row[seq] = mil.Float32ToFP16(w.RMSAtt[d])
+		}
+		off := seq + 1
+		writeTransposedMatrixFP16(data, layout, 0, off, dim, dim, w.Wq)
+		off += dim
+		writeTransposedMatrixFP16(data, layout, 0, off, kvDim, dim, w.Wk)
+		off += kvDim
+		writeTransposedMatrixFP16(data, layout, 0, off, kvDim, dim, w.Wv)
+		off += kvDim
+		writeTransposedMatrixFP16(data, layout, 0, off, dim, dim, w.Wo)
+		return nil
+	})
+}
+
+// writeGQAAttentionForwardActs writes activations for a GQA attention kernel.
+func writeGQAAttentionForwardActs(k *model.Kernel, seq, dim, kvDim int, x []float32) error {
+	width := seq + 1 + 2*dim + 2*kvDim
+	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
+		if err := requireFP16InputLayout("write gqa attention forward acts", layout, dim, width); err != nil {
+			return err
+		}
+		writeChannelFirstActsFP16(data, layout, seq, x)
 		return nil
 	})
 }

@@ -133,6 +133,7 @@ func GenFinalRMSNormDynamic(dim, seq int) string {
 		invd,
 		seq,
 		seq,
+		seq,
 		dim, seq,
 		dim, seq,
 	)

@@ -39,23 +39,31 @@ type OptimState struct {
 	Embed    AdamState
 }
 
+// NewOptimState allocates optimizer state for the legacy 110M model.
 func NewOptimState(vocab int) *OptimState {
+	cfg := DefaultConfig()
+	cfg.Vocab = vocab
+	return NewOptimStateFromConfig(cfg)
+}
+
+// NewOptimStateFromConfig allocates optimizer state for an arbitrary config.
+func NewOptimStateFromConfig(cfg ModelConfig) *OptimState {
 	opt := &OptimState{
-		Layers:   make([]LayerOptimState, NLayers),
-		RMSFinal: NewAdamState(Dim),
-		Embed:    NewAdamState(vocab * Dim),
+		Layers:   make([]LayerOptimState, cfg.NLayers),
+		RMSFinal: NewAdamState(cfg.Dim),
+		Embed:    NewAdamState(cfg.Vocab * cfg.Dim),
 	}
 	for i := range opt.Layers {
 		opt.Layers[i] = LayerOptimState{
-			Wq:     NewAdamState(WQSize),
-			Wk:     NewAdamState(WQSize),
-			Wv:     NewAdamState(WQSize),
-			Wo:     NewAdamState(WOSize),
-			W1:     NewAdamState(W1Size),
-			W2:     NewAdamState(W2Size),
-			W3:     NewAdamState(W3Size),
-			RMSAtt: NewAdamState(Dim),
-			RMSFFN: NewAdamState(Dim),
+			Wq:     NewAdamState(cfg.WqSize()),
+			Wk:     NewAdamState(cfg.WkSize()),
+			Wv:     NewAdamState(cfg.WvSize()),
+			Wo:     NewAdamState(cfg.WoSize()),
+			W1:     NewAdamState(cfg.W1Size()),
+			W2:     NewAdamState(cfg.W2Size()),
+			W3:     NewAdamState(cfg.W3Size()),
+			RMSAtt: NewAdamState(cfg.Dim),
+			RMSFFN: NewAdamState(cfg.Dim),
 		}
 	}
 	return opt
@@ -70,10 +78,10 @@ func SaveCheckpointV2(path string, meta TrainMeta, mw *ModelWeights, opt *OptimS
 }
 
 func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights, opt *OptimState) error {
-	if len(mw.Layers) != NLayers {
-		return fmt.Errorf("layers=%d want=%d", len(mw.Layers), NLayers)
+	cfg := mw.Config
+	if len(mw.Layers) != cfg.NLayers {
+		return fmt.Errorf("layers=%d want=%d", len(mw.Layers), cfg.NLayers)
 	}
-	vocab := len(mw.Embed) / Dim
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -100,22 +108,22 @@ func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights
 	if err := writeI32(int32(meta.TotalSteps)); err != nil {
 		return err
 	}
-	if err := writeI32(NLayers); err != nil {
+	if err := writeI32(int32(cfg.NLayers)); err != nil {
 		return err
 	}
-	if err := writeI32(Vocab); err != nil {
+	if err := writeI32(int32(cfg.Vocab)); err != nil {
 		return err
 	}
-	if err := writeI32(Dim); err != nil {
+	if err := writeI32(int32(cfg.Dim)); err != nil {
 		return err
 	}
-	if err := writeI32(Hidden); err != nil {
+	if err := writeI32(int32(cfg.Hidden)); err != nil {
 		return err
 	}
-	if err := writeI32(Heads); err != nil {
+	if err := writeI32(int32(cfg.Heads)); err != nil {
 		return err
 	}
-	if err := writeI32(SeqDefault); err != nil {
+	if err := writeI32(int32(cfg.EffectiveSeq())); err != nil {
 		return err
 	}
 	if err := writeF32(meta.LR); err != nil {
@@ -180,7 +188,7 @@ func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights
 	}
 	if version == ckptVersionV3 {
 		for i := range mw.Layers {
-			layerOpt := zeroLayerOptimState()
+			layerOpt := zeroLayerOptimStateFromConfig(cfg)
 			if opt != nil && i < len(opt.Layers) {
 				layerOpt = opt.Layers[i]
 			}
@@ -190,7 +198,7 @@ func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights
 		}
 	} else {
 		for range mw.Layers {
-			if err := writeZeroLayerOptimState(f); err != nil {
+			if err := writeZeroLayerOptimStateFromConfig(f, cfg); err != nil {
 				return err
 			}
 		}
@@ -199,7 +207,7 @@ func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights
 	if err := writeF32s(f, mw.RMSFinal); err != nil {
 		return err
 	}
-	finalOpt := NewAdamState(Dim)
+	finalOpt := NewAdamState(cfg.Dim)
 	embedOpt := NewAdamState(len(mw.Embed))
 	if opt != nil {
 		finalOpt = opt.RMSFinal
@@ -227,11 +235,7 @@ func saveCheckpoint(path string, version int32, meta TrainMeta, mw *ModelWeights
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	_ = vocab
-	return nil
+	return os.Rename(tmp, path)
 }
 
 func LoadCheckpoint(path string, mw *ModelWeights, opt *OptimState) (TrainMeta, error) {
@@ -248,6 +252,7 @@ func LoadCheckpointV2(path string, mw *ModelWeights, opt *OptimState) (TrainMeta
 }
 
 func loadCheckpointFile(f *os.File, mw *ModelWeights, opt *OptimState) (TrainMeta, error) {
+	cfg := mw.Config
 	if opt != nil {
 		zeroOptimState(opt)
 	}
@@ -307,12 +312,13 @@ func loadCheckpointFile(f *os.File, mw *ModelWeights, opt *OptimState) (TrainMet
 	if err != nil {
 		return TrainMeta{}, err
 	}
-	_, err = readI32()
+	_, err = readI32() // seq
 	if err != nil {
 		return TrainMeta{}, err
 	}
-	if nLayers != NLayers || vocabSize != Vocab || dim != Dim || hidden != Hidden || heads != Heads {
-		return TrainMeta{}, fmt.Errorf("checkpoint config mismatch")
+	if int(nLayers) != cfg.NLayers || int(vocabSize) != cfg.Vocab || int(dim) != cfg.Dim || int(hidden) != cfg.Hidden || int(heads) != cfg.Heads {
+		return TrainMeta{}, fmt.Errorf("checkpoint config mismatch: got layers=%d vocab=%d dim=%d hidden=%d heads=%d, want layers=%d vocab=%d dim=%d hidden=%d heads=%d",
+			nLayers, vocabSize, dim, hidden, heads, cfg.NLayers, cfg.Vocab, cfg.Dim, cfg.Hidden, cfg.Heads)
 	}
 	lr, err := readF32()
 	if err != nil {
@@ -385,7 +391,7 @@ func loadCheckpointFile(f *os.File, mw *ModelWeights, opt *OptimState) (TrainMet
 	if ver == ckptVersionV3 {
 		for i := range mw.Layers {
 			if opt == nil || i >= len(opt.Layers) {
-				if err := skipLayerOptimState(f); err != nil {
+				if err := skipLayerOptimStateFromConfig(f, cfg); err != nil {
 					return TrainMeta{}, err
 				}
 				continue
@@ -396,7 +402,7 @@ func loadCheckpointFile(f *os.File, mw *ModelWeights, opt *OptimState) (TrainMet
 		}
 	} else {
 		for range mw.Layers {
-			if err := skipLayerOptimState(f); err != nil {
+			if err := skipLayerOptimStateFromConfig(f, cfg); err != nil {
 				return TrainMeta{}, err
 			}
 		}
@@ -405,7 +411,7 @@ func loadCheckpointFile(f *os.File, mw *ModelWeights, opt *OptimState) (TrainMet
 		return TrainMeta{}, err
 	}
 	if opt == nil {
-		if err := skipF32(f, Dim*2); err != nil {
+		if err := skipF32(f, cfg.Dim*2); err != nil {
 			return TrainMeta{}, err
 		}
 	} else {
@@ -473,17 +479,22 @@ func zeroOptimState(opt *OptimState) {
 	clear(opt.Embed.V)
 }
 
+// zeroLayerOptimState allocates a zeroed layer optim state for the legacy 110M model.
 func zeroLayerOptimState() LayerOptimState {
+	return zeroLayerOptimStateFromConfig(DefaultConfig())
+}
+
+func zeroLayerOptimStateFromConfig(cfg ModelConfig) LayerOptimState {
 	return LayerOptimState{
-		Wq:     NewAdamState(WQSize),
-		Wk:     NewAdamState(WQSize),
-		Wv:     NewAdamState(WQSize),
-		Wo:     NewAdamState(WOSize),
-		W1:     NewAdamState(W1Size),
-		W2:     NewAdamState(W2Size),
-		W3:     NewAdamState(W3Size),
-		RMSAtt: NewAdamState(Dim),
-		RMSFFN: NewAdamState(Dim),
+		Wq:     NewAdamState(cfg.WqSize()),
+		Wk:     NewAdamState(cfg.WkSize()),
+		Wv:     NewAdamState(cfg.WvSize()),
+		Wo:     NewAdamState(cfg.WoSize()),
+		W1:     NewAdamState(cfg.W1Size()),
+		W2:     NewAdamState(cfg.W2Size()),
+		W3:     NewAdamState(cfg.W3Size()),
+		RMSAtt: NewAdamState(cfg.Dim),
+		RMSFFN: NewAdamState(cfg.Dim),
 	}
 }
 
@@ -507,16 +518,20 @@ func writeLayerOptimState(w io.Writer, st LayerOptimState) error {
 }
 
 func writeZeroLayerOptimState(w io.Writer) error {
+	return writeZeroLayerOptimStateFromConfig(w, DefaultConfig())
+}
+
+func writeZeroLayerOptimStateFromConfig(w io.Writer, cfg ModelConfig) error {
 	for _, n := range []int{
-		WQSize, WQSize,
-		WQSize, WQSize,
-		WQSize, WQSize,
-		WOSize, WOSize,
-		W1Size, W1Size,
-		W2Size, W2Size,
-		W3Size, W3Size,
-		Dim, Dim,
-		Dim, Dim,
+		cfg.WqSize(), cfg.WqSize(),
+		cfg.WkSize(), cfg.WkSize(),
+		cfg.WvSize(), cfg.WvSize(),
+		cfg.WoSize(), cfg.WoSize(),
+		cfg.W1Size(), cfg.W1Size(),
+		cfg.W2Size(), cfg.W2Size(),
+		cfg.W3Size(), cfg.W3Size(),
+		cfg.Dim, cfg.Dim,
+		cfg.Dim, cfg.Dim,
 	} {
 		if err := writeZerosF32(w, n); err != nil {
 			return err
@@ -545,7 +560,30 @@ func readLayerOptimState(r io.Reader, st *LayerOptimState) error {
 }
 
 func skipLayerOptimState(r io.Reader) error {
-	return skipF32(r, 6*WQSize+2*WOSize+2*W1Size+2*W2Size+2*W3Size+4*Dim)
+	return skipLayerOptimStateFromConfig(r, DefaultConfig())
+}
+
+func skipLayerOptimStateFromConfig(r io.Reader, cfg ModelConfig) error {
+	wqSz := cfg.WqSize()
+	wkSz := cfg.WkSize()
+	wvSz := cfg.WvSize()
+	woSz := cfg.WoSize()
+	total := 2*(wqSz+wkSz+wvSz+woSz+cfg.W1Size()+cfg.W2Size()+cfg.W3Size()) + 4*cfg.Dim
+	return skipF32(r, total)
+}
+
+// CheckpointSize returns the byte size of a checkpoint for the given config.
+func CheckpointSize(cfg ModelConfig) int {
+	const headerBytes = 96
+	wqSz := cfg.WqSize()
+	wkSz := cfg.WkSize()
+	wvSz := cfg.WvSize()
+	woSz := cfg.WoSize()
+	layerWeights := cfg.NLayers * (wqSz + wkSz + wvSz + woSz + cfg.W1Size() + cfg.W2Size() + cfg.W3Size() + cfg.Dim*2)
+	layerOpt := cfg.NLayers * 2 * (wqSz + wkSz + wvSz + woSz + cfg.W1Size() + cfg.W2Size() + cfg.W3Size() + cfg.Dim*2)
+	final := cfg.Dim * 3
+	embed := cfg.Vocab * cfg.Dim * 3
+	return headerBytes + 4*(layerWeights+layerOpt+final+embed)
 }
 
 func writeF32s(w io.Writer, vals []float32) error {
