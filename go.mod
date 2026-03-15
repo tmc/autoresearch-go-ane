@@ -7,4 +7,8 @@ require (
 	github.com/tmc/apple v0.0.0-20260314211304-99e9c42d77ed
 )
 
+require github.com/tmc/anperf v0.0.0
+
+replace github.com/tmc/anperf => ../anperf
+
 replace github.com/ebitengine/purego => github.com/tmc/purego v0.10.0-alpha.2.0.20260130081008-0b23e28544a2

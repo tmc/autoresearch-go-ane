@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/tmc/anperf"
 	"github.com/tmc/autoresearch-go-ane/ane/stories"
 	"github.com/tmc/autoresearch-go-ane/ane/storiesane"
 )
@@ -50,6 +52,37 @@ func main() {
 	}
 	defer engine.Close()
 
+	// Start anperf dashboard.
+	perf := anperf.New(
+		anperf.WithCapacity(100000),
+		anperf.WithDataDir(".anperf"),
+		anperf.WithRunName(gitCommit()),
+		anperf.WithSystemInfo(anperf.SystemInfo{
+			Chip:     "Apple Silicon",
+			ANECores: 16,
+		}),
+	)
+	perf.SetHyperparams(map[string]interface{}{
+		"seq_length":     SequenceLength,
+		"accum_steps":    AccumSteps,
+		"learning_rate":  LearningRate,
+		"adam_beta1":     AdamBeta1,
+		"adam_beta2":     AdamBeta2,
+		"weight_decay":   WeightDecay,
+		"grad_clip":      GradClip,
+		"loss_scale":     LossScale,
+		"use_ane":        UseANE,
+		"hybrid_backward": HybridBackward,
+		"seed":           Seed,
+	})
+	http.Handle("/perf/", perf.Handler("/perf/"))
+	go func() {
+		log.Println("anperf dashboard: http://localhost:9090/perf/")
+		if err := http.ListenAndServe(":9090", nil); err != nil {
+			log.Printf("anperf server: %v", err)
+		}
+	}()
+
 	if *evalOnly {
 		loss, err := evalLoss(engine, tokens)
 		if err != nil {
@@ -77,6 +110,33 @@ func main() {
 			os.Exit(1)
 		}
 		steps++
+
+		// Record real metrics to anperf.
+		msOf := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+		stepMs := msOf(res.StepDuration)
+		tokPerSec := float64(SequenceLength) / (stepMs / 1000.0)
+		perf.Record(anperf.StepResult{
+			Step:         steps,
+			Loss:         res.Loss,
+			StepMs:       stepMs,
+			ANEMs:        msOf(res.ANEEvalDuration),
+			AdamMs:       msOf(res.AdamDuration),
+			CPUMs:        msOf(res.CPUWorkDuration),
+			CompileMs:    msOf(res.CompileDuration),
+			TokensPerSec: tokPerSec,
+			Components: map[string]float64{
+				"Compile":       msOf(res.CompileDuration),
+				"StartupCompile": msOf(res.StartupCompileDuration),
+				"ANEEval":       msOf(res.ANEEvalDuration),
+				"FinalHead":     msOf(res.FinalHeadDuration),
+				"EmbedGrad":     msOf(res.EmbedGradDuration),
+				"RMSDW":         msOf(res.RMSDWDuration),
+				"DWGEMM":        msOf(res.DWGEMMDuration),
+				"DWWait":        msOf(res.DWWaitDuration),
+				"WeightRefresh": msOf(res.WeightRefreshDuration),
+				"Adam":          msOf(res.AdamDuration),
+			},
+		})
 
 		if !warmupDone && steps > warmupSteps {
 			warmupDone = true
@@ -124,6 +184,15 @@ func main() {
 	fmt.Printf("seed:             %d\n", Seed)
 
 	logResult(*resultsPath, valLoss, steps, trainElapsed.Seconds(), "ok", "baseline")
+
+	// Auto-save anperf snapshot.
+	if snap, err := perf.SaveSnapshot(gitCommit(), gitCommit(), nil); err == nil {
+		log.Printf("anperf snapshot saved: %s (ANE util %.1f%%, %.0f tok/s)", snap.ID, snap.ANEUtil, snap.AvgTokensSec)
+	}
+
+	// Keep anperf dashboard alive after training completes.
+	log.Println("training done — dashboard still serving at http://localhost:9090/perf/")
+	select {}
 }
 
 // --- token loading ---
