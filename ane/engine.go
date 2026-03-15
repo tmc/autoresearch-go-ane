@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/tmc/apple/x/ane/dynamicmatmul"
@@ -1027,8 +1028,15 @@ func (e *Engine) evalLogitsCPUInto(tokens []int32, logits []float32) error {
 		linearCF(x2, layer.Wo, attOut, dim, qDim, e.seq)
 		addScaledResidual(x2, cur, x2)
 		rmsNormCF(xNorm, x2, layer.RMSFFN, dim, e.seq)
+		// W1 and W3 share the same input (xNorm) — run concurrently.
+		var w3wg sync.WaitGroup
+		w3wg.Add(1)
+		go func() {
+			linearCF(h3, layer.W3, xNorm, hidden, dim, e.seq)
+			w3wg.Done()
+		}()
 		linearCF(h1, layer.W1, xNorm, hidden, dim, e.seq)
-		linearCF(h3, layer.W3, xNorm, hidden, dim, e.seq)
+		w3wg.Wait()
 		siluMulAccel(gate, h1, h3)
 		linearCF(ffOut, layer.W2, gate, dim, hidden, e.seq)
 		addScaledResidual(next, x2, ffOut)
