@@ -10,7 +10,7 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main.
 3. **Read the in-scope files**: Read these files for full context:
    - `experiment.go` — primary experiment file. Hyperparameters, LR schedule, training config.
-   - `helpers.go` — evaluation harness, data loading, random init. Do not modify.
+   - `harness.go` — evaluation harness, data loading, random init. Do not modify.
    - `bench_test.go` — Go benchmarks for measuring step throughput, eval loss, etc. Do not modify.
    - `ane/train_full.go` — forward pass, backward pass, Adam optimizer, gradient clipping. Editable.
    - `ane/train_util.go` — cross-entropy loss, RMS norm gradients, residual scaling, RoPE. Editable.
@@ -49,7 +49,7 @@ These are more impactful but riskier. Changes here can affect correctness, so ve
 
 ### Read-only files
 
-- `helpers.go` — evaluation harness (`evalLoss`), data loading. The ground truth metric.
+- `harness.go` — evaluation harness (`evalLoss`), data loading. The ground truth metric.
 - `bench_test.go` — benchmark harness.
 - `ane/runtime.go` — ANE kernel compilation and weight refresh.
 - `ane/layer_darwin.go`, `ane/backward_darwin.go` — ANE MIL kernel dispatch.
