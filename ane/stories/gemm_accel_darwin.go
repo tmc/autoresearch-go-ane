@@ -9,12 +9,42 @@ package stories
 */
 import "C"
 
+import "sync"
+
 func matMulVocabSeqAccelerate(logits, embed, x []float32, vocab, dim, seq int) bool {
 	if vocab <= 0 || dim <= 0 || seq <= 0 {
 		return false
 	}
 	if len(logits) < vocab*seq || len(embed) < vocab*dim || len(x) < dim*seq {
 		return false
+	}
+	// Split vocab into chunks and compute concurrently.
+	const nSplit = 8
+	chunk := vocab / nSplit
+	if chunk > 0 && vocab > 1000 {
+		var wg sync.WaitGroup
+		for s := 0; s < nSplit; s++ {
+			start := s * chunk
+			size := chunk
+			if s == nSplit-1 {
+				size = vocab - start
+			}
+			wg.Add(1)
+			go func(start, size int) {
+				defer wg.Done()
+				C.cblas_sgemm(
+					C.CblasRowMajor, C.CblasNoTrans, C.CblasNoTrans,
+					C.int(size), C.int(seq), C.int(dim),
+					C.float(1.0),
+					(*C.float)(&embed[start*dim]), C.int(dim),
+					(*C.float)(&x[0]), C.int(seq),
+					C.float(0.0),
+					(*C.float)(&logits[start*seq]), C.int(seq),
+				)
+			}(start, size)
+		}
+		wg.Wait()
+		return true
 	}
 	C.cblas_sgemm(
 		C.CblasRowMajor,
