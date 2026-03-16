@@ -74,7 +74,7 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 	headDim := cfg.HeadDim()
 	kvHeads := cfg.EffectiveKVHeads()
 	nLayers := cfg.NLayers
-	maxSeq := 256
+	maxSeq := 32
 	x := make([]float32, dim)
 	_ = vocab
 	ropeCos := make([]float32, headDim/2)

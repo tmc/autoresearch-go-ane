@@ -151,7 +151,7 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
 
         // RoPE cos/sin for current position: [1, headDim/2] fp32
         int ropeHalf = headDim / 2;
-        int maxSeq = 256; // fixed max sequence length for KV cache
+        int maxSeq = 32; // smaller KV cache = faster SDPA attention
         MPSGraphTensor *ropeCos = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat16 name:@"rope_cos"];
         MPSGraphTensor *ropeSin = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat16 name:@"rope_sin"];
 
@@ -367,7 +367,7 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)t->executable;
 
         int ropeHalf = t->headDim / 2;
-        int maxSeq = 256;
+        int maxSeq = 32;
         size_t xBytes = (size_t)t->dim * sizeof(float);
         size_t ropeBytes = (size_t)ropeHalf * sizeof(float);
         size_t maskBytes = (size_t)maxSeq * sizeof(float);
