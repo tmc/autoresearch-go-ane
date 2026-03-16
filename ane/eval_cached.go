@@ -476,7 +476,7 @@ func rmsNormSingle(out, x, w []float32, dim int) {
 // For large outDim, splits into 4 concurrent sub-GEMVs for better core utilization.
 func linearSingle(out, w, x []float32, outDim, inDim int) {
 	const splitThreshold = 2048
-	const nSplit = 4
+	const nSplit = 8
 	if outDim > splitThreshold {
 		chunk := outDim / nSplit
 		var wg sync.WaitGroup
