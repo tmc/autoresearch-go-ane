@@ -24,7 +24,9 @@ typedef struct {
     void *maskBuf;     // id<MTLBuffer>
     void **kBufs;      // id<MTLBuffer>[] per-layer
     void **vBufs;      // id<MTLBuffer>[] per-layer
-    void *cachedInputsArray; // CFRetained NSMutableArray<MPSGraphTensorData*>*
+    void *cachedInputsArray;  // CFRetained NSMutableArray<MPSGraphTensorData*>*
+    void *cachedResultsArray; // CFRetained NSMutableArray<MPSGraphTensorData*>*
+    void *outputBuf;          // id<MTLBuffer> for logits output
     // Weight tensors (persistent on GPU in fp16)
     void **wq;         // per-layer Wq [dim, qDim] fp16
     void **wk;         // per-layer Wk [dim, kvDim] fp16
@@ -330,6 +332,14 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
             }
             t->cachedInputsArray = (void *)CFRetain((__bridge CFTypeRef)arr);
         }
+        // Pre-allocate output buffer and cached results array.
+        {
+            id<MTLBuffer> outBuf = [device newBufferWithLength:(NSUInteger)vocab * sizeof(float) options:MTLResourceStorageModeShared];
+            t->outputBuf = (__bridge_retained void *)outBuf;
+            MPSGraphTensorData *outTD = [[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf shape:@[@1, @(vocab)] dataType:MPSDataTypeFloat32];
+            NSMutableArray *rarr = [NSMutableArray arrayWithObject:outTD];
+            t->cachedResultsArray = (void *)CFRetain((__bridge CFTypeRef)rarr);
+        }
         t->nLayers = nLayers;
         t->dim = dim;
         t->qDim = qDim;
@@ -388,16 +398,18 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         // The underlying Metal buffers are the same pre-allocated ones we memcpy'd into above.
         NSArray<MPSGraphTensorData*> *inputs = (__bridge NSArray<MPSGraphTensorData*> *)t->cachedInputsArray;
 
+        // Use cached results array with pre-allocated output buffer.
+        NSMutableArray<MPSGraphTensorData*> *resultsArr = (__bridge NSMutableArray<MPSGraphTensorData*> *)t->cachedResultsArray;
         NSArray<MPSGraphTensorData *> *results = [executable runWithMTLCommandQueue:queue
                                                                          inputsArray:inputs
-                                                                        resultsArray:nil
+                                                                        resultsArray:resultsArr
                                                                executionDescriptor:nil];
 
         if (results.count == 0) return -1;
 
-        MPSGraphTensorData *outTD = results[0];
-        MPSNDArray *outArr = outTD.mpsndarray;
-        [outArr readBytes:logits strideBytes:nil];
+        // Read from pre-allocated output buffer (unified memory — may already be accessible).
+        id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)t->outputBuf;
+        memcpy(logits, outBuf.contents, (size_t)t->vocab * sizeof(float));
 
         return 0;
     }
