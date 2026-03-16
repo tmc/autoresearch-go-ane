@@ -101,25 +101,25 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		// multi-layer kernels. Keep CPU BLAS for single-token path.
 	}
 
-	// Lazily create Metal fp16 GEMV handles for decode.
-	if useFP16 && e.metalWq == nil {
+	// Lazily create Metal fp16 GEMV handles for large FFN matmuls.
+	// Convert fp32 weights to fp16 on-the-fly (only for Metal, keep fp32 for CPU BLAS).
+	if e.metalW1 == nil {
 		nLayers := cfg.NLayers
-		e.metalWq = make([]*MetalFP16Gemv, nLayers)
-		e.metalWk = make([]*MetalFP16Gemv, nLayers)
-		e.metalWv = make([]*MetalFP16Gemv, nLayers)
-		e.metalWo = make([]*MetalFP16Gemv, nLayers)
 		e.metalW1 = make([]*MetalFP16Gemv, nLayers)
 		e.metalW3 = make([]*MetalFP16Gemv, nLayers)
 		e.metalW2 = make([]*MetalFP16Gemv, nLayers)
 		for i := 0; i < nLayers; i++ {
-			fp16L := e.mw.FP16Layers[i]
-			e.metalWq[i] = NewMetalFP16Gemv(fp16L.Wq, qDim, dim)
-			e.metalWk[i] = NewMetalFP16Gemv(fp16L.Wk, kvDim, dim)
-			e.metalWv[i] = NewMetalFP16Gemv(fp16L.Wv, kvDim, dim)
-			e.metalWo[i] = NewMetalFP16Gemv(fp16L.Wo, dim, qDim)
-			e.metalW1[i] = NewMetalFP16Gemv(fp16L.W1, hidden, dim)
-			e.metalW3[i] = NewMetalFP16Gemv(fp16L.W3, hidden, dim)
-			e.metalW2[i] = NewMetalFP16Gemv(fp16L.W2, dim, hidden)
+			layer := e.mw.Layers[i]
+			// Convert fp32 → fp16 for Metal handles.
+			w1f16 := make([]uint16, len(layer.W1))
+			convertF32ToFP16(w1f16, layer.W1)
+			e.metalW1[i] = NewMetalFP16Gemv(w1f16, hidden, dim)
+			w3f16 := make([]uint16, len(layer.W3))
+			convertF32ToFP16(w3f16, layer.W3)
+			e.metalW3[i] = NewMetalFP16Gemv(w3f16, hidden, dim)
+			w2f16 := make([]uint16, len(layer.W2))
+			convertF32ToFP16(w2f16, layer.W2)
+			e.metalW2[i] = NewMetalFP16Gemv(w2f16, dim, hidden)
 		}
 	}
 
@@ -245,9 +245,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		}
 		timings.RMSNorm += time.Since(tRMS)
 
-		// Unfused W1+W3: run concurrently. Use Metal fp16 when available.
+		// Unfused W1+W3: Metal fp16 for large FFN, CPU for fallback.
 		tFFN := time.Now()
-		if useFP16 && e.metalW1[li] != nil && e.metalW3[li] != nil {
+		if e.metalW1[li] != nil && e.metalW3[li] != nil {
 			var ffnWG sync.WaitGroup
 			ffnWG.Add(1)
 			go func() {
@@ -268,14 +268,8 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		}
 		siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
 
-		if useFP16 && e.metalW2[li] != nil {
+		if e.metalW2[li] != nil {
 			e.metalW2[li].Exec(e.cacheFFOut, e.cacheGate)
-		} else if useFP16 {
-			w2Size := dim * hidden
-			tFP16 := time.Now()
-			convertFP16ToF32(e.fp16Scratch[:w2Size], e.mw.FP16Layers[li].W2)
-			timings.FP16Conv += time.Since(tFP16)
-			linearSingle(e.cacheFFOut, e.fp16Scratch[:w2Size], e.cacheGate, dim, hidden)
 		} else {
 			linearSingle(e.cacheFFOut, layer.W2, e.cacheGate, dim, hidden)
 		}
