@@ -415,9 +415,13 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
 
         if (results.count == 0) return -1;
 
-        // Read from pre-allocated output buffer (unified memory — may already be accessible).
-        id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)t->outputBuf;
-        memcpy(logits, outBuf.contents, (size_t)t->vocab * sizeof(float));
+        // Read from pre-allocated output buffer.
+        // On unified memory, outBuf.contents IS the logits pointer if we could
+        // use it directly. For now, copy it out.
+        if (logits != NULL) {
+            id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)t->outputBuf;
+            memcpy(logits, outBuf.contents, (size_t)t->vocab * sizeof(float));
+        }
 
         return 0;
     }

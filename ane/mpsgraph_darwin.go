@@ -224,6 +224,23 @@ func (d *MPSGraphDecoder) VCacheSlice(layer, size int) []float32 {
 	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), size)
 }
 
+// ExecNoCopy runs without copying logits output (for benchmarking pure GPU throughput).
+func (d *MPSGraphDecoder) ExecNoCopy(x, ropeCosRow, ropeSinRow, mask []float32) error {
+	if d == nil || d.handle == nil {
+		return fmt.Errorf("MPSGraph decoder not initialized")
+	}
+	// Copy only the small inputs (x, cos, sin, mask).
+	id := d.handle
+	xBuf := (*C.float)(unsafe.Pointer(&x[0]))
+	cosBuf := (*C.float)(unsafe.Pointer(&ropeCosRow[0]))
+	sinBuf := (*C.float)(unsafe.Pointer(&ropeSinRow[0]))
+	maskBuf := (*C.float)(unsafe.Pointer(&mask[0]))
+	if C.mpsGraphTransformerExec(id, nil, xBuf, cosBuf, sinBuf, maskBuf, nil, nil) != 0 {
+		return fmt.Errorf("MPSGraph execution failed")
+	}
+	return nil
+}
+
 // ExecZeroCopy runs without copying KV caches (they're already in GPU buffers).
 func (d *MPSGraphDecoder) ExecZeroCopy(logits, x, ropeCosRow, ropeSinRow, mask []float32) error {
 	if d == nil || d.handle == nil {

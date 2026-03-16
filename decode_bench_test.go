@@ -76,7 +76,7 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 	nLayers := cfg.NLayers
 	maxSeq := 256
 	x := make([]float32, dim)
-	logits := make([]float32, vocab)
+	_ = vocab
 	ropeCos := make([]float32, headDim/2)
 	ropeSin := make([]float32, headDim/2)
 	mask := make([]float32, maxSeq)
@@ -102,16 +102,16 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 	// KV caches are fp16 on GPU — already zero-filled.
 	_ = nLayers
 
-	// Warmup with zero-copy (KV caches already on GPU)
+	// Warmup
 	for range 3 {
-		if err := decoder.ExecZeroCopy(logits, x, ropeCos, ropeSin, mask); err != nil {
+		if err := decoder.ExecNoCopy(x, ropeCos, ropeSin, mask); err != nil {
 			b.Fatalf("warmup: %v", err)
 		}
 	}
 
 	b.ResetTimer()
 	for b.Loop() {
-		if err := decoder.ExecZeroCopy(logits, x, ropeCos, ropeSin, mask); err != nil {
+		if err := decoder.ExecNoCopy(x, ropeCos, ropeSin, mask); err != nil {
 			b.Fatal(err)
 		}
 	}
