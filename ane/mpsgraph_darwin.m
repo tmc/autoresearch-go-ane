@@ -263,8 +263,9 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         // Cast output back to fp32 for CPU consumption.
         MPSGraphTensor *logits = [graph castTensor:logits16 toType:MPSDataTypeFloat32 name:@"logits_f32"];
 
-        // Compile the graph
+        // Compile the graph with performance optimization.
         MPSGraphCompilationDescriptor *compDesc = [[MPSGraphCompilationDescriptor alloc] init];
+        compDesc.optimizationLevel = MPSGraphOptimizationLevel1;
 
         // Build feeds dictionary: map placeholder tensors to their shapes+types.
         MPSGraphShapedType *xType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(dim)] dataType:MPSDataTypeFloat32];
