@@ -162,14 +162,14 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         // Attention mask: [1, 1, 1, maxSeq] — 0 for valid positions, -inf for padding
         MPSGraphTensor *attnMask = [graph placeholderWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32 name:@"attn_mask"];
 
-        // Per-layer KV cache placeholders
+        // Per-layer KV cache placeholders (fp16 to halve SDPA bandwidth).
         NSMutableArray<MPSGraphTensor*> *kCaches = [NSMutableArray arrayWithCapacity:nLayers];
         NSMutableArray<MPSGraphTensor*> *vCaches = [NSMutableArray arrayWithCapacity:nLayers];
         for (int li = 0; li < nLayers; li++) {
             NSString *kName = [NSString stringWithFormat:@"k_cache_%d", li];
             NSString *vName = [NSString stringWithFormat:@"v_cache_%d", li];
-            [kCaches addObject:[graph placeholderWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat32 name:kName]];
-            [vCaches addObject:[graph placeholderWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat32 name:vName]];
+            [kCaches addObject:[graph placeholderWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16 name:kName]];
+            [vCaches addObject:[graph placeholderWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16 name:vName]];
         }
 
         MPSGraphTensor *cur = x;
@@ -274,7 +274,7 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         MPSGraphShapedType *xType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(dim)] dataType:MPSDataTypeFloat32];
         MPSGraphShapedType *ropeType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32];
         MPSGraphShapedType *maskType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32];
-        MPSGraphShapedType *kvType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat32];
+        MPSGraphShapedType *kvType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16];
 
         NSMutableDictionary<MPSGraphTensor*, MPSGraphShapedType*> *feeds = [NSMutableDictionary dictionary];
         feeds[x] = xType;
@@ -312,7 +312,7 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         t->cosBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(float) options:MTLResourceStorageModeShared];
         t->sinBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(float) options:MTLResourceStorageModeShared];
         t->maskBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)maxSeq * sizeof(float) options:MTLResourceStorageModeShared];
-        size_t kvBufSize = (size_t)kvHeads * maxSeq * headDim * sizeof(float);
+        size_t kvBufSize = (size_t)kvHeads * maxSeq * headDim * sizeof(uint16_t); // fp16
         t->kBufs = (void **)calloc(nLayers, sizeof(void *));
         t->vBufs = (void **)calloc(nLayers, sizeof(void *));
         for (int i = 0; i < nLayers; i++) {
@@ -327,8 +327,8 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
             [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->sinBuf shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32]];
             [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->maskBuf shape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32]];
             for (int i = 0; i < nLayers; i++) {
-                [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->kBufs[i] shape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat32]];
-                [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->vBufs[i] shape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat32]];
+                [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->kBufs[i] shape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16]];
+                [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->vBufs[i] shape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16]];
             }
             t->cachedInputsArray = (void *)CFRetain((__bridge CFTypeRef)arr);
         }
@@ -371,7 +371,7 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         size_t xBytes = (size_t)t->dim * sizeof(float);
         size_t ropeBytes = (size_t)ropeHalf * sizeof(float);
         size_t maskBytes = (size_t)maxSeq * sizeof(float);
-        size_t kvBytes = (size_t)t->kvHeads * maxSeq * t->headDim * sizeof(float);
+        size_t kvBytes = (size_t)t->kvHeads * maxSeq * t->headDim * sizeof(uint16_t); // fp16
 
         // Copy data into pre-allocated buffers.
         id<MTLBuffer> xBuf = (__bridge id<MTLBuffer>)t->xBuf;

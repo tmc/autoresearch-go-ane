@@ -99,20 +99,8 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 		vCaches[i] = make([]float32, kvHeads*maxSeq*headDim)
 	}
 
-	// Initialize GPU-resident KV caches (zero-filled, simulating a real decode session).
-	for i := 0; i < nLayers; i++ {
-		kSlice := decoder.KCacheSlice(i, kvHeads*maxSeq*headDim)
-		vSlice := decoder.VCacheSlice(i, kvHeads*maxSeq*headDim)
-		if kSlice != nil {
-			// Fill with small values to simulate cached data
-			for j := range kSlice[:kvHeads*10*headDim] {
-				kSlice[j] = 0.01
-			}
-			for j := range vSlice[:kvHeads*10*headDim] {
-				vSlice[j] = 0.01
-			}
-		}
-	}
+	// KV caches are fp16 on GPU — already zero-filled.
+	_ = nLayers
 
 	// Warmup with zero-copy (KV caches already on GPU)
 	for range 3 {
