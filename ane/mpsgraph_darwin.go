@@ -23,6 +23,8 @@ extern int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const 
                                    const float *ropeCosRow, const float *ropeSinRow,
                                    const float *mask,
                                    const float **kCachesAll, const float **vCachesAll);
+extern float* mpsGraphGetKCachePtr(MPSGraphTransformer *t, int layer);
+extern float* mpsGraphGetVCachePtr(MPSGraphTransformer *t, int layer);
 extern void mpsGraphTransformerDestroy(MPSGraphTransformer *t);
 */
 import "C"
@@ -198,6 +200,46 @@ func (d *MPSGraphDecoder) Exec(logits, x, ropeCosRow, ropeSinRow, mask []float32
 		(*C.float)(unsafe.Pointer(&mask[0])),
 		(**C.float)(unsafe.Pointer(&kPtrs[0])),
 		(**C.float)(unsafe.Pointer(&vPtrs[0])),
+	) != 0 {
+		return fmt.Errorf("MPSGraph execution failed")
+	}
+	return nil
+}
+
+// KVCacheSlice returns a Go slice backed by the GPU-resident KV cache buffer for a layer.
+// Writes to this slice go directly to GPU memory (unified memory).
+func (d *MPSGraphDecoder) KCacheSlice(layer, size int) []float32 {
+	ptr := C.mpsGraphGetKCachePtr(d.handle, C.int(layer))
+	if ptr == nil {
+		return nil
+	}
+	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), size)
+}
+
+func (d *MPSGraphDecoder) VCacheSlice(layer, size int) []float32 {
+	ptr := C.mpsGraphGetVCachePtr(d.handle, C.int(layer))
+	if ptr == nil {
+		return nil
+	}
+	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), size)
+}
+
+// ExecZeroCopy runs without copying KV caches (they're already in GPU buffers).
+func (d *MPSGraphDecoder) ExecZeroCopy(logits, x, ropeCosRow, ropeSinRow, mask []float32) error {
+	if d == nil || d.handle == nil {
+		return fmt.Errorf("MPSGraph decoder not initialized")
+	}
+	pinner := runtime.Pinner{}
+	defer pinner.Unpin()
+	pinner.Pin(&mask[0])
+
+	if C.mpsGraphTransformerExec(d.handle,
+		(*C.float)(unsafe.Pointer(&logits[0])),
+		(*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&ropeCosRow[0])),
+		(*C.float)(unsafe.Pointer(&ropeSinRow[0])),
+		(*C.float)(unsafe.Pointer(&mask[0])),
+		nil, nil, // NULL = skip KV cache copy, use pre-allocated buffers
 	) != 0 {
 		return fmt.Errorf("MPSGraph execution failed")
 	}

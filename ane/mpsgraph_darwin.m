@@ -359,11 +359,15 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         memcpy(sinBuf.contents, ropeSinRow, ropeBytes);
         memcpy(maskBuf.contents, mask, maskBytes);
 
-        for (int li = 0; li < t->nLayers; li++) {
-            id<MTLBuffer> kb = (__bridge id<MTLBuffer>)t->kBufs[li];
-            id<MTLBuffer> vb = (__bridge id<MTLBuffer>)t->vBufs[li];
-            memcpy(kb.contents, kCachesAll[li], kvBytes);
-            memcpy(vb.contents, vCachesAll[li], kvBytes);
+        // Only copy KV caches if external pointers differ from pre-allocated buffers.
+        // In a real decode loop, the KV caches would be updated in-place on the GPU.
+        if (kCachesAll != NULL && vCachesAll != NULL) {
+            for (int li = 0; li < t->nLayers; li++) {
+                id<MTLBuffer> kb = (__bridge id<MTLBuffer>)t->kBufs[li];
+                id<MTLBuffer> vb = (__bridge id<MTLBuffer>)t->vBufs[li];
+                if (kCachesAll[li] != kb.contents) memcpy(kb.contents, kCachesAll[li], kvBytes);
+                if (vCachesAll[li] != vb.contents) memcpy(vb.contents, vCachesAll[li], kvBytes);
+            }
         }
 
         // Build input array using pre-allocated buffers.
@@ -394,6 +398,18 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
 
         return 0;
     }
+}
+
+// Get the contents pointer for a pre-allocated KV cache buffer.
+float* mpsGraphGetKCachePtr(MPSGraphTransformer *t, int layer) {
+    if (t == NULL || layer < 0 || layer >= t->nLayers) return NULL;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)t->kBufs[layer];
+    return (float *)buf.contents;
+}
+float* mpsGraphGetVCachePtr(MPSGraphTransformer *t, int layer) {
+    if (t == NULL || layer < 0 || layer >= t->nLayers) return NULL;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)t->vBufs[layer];
+    return (float *)buf.contents;
 }
 
 void mpsGraphTransformerDestroy(MPSGraphTransformer *t) {

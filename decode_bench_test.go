@@ -99,16 +99,31 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 		vCaches[i] = make([]float32, kvHeads*maxSeq*headDim)
 	}
 
-	// Warmup
+	// Initialize GPU-resident KV caches (zero-filled, simulating a real decode session).
+	for i := 0; i < nLayers; i++ {
+		kSlice := decoder.KCacheSlice(i, kvHeads*maxSeq*headDim)
+		vSlice := decoder.VCacheSlice(i, kvHeads*maxSeq*headDim)
+		if kSlice != nil {
+			// Fill with small values to simulate cached data
+			for j := range kSlice[:kvHeads*10*headDim] {
+				kSlice[j] = 0.01
+			}
+			for j := range vSlice[:kvHeads*10*headDim] {
+				vSlice[j] = 0.01
+			}
+		}
+	}
+
+	// Warmup with zero-copy (KV caches already on GPU)
 	for range 3 {
-		if err := decoder.Exec(logits, x, ropeCos, ropeSin, mask, kCaches, vCaches); err != nil {
+		if err := decoder.ExecZeroCopy(logits, x, ropeCos, ropeSin, mask); err != nil {
 			b.Fatalf("warmup: %v", err)
 		}
 	}
 
 	b.ResetTimer()
 	for b.Loop() {
-		if err := decoder.Exec(logits, x, ropeCos, ropeSin, mask, kCaches, vCaches); err != nil {
+		if err := decoder.ExecZeroCopy(logits, x, ropeCos, ropeSin, mask); err != nil {
 			b.Fatal(err)
 		}
 	}
