@@ -42,10 +42,13 @@ import requests
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Repo root — anchored to this script's location (scripts/ is one level below root)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 HUB_ORG = "austin_mac"
 API_URL = "https://api.ensue-network.ai/"
-KEY_FILE = ".autoresearch-key"
-AGENT_FILE = ".autoresearch-agent"
+KEY_FILE = os.path.join(REPO_ROOT, ".autoresearch-key")
+AGENT_FILE = os.path.join(REPO_ROOT, ".autoresearch-agent")
 NAMESPACE = "autoresearch-go-ane-infer"
 INVITE_TOKEN = "596e13c30e7848e7b50e3bb2bf5f319d5eaa99eeb5df4337bab90310bfd76385"
 
@@ -66,6 +69,14 @@ _TIER_THRESHOLDS: list[tuple[str, int]] = [
     ("base", 12),
     ("mid", 17),
     ("high", 20),
+]
+
+# The file that constitutes the "solution" — the single editable tuning surface.
+# All other files (ane/*.go) are read-only infrastructure.
+# When submitting results, this file is captured in its entirety so any agent
+# can understand the full solution without tracing diffs or commit history.
+SOLUTION_FILES = [
+    "experiment.go",
 ]
 
 # ---------------------------------------------------------------------------
@@ -140,7 +151,8 @@ def _git_remote_url() -> Optional[str]:
     """Get the GitHub HTTPS URL for the current repo."""
     try:
         url = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"], text=True, stderr=subprocess.DEVNULL
+            ["git", "remote", "get-url", "origin"], text=True,
+            stderr=subprocess.DEVNULL, cwd=REPO_ROOT,
         ).strip()
         if url.startswith("git@github.com:"):
             url = "https://github.com/" + url[len("git@github.com:"):]
@@ -155,7 +167,8 @@ def _git_branch() -> Optional[str]:
     """Get the current git branch name."""
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True, stderr=subprocess.DEVNULL
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True,
+            stderr=subprocess.DEVNULL, cwd=REPO_ROOT,
         ).strip()
     except Exception:
         return None
@@ -165,10 +178,60 @@ def _git_commit_short() -> Optional[str]:
     """Get the short commit hash of HEAD."""
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL
+            ["git", "rev-parse", "--short", "HEAD"], text=True,
+            stderr=subprocess.DEVNULL, cwd=REPO_ROOT,
         ).strip()
     except Exception:
         return None
+
+
+def _git_full_diff() -> str:
+    """Get the full cumulative diff from main to HEAD.
+
+    This is the COMPLETE solution — every change made on this experiment branch.
+    Unlike `git diff HEAD~1` (incremental), this captures all accumulated work.
+    """
+    try:
+        for base in ["main", "origin/main"]:
+            try:
+                return subprocess.check_output(
+                    ["git", "diff", f"{base}...HEAD"], text=True,
+                    stderr=subprocess.DEVNULL, cwd=REPO_ROOT,
+                ).strip()
+            except subprocess.CalledProcessError:
+                continue
+        return ""
+    except Exception:
+        return ""
+
+
+def _git_modified_files_from_main() -> list[str]:
+    """List files modified on this branch vs main."""
+    try:
+        for base in ["main", "origin/main"]:
+            try:
+                output = subprocess.check_output(
+                    ["git", "diff", "--name-only", f"{base}...HEAD"],
+                    text=True, stderr=subprocess.DEVNULL, cwd=REPO_ROOT,
+                ).strip()
+                return [f for f in output.split("\n") if f] if output else []
+            except subprocess.CalledProcessError:
+                continue
+        return []
+    except Exception:
+        return []
+
+
+def _read_experiment_go() -> str:
+    """Read experiment.go — the single editable solution file."""
+    path = os.path.join(REPO_ROOT, "experiment.go")
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                return f.read()
+    except Exception:
+        pass
+    return ""
 
 
 def detect_chip_info() -> tuple[Optional[str], Optional[int]]:
@@ -177,7 +240,9 @@ def detect_chip_info() -> tuple[Optional[str], Optional[int]]:
         chip = subprocess.check_output(
             ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, stderr=subprocess.DEVNULL
         ).strip()
-        if "M4" in chip:
+        if "M5" in chip:
+            return chip, 42
+        elif "M4" in chip:
             return chip, 38
         elif "M3" in chip:
             return chip, 18
@@ -185,8 +250,6 @@ def detect_chip_info() -> tuple[Optional[str], Optional[int]]:
             return chip, 16
         elif "M1" in chip:
             return chip, 11
-        elif "M5" in chip:
-            return chip, 42
         return chip, None
     except Exception:
         return None, None
@@ -500,9 +563,14 @@ class Coordinator:
     ) -> str:
         """Publish an experiment result to the hub.
 
-        Each result is a self-contained record: it includes everything needed
-        to understand the experiment without looking up other keys. Agents can
-        search results and get the full picture from any single match.
+        Each result is a self-contained record with:
+        - Agent identity and chip context
+        - Benchmark metrics (tokens/s, ns/op, runs)
+        - experiment_go: the FULL contents of experiment.go (the solution)
+        - Diffs for reference (incremental + cumulative from main)
+
+        Another agent can read experiment_go to understand the full solution
+        without tracing diffs or commit history.
         """
         if isinstance(benchmark_json, str):
             benchmark_json = json.loads(benchmark_json)
@@ -516,11 +584,18 @@ class Coordinator:
         ns_per_op = benchmark_json.get("ns_per_op", 0)
         runs = benchmark_json.get("runs", 0)
 
+        # Auto-compute full solution context
+        full_diff = _git_full_diff()
+        modified_files = _git_modified_files_from_main()
+
         # Get current bests for delta calculations
         global_best_tps = self._get_global_best_tps()
         delta_vs_best = (tokens_per_sec - global_best_tps) if global_best_tps is not None else None
         agent_best_tps = self._get_agent_best_tps()
         delta_vs_own_best = (tokens_per_sec - agent_best_tps) if agent_best_tps is not None else None
+
+        # Read experiment.go directly — this IS the solution
+        experiment_go = _read_experiment_go()
 
         result_data = {
             # Identity
@@ -536,7 +611,7 @@ class Coordinator:
             "repo_url": repo_url,
             "commit_url": f"{repo_url}/commit/{commit}" if repo_url and commit else None,
             "completed_at": _now_iso(),
-            # Benchmark metrics (inlined for self-containedness)
+            # Benchmark metrics
             "tokens_per_sec": tokens_per_sec,
             "ns_per_op": ns_per_op,
             "runs": runs,
@@ -546,23 +621,28 @@ class Coordinator:
             "global_best_at_publish": global_best_tps,
             "delta_vs_own_best": delta_vs_own_best,
             "agent_best_at_publish": agent_best_tps,
-            # Code change
+            # THE SOLUTION — experiment.go in full, readable as-is
+            "experiment_go": experiment_go,
+            # Diffs for reference
             "git_diff": git_diff,
+            "full_diff": full_diff,
+            "modified_files": modified_files,
         }
 
         result_key = f"@{HUB_ORG}/results/{exp_key}"
         value_b64 = base64.b64encode(json.dumps(result_data).encode()).decode()
 
-        # Rich embed description: agents searching results will match on this text.
-        # Include what changed, the outcome, chip context, and whether it helped.
+        # Rich embed description for semantic search
         delta_str = ""
         if delta_vs_best is not None:
             delta_str = f", delta={delta_vs_best:+.1f} vs global best {global_best_tps:.1f}"
         outcome = "improved" if status == "keep" else ("no improvement" if status == "discard" else "crashed")
+        files_str = ", ".join(modified_files[:5]) if modified_files else "no files"
         embed_desc = (
             f"Experiment by {self.agent_id} on {self._chip_context()}: "
             f"{description}. "
             f"Result: {outcome}, tokens/s={tokens_per_sec:.1f}, ns/op={ns_per_op}{delta_str}. "
+            f"Files changed: {files_str}. "
             f"Status: {status}."
         )
 
@@ -587,13 +667,16 @@ class Coordinator:
         if delta_vs_best is not None:
             delta_log = f" (delta={delta_vs_best:+.1f} vs global best {global_best_tps:.1f})"
         self._log(f"RESULT: tokens/s={tokens_per_sec:.1f}{delta_log} ({status})")
+        if modified_files:
+            self._log(f"  Modified files: {', '.join(modified_files)}")
+        self._log(f"  Full diff size: {len(full_diff)} chars, experiment.go: {len(experiment_go)} chars")
 
         # Update bests if this is a keep
         if status == "keep":
             self._update_agent_best(tokens_per_sec, result_data)
-            self._maybe_update_best(tokens_per_sec, result_data, git_diff)
+            self._maybe_update_best(tokens_per_sec, result_data, full_diff)
             if self.chip_tier:
-                self._update_tier_best(tokens_per_sec, result_data, git_diff)
+                self._update_tier_best(tokens_per_sec, result_data, full_diff)
 
         print(f"Published result: {description} [{status}] -> {result_key}")
         return result_key
@@ -670,10 +753,13 @@ class Coordinator:
         self,
         tokens_per_sec: float,
         result_data: dict,
-        git_diff: str,
+        full_diff: str,
     ) -> bool:
         """
         Update the global best if this result beats it. Returns True if updated.
+
+        Stores the FULL cumulative diff (from main) as best/config, plus the
+        complete experiment.go so any agent can adopt the winning config.
 
         Safety rules:
         - Reject tokens_per_sec <= 0
@@ -719,8 +805,10 @@ class Coordinator:
                     self._log(f"Lost best update race: someone posted {current2_tps:.1f} while we were checking")
                     return False
 
+            # best/metadata — everything except huge fields
             best_data = {
-                **{k: v for k, v in result_data.items() if k != "git_diff"},
+                **{k: v for k, v in result_data.items()
+                   if k not in ("git_diff", "full_diff", "experiment_go")},
                 "tokens_per_sec": tokens_per_sec,
                 "agent_id": self.agent_id,
                 "achieved_by": self.agent_id,
@@ -731,10 +819,10 @@ class Coordinator:
                 "improvement_over_previous": (tokens_per_sec - previous_best_tps) if previous_best_tps is not None else None,
             }
 
-            # Upsert best/config (git diff)
+            # best/config — the FULL cumulative diff (not incremental)
             code_key = f"@{HUB_ORG}/best/config"
-            if git_diff:
-                code_b64 = base64.b64encode(git_diff.encode()).decode()
+            if full_diff:
+                code_b64 = base64.b64encode(full_diff.encode()).decode()
                 try:
                     self._rpc("update_memory", {
                         "key_name": code_key,
@@ -744,8 +832,27 @@ class Coordinator:
                 except Exception:
                     self._rpc("create_memory", {"items": [{
                         "key_name": code_key,
-                        "description": f"Git diff for current global best config ({self.agent_id}: {result_data.get('description', '')})",
+                        "description": f"Full cumulative diff for global best: tokens/s={tokens_per_sec:.1f} by {self.agent_id} ({result_data.get('description', '')})",
                         "value": code_b64,
+                        "base64": True,
+                    }]})
+
+            # best/solution — experiment.go contents for direct adoption
+            experiment_go = result_data.get("experiment_go", "")
+            if experiment_go:
+                sol_key = f"@{HUB_ORG}/best/solution"
+                sol_b64 = base64.b64encode(experiment_go.encode()).decode()
+                try:
+                    self._rpc("update_memory", {
+                        "key_name": sol_key,
+                        "value": sol_b64,
+                        "base64": True,
+                    })
+                except Exception:
+                    self._rpc("create_memory", {"items": [{
+                        "key_name": sol_key,
+                        "description": f"experiment.go for global best: tokens/s={tokens_per_sec:.1f} by {self.agent_id}",
+                        "value": sol_b64,
                         "base64": True,
                     }]})
 
@@ -789,7 +896,7 @@ class Coordinator:
             pass
         return None
 
-    def _update_tier_best(self, tokens_per_sec: float, result_data: dict, git_diff: str) -> bool:
+    def _update_tier_best(self, tokens_per_sec: float, result_data: dict, full_diff: str) -> bool:
         """Update the best config for this agent's chip tier if the result beats it."""
         tier = self.chip_tier
         if not tier:
@@ -815,7 +922,8 @@ class Coordinator:
                     previous_best_by = prev.get("agent_id", prev.get("achieved_by"))
 
             tier_data = {
-                **{k: v for k, v in result_data.items() if k != "git_diff"},
+                **{k: v for k, v in result_data.items()
+                   if k not in ("git_diff", "full_diff", "experiment_go")},
                 "chip_tier": tier,
                 "tokens_per_sec": tokens_per_sec,
                 "agent_id": self.agent_id,
@@ -825,9 +933,9 @@ class Coordinator:
                 "previous_best_by": previous_best_by,
             }
 
-            # Upsert tier config
-            if git_diff:
-                code_b64 = base64.b64encode(git_diff.encode()).decode()
+            # Store FULL cumulative diff for tier config
+            if full_diff:
+                code_b64 = base64.b64encode(full_diff.encode()).decode()
                 try:
                     self._rpc("update_memory", {
                         "key_name": code_key,
@@ -837,7 +945,7 @@ class Coordinator:
                 except Exception:
                     self._rpc("create_memory", {"items": [{
                         "key_name": code_key,
-                        "description": f"Best config for chip tier '{tier}': tokens/s={tokens_per_sec:.1f} by {self.agent_id}",
+                        "description": f"Full diff for chip tier '{tier}' best: tokens/s={tokens_per_sec:.1f} by {self.agent_id}",
                         "value": code_b64,
                         "base64": True,
                     }]})
@@ -888,22 +996,34 @@ class Coordinator:
     # --- Config Sharing ---
 
     def pull_best(self) -> dict:
-        """Get the current best configuration and metadata."""
+        """Get the current best configuration and experiment.go contents."""
         try:
             meta_key = f"@{HUB_ORG}/best/metadata"
             meta = self._rpc("get_memory", {"key_names": [meta_key]})
             meta_results = meta.get("results", [])
             if meta_results and meta_results[0].get("status") == "success":
                 metadata = json.loads(meta_results[0]["value"])
-                # Also pull the git diff
+
+                # Pull the full cumulative diff
                 code_key = f"@{HUB_ORG}/best/config"
                 try:
                     code = self._rpc("get_memory", {"key_names": [code_key]})
                     code_results = code.get("results", [])
                     if code_results and code_results[0].get("status") == "success":
-                        metadata["git_diff"] = code_results[0]["value"]
+                        metadata["full_diff"] = code_results[0]["value"]
                 except Exception:
                     pass
+
+                # Pull experiment.go — the complete solution file
+                sol_key = f"@{HUB_ORG}/best/solution"
+                try:
+                    sol = self._rpc("get_memory", {"key_names": [sol_key]})
+                    sol_results = sol.get("results", [])
+                    if sol_results and sol_results[0].get("status") == "success":
+                        metadata["experiment_go"] = sol_results[0]["value"]
+                except Exception:
+                    pass
+
                 return metadata
         except Exception as e:
             self._log(f"pull_best error: {e}")
@@ -924,6 +1044,7 @@ class Coordinator:
                         code = self._rpc("get_memory", {"key_names": [code_key]})
                         code_results = code.get("results", [])
                         if code_results and code_results[0].get("status") == "success":
+                            metadata["full_diff"] = code_results[0]["value"]
                             metadata["git_diff"] = code_results[0]["value"]
                     except Exception:
                         pass
@@ -1027,9 +1148,12 @@ class Coordinator:
                     # Result record
                     delta = r.get("delta_vs_best")
                     delta_str = f" delta={delta:+.1f}" if delta is not None else ""
-                    lines.append(f"  [{agent}{chip_tag}] {status.upper()} tokens/s={tps:.1f}{delta_str} — {desc} (score={score:.2f})")
-                    if r.get("git_diff"):
-                        diff_preview = r["git_diff"][:200].replace('\n', ' | ')
+                    mod_files = r.get("modified_files", [])
+                    files_str = f" files=[{', '.join(mod_files[:3])}]" if mod_files else ""
+                    lines.append(f"  [{agent}{chip_tag}] {status.upper()} tokens/s={tps:.1f}{delta_str}{files_str} — {desc} (score={score:.2f})")
+                    diff = r.get("full_diff") or r.get("git_diff", "")
+                    if diff:
+                        diff_preview = diff[:200].replace('\n', ' | ')
                         lines.append(f"    diff: {diff_preview}")
                 elif insight_text:
                     # Insight record
@@ -1109,8 +1233,10 @@ class Coordinator:
                     desc = e.get("description", "?")
                     chip = e.get("chip_name", "")
                     chip_tag = f" [{chip}]" if chip else ""
+                    mod_files = e.get("modified_files", [])
+                    files_str = f" files=[{', '.join(mod_files[:3])}]" if mod_files else ""
                     print(f"  {short_key}")
-                    print(f"    [{agent}{chip_tag}] {status.upper()} tokens/s={tps} — {desc}")
+                    print(f"    [{agent}{chip_tag}] {status.upper()} tokens/s={tps}{files_str} — {desc}")
                 elif namespace == "insights":
                     text = e.get("insight", e.get("text", "?"))
                     chip = e.get("chip_name", "")
@@ -1280,8 +1406,6 @@ class Coordinator:
                 "posted_at": _now_iso(),
             }
 
-            # Rich embed: include the full insight text + chip context so semantic
-            # search surfaces this insight for relevant queries.
             embed_desc = (
                 f"Insight by {self.agent_id} on {self._chip_context()}: {insight}"
             )
@@ -1332,8 +1456,6 @@ class Coordinator:
                 "created_at": _now_iso(),
             }
 
-            # Rich embed: include title + full hypothesis text so semantic search
-            # finds this when agents search for related optimization topics.
             embed_desc = (
                 f"Hypothesis by {self.agent_id} [priority {priority}]: {title}. "
                 f"Reasoning: {hypothesis}"
@@ -1396,6 +1518,8 @@ class Coordinator:
                 chip = best.get("chip_name", "")
                 if chip:
                     lines.append(f"  chip: {chip}")
+            if best.get("experiment_go"):
+                lines.append(f"  experiment.go: {len(best['experiment_go'])} chars")
 
             output = "\n".join(lines)
             print(output)
@@ -1430,7 +1554,6 @@ class Coordinator:
                 except (json.JSONDecodeError, KeyError):
                     pass
 
-            # Higher is better
             recent_keeps = sorted(
                 [r for r in all_results if r.get("status") == "keep"],
                 key=lambda x: x.get("tokens_per_sec", 0),
@@ -1457,7 +1580,7 @@ class Coordinator:
                 except Exception:
                     pass
 
-            # Unclaimed hypotheses (fetch but don't print — we print our own summary)
+            # Unclaimed hypotheses (fetch directly, don't call get_unclaimed_hypotheses to avoid double-print)
             hyp_search = self._rpc("search_memories", {
                 "query": "hypothesis experiment suggestion optimization inference speed",
                 "limit": 10,
@@ -1482,7 +1605,6 @@ class Coordinator:
             # Build summary
             lines = ["=" * 60, "  SWARM ANALYSIS", "=" * 60]
 
-            # Global best
             if global_best:
                 best_by = global_best.get("agent_id", global_best.get("achieved_by", "?"))
                 best_chip = global_best.get("chip_name", "")
@@ -1492,10 +1614,12 @@ class Coordinator:
                     lines.append(f"  Achieved at: {global_best['achieved_at']}")
                 if global_best.get("description"):
                     lines.append(f"  Description: {global_best['description']}")
+                mod_files = global_best.get("modified_files", [])
+                if mod_files:
+                    lines.append(f"  Modified files: {', '.join(mod_files)}")
             else:
                 lines.append("Global best: none yet")
 
-            # Keeps
             lines.append(f"\nKeeps ({len(recent_keeps)}):")
             for r in recent_keeps[:8]:
                 agent = r.get("agent_id", "?")
@@ -1507,7 +1631,6 @@ class Coordinator:
                 delta_str = f" delta={delta:+.1f}" if delta is not None else ""
                 lines.append(f"  [{agent}{chip_tag}] tokens/s={tps:.1f}{delta_str} — {desc}")
 
-            # Failures
             lines.append(f"\nFailures ({len(recent_failures)}):")
             for r in recent_failures[:5]:
                 agent = r.get("agent_id", "?")
@@ -1517,7 +1640,6 @@ class Coordinator:
                 chip_tag = f" [{chip}]" if chip else ""
                 lines.append(f"  [{agent}{chip_tag}] {status} — {desc}")
 
-            # Active claims
             lines.append(f"\nActive claims ({len(active_claims)}):")
             for c in active_claims:
                 agent = c.get("agent_id", "?")
@@ -1526,7 +1648,6 @@ class Coordinator:
                 chip_tag = f" [{chip}]" if chip else ""
                 lines.append(f"  [{agent}{chip_tag}] {desc}")
 
-            # Hypotheses
             lines.append(f"\nUnclaimed hypotheses ({len(unclaimed)}):")
             for h in unclaimed[:5]:
                 agent = h.get("agent_id", "?")
@@ -1537,7 +1658,6 @@ class Coordinator:
                 if hyp_text:
                     lines.append(f"    {hyp_text[:120]}")
 
-            # Agent bests
             lines.append(f"\nAgent personal bests ({len(agent_bests)}):")
             for ab in agent_bests:
                 agent = ab.get("agent_id", "?")
@@ -1550,7 +1670,6 @@ class Coordinator:
                 tier_tag = f" [tier={ab.get('chip_tier', '?')}]" if ab.get("chip_tier") else ""
                 lines.append(f"  [{agent}{chip_tag}{tier_tag}] tokens/s={tps:.1f}{improvement} — {desc}")
 
-            # Tier bests
             if has_tier_data:
                 lines.append(f"\nChip tier bests:")
                 for tier_name, tb in tier_bests.items():
@@ -1601,7 +1720,6 @@ class Coordinator:
             })
             matches = result.get("results", [])
         except Exception:
-            # Also try local namespace
             pass
 
         if not matches:
@@ -1630,9 +1748,10 @@ class Coordinator:
                         tps = data.get("tokens_per_sec", data.get("benchmark", {}).get("tokens_per_sec", "?"))
                         chip = data.get("chip_name", "")
                         chip_tag = f" [{chip}]" if chip else ""
-                        print(f"  [{agent}{chip_tag}] {status.upper()} tokens/s={tps} — {desc} (match={score:.2f})")
-                        # Show diff preview if available
-                        diff = data.get("git_diff", "")
+                        mod_files = data.get("modified_files", [])
+                        files_str = f" files=[{', '.join(mod_files[:3])}]" if mod_files else ""
+                        print(f"  [{agent}{chip_tag}] {status.upper()} tokens/s={tps}{files_str} — {desc} (match={score:.2f})")
+                        diff = data.get("full_diff") or data.get("git_diff", "")
                         if diff:
                             diff_preview = diff[:150].replace('\n', ' | ')
                             print(f"    diff: {diff_preview}")
@@ -1667,7 +1786,7 @@ def _cli():
         print("  get_unclaimed_hypotheses")
         print("  post_insight         '<text>' [evidence_key1,key2,...]")
         print("  get_swarm_insights   '<topic>'")
-        print("  pull_best            Get current global best")
+        print("  pull_best            Get current global best (includes full diff + solution files)")
         print("  pull_best_for_tier   [tier]  Get best for chip tier")
         print("  ask                  '<query>' [namespace]")
         print("  list_namespace       '<namespace>'")
@@ -1709,6 +1828,9 @@ def _cli():
     elif cmd == "publish_result":
         if len(sys.argv) < 4:
             print("Usage: publish_result '<desc>' '<bench_json>' ['<git_diff>'] [status]")
+            print()
+            print("Note: full cumulative diff and solution files are auto-collected.")
+            print("The git_diff arg is for the INCREMENTAL diff only (what this experiment changed).")
             sys.exit(1)
         desc = sys.argv[2]
         bench = sys.argv[3]
@@ -1763,12 +1885,29 @@ def _cli():
 
     elif cmd == "pull_best":
         best = coord.pull_best()
-        print(json.dumps(best, indent=2))
+        # Print metadata without huge fields
+        display = {k: v for k, v in best.items()
+                   if k not in ("full_diff", "git_diff", "experiment_go")}
+        print(json.dumps(display, indent=2))
+        if best.get("full_diff"):
+            print(f"\n[full_diff: {len(best['full_diff'])} chars]")
+        if best.get("experiment_go"):
+            print(f"\n--- experiment.go (best solution) ---")
+            print(best["experiment_go"])
+            print(f"--- end experiment.go ---")
 
     elif cmd == "pull_best_for_tier":
         tier = sys.argv[2] if len(sys.argv) > 2 else None
         best = coord.pull_best_for_tier(tier)
-        print(json.dumps(best, indent=2))
+        display = {k: v for k, v in best.items()
+                   if k not in ("full_diff", "git_diff", "experiment_go")}
+        print(json.dumps(display, indent=2))
+        if best.get("full_diff"):
+            print(f"\n[full_diff: {len(best['full_diff'])} chars]")
+        if best.get("experiment_go"):
+            print(f"\n--- experiment.go (best solution) ---")
+            print(best["experiment_go"])
+            print(f"--- end experiment.go ---")
 
     elif cmd == "ask":
         if len(sys.argv) < 3:
