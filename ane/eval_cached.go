@@ -473,7 +473,28 @@ func rmsNormSingle(out, x, w []float32, dim int) {
 
 // linearSingle computes out = W @ x for a single position.
 // W is [outDim, inDim] row-major, x is [inDim], out is [outDim].
+// For large outDim, splits into 4 concurrent sub-GEMVs for better core utilization.
 func linearSingle(out, w, x []float32, outDim, inDim int) {
+	const splitThreshold = 2048
+	const nSplit = 4
+	if outDim > splitThreshold {
+		chunk := outDim / nSplit
+		var wg sync.WaitGroup
+		for s := 0; s < nSplit; s++ {
+			start := s * chunk
+			size := chunk
+			if s == nSplit-1 {
+				size = outDim - start
+			}
+			wg.Add(1)
+			go func(start, size int) {
+				defer wg.Done()
+				linearCF(out[start:], w[start*inDim:], x, size, inDim, 1)
+			}(start, size)
+		}
+		wg.Wait()
+		return
+	}
 	linearCF(out, w, x, outDim, inDim, 1)
 }
 
