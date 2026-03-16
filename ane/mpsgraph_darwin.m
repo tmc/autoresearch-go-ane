@@ -145,7 +145,6 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         if (!queue) return NULL;
 
         MPSGraph *graph = [[MPSGraph alloc] init];
-        graph.options = MPSGraphOptionsNone; // Disable synchronization for max speed.
 
         // Input: x [1, dim] fp32
         MPSGraphTensor *x = [graph placeholderWithShape:@[@1, @(dim)] dataType:MPSDataTypeFloat32 name:@"input"];
