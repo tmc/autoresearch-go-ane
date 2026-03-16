@@ -1025,8 +1025,18 @@ func (e *Engine) evalLogitsANEInto(tokens []int32, logits []float32) error {
 		}
 		cur, next = next, cur
 	}
-	// Final RMSNorm + classifier on CPU.
-	stories.RMSNorm(e.xNorm, cur, e.mw.RMSFinal, dim, e.seq)
+	// Final RMSNorm: try direct surface read from last FFN, fall back to CPU.
+	lastLF := useLayers[len(useLayers)-1]
+	rmsOK := false
+	if e.off != nil && e.off.hasRMSForward() && lastLF != nil && lastLF.ffn != nil {
+		if err := e.off.runRMSForwardFromSurface(e.xNorm, lastLF.ffn, dim, e.seq); err == nil {
+			rmsOK = true
+		}
+	}
+	if !rmsOK {
+		stories.RMSNorm(e.xNorm, cur, e.mw.RMSFinal, dim, e.seq)
+	}
+	// Classifier on CPU.
 	stories.MatMulVocabSeq(logits, e.mw.Embed, e.xNorm, vocab, dim, e.seq)
 	return nil
 }
