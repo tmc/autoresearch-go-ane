@@ -234,13 +234,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 			heads, kvHeads, headDim, pos+1, e.kvc.maxSeq)
 		timings.Attention += time.Since(tAttn)
 
-		// Wo projection: Metal fp16.
+		// Wo projection: CPU BLAS (faster than Metal for this shape).
 		tWo := time.Now()
-		if e.metalWo[li] != nil {
-			e.metalWo[li].Exec(e.cacheX2, e.cacheAttOut)
-		} else {
-			linearSingle(e.cacheX2, layer.Wo, e.cacheAttOut, dim, qDim)
-		}
+		linearSingle(e.cacheX2, layer.Wo, e.cacheAttOut, dim, qDim)
 		timings.Wo += time.Since(tWo)
 
 		// Residual connection: x2 = cur + scale * x2
