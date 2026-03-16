@@ -228,10 +228,8 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
             MPSGraphTensor *Wo = constantFP16(graph, woAll[li], dim, qDim, [lp stringByAppendingString:@"Wo"]);
             MPSGraphTensor *attOut = graphGEMV(graph, attnFlat, Wo, [lp stringByAppendingString:@"wo"]);
 
-            // Residual
-            MPSGraphTensor *diff = [graph subtractionWithPrimaryTensor:attOut secondaryTensor:cur name:[lp stringByAppendingString:@"att_diff"]];
-            MPSGraphTensor *scaled = [graph multiplicationWithPrimaryTensor:diff secondaryTensor:rsConst name:[lp stringByAppendingString:@"att_scaled"]];
-            MPSGraphTensor *x2 = [graph additionWithPrimaryTensor:cur secondaryTensor:scaled name:[lp stringByAppendingString:@"x2"]];
+            // Residual: simple add (no scale — matches standard transformer).
+            MPSGraphTensor *x2 = [graph additionWithPrimaryTensor:cur secondaryTensor:attOut name:[lp stringByAppendingString:@"x2"]];
 
             // === FFN block ===
             MPSGraphTensor *rmsFFNW = constantFP32(graph, rmsFFNAll[li], dim, [lp stringByAppendingString:@"rms_ffn"]);
@@ -251,10 +249,8 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
             // W2
             MPSGraphTensor *ff = graphGEMV(graph, gate, W2, [lp stringByAppendingString:@"ff"]);
 
-            // Residual
-            MPSGraphTensor *ffDiff = [graph subtractionWithPrimaryTensor:ff secondaryTensor:x2 name:[lp stringByAppendingString:@"ff_diff"]];
-            MPSGraphTensor *ffScaled = [graph multiplicationWithPrimaryTensor:ffDiff secondaryTensor:rsConst name:[lp stringByAppendingString:@"ff_scaled"]];
-            cur = [graph additionWithPrimaryTensor:x2 secondaryTensor:ffScaled name:[lp stringByAppendingString:@"next"]];
+            // Residual: simple add.
+            cur = [graph additionWithPrimaryTensor:x2 secondaryTensor:ff name:[lp stringByAppendingString:@"next"]];
         }
 
         // Final RMSNorm
