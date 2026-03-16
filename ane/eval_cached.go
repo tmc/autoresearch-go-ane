@@ -289,8 +289,18 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 	timings.RMSNorm += time.Since(tRMS)
 
 	// Classifier: logits = Embed @ xNorm where Embed is [vocab, dim] row-major.
+	// Use Metal fp16 for the largest single matmul (vocab=151936).
 	tCls := time.Now()
-	linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
+	if e.metalCls == nil {
+		clsF16 := make([]uint16, len(e.mw.Embed))
+		convertF32ToFP16(clsF16, e.mw.Embed)
+		e.metalCls = NewMetalFP16Gemv(clsF16, vocab, dim)
+	}
+	if e.metalCls != nil {
+		e.metalCls.Exec(e.cacheLogits, e.cacheXNorm)
+	} else {
+		linearSingle(e.cacheLogits, e.mw.Embed, e.cacheXNorm, vocab, dim)
+	}
 	timings.Classifier = time.Since(tCls)
 
 	e.kvc.advancePos()

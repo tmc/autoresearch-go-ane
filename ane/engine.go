@@ -179,6 +179,7 @@ type Engine struct {
 	metalW1  []*MetalFP16Gemv
 	metalW3  []*MetalFP16Gemv
 	metalW2  []*MetalFP16Gemv
+	metalCls *MetalFP16Gemv // classifier [vocab, dim]
 
 	// ANE executors for single-token KV-cached inference.
 	// Compiled with batch=1 for EvalNextToken.
