@@ -7,7 +7,9 @@ import (
 	"math"
 	"time"
 
+	xane "github.com/tmc/apple/x/ane"
 	"github.com/tmc/apple/x/ane/dynamicmatmul"
+	"github.com/tmc/apple/x/ane/model"
 )
 
 // TokenTimings holds per-token timing breakdown for EvalNextToken.
@@ -588,4 +590,21 @@ func singleQueryGQAAttention(out, q, kCache, vCache []float32,
 			out[qBase+d] = sum
 		}
 	}
+}
+
+// writeANEActivations writes activations x[dim, seq] to the first seq columns
+// of an ANE kernel's input IOSurface. Config-aware: uses actual dim, not stories.Dim.
+func writeANEActivations(k *model.Kernel, seq int, x []float32) error {
+	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
+		writeChannelFirstActsFP16(data, layout, seq, x)
+		return nil
+	})
+}
+
+// writeANEFFNActivations writes activations to an FFN kernel's input.
+func writeANEFFNActivations(k *model.Kernel, seq int, x []float32) error {
+	return withLockedFP16Input(k, 0, func(layout xane.TensorLayout, data []uint16) error {
+		writeChannelFirstActsFP16(data, layout, seq, x)
+		return nil
+	})
 }

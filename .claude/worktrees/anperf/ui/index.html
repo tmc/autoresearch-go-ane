@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>anperf — ANE Training Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Header -->
+<header class="header">
+    <div class="header-title">anperf <span>/ ANE Training Dashboard</span></div>
+    <div class="connection-status">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">connecting...</span>
+    </div>
+</header>
+
+<!-- Dashboard Grid -->
+<div class="dashboard">
+
+    <!-- A. Hero Stats Bar -->
+    <div class="hero-stats">
+        <div class="card hero-stat primary" id="heroLoss">
+            <div class="hero-stat-label">Training Loss</div>
+            <div class="hero-stat-value loss" id="valLoss">—</div>
+            <div class="hero-stat-sub" id="valLossAvg">avg: —</div>
+            <canvas class="hero-sparkline" id="sparkLoss"></canvas>
+        </div>
+        <div class="card hero-stat" id="heroThroughput">
+            <div class="hero-stat-label">Throughput</div>
+            <div class="hero-stat-value throughput" id="valTokens">—<span class="hero-stat-unit">tok/s</span></div>
+            <div class="hero-stat-sub" id="valTokensAvg">avg: —</div>
+            <canvas class="hero-sparkline" id="sparkTokens"></canvas>
+        </div>
+        <div class="card hero-stat" id="heroStepTime">
+            <div class="hero-stat-label">Step Time</div>
+            <div class="hero-stat-value step-time" id="valStepMs">—<span class="hero-stat-unit">ms</span></div>
+            <div class="hero-stat-sub" id="valStepAvg">avg: —</div>
+            <canvas class="hero-sparkline" id="sparkStep"></canvas>
+        </div>
+        <div class="card hero-stat" id="heroANE">
+            <div class="hero-stat-label">ANE Utilization</div>
+            <div class="hero-stat-value ane-util" id="valANE">—<span class="hero-stat-unit">%</span></div>
+            <div class="hero-stat-sub" id="valANESub">— ms / step</div>
+            <canvas class="hero-sparkline" id="sparkANE"></canvas>
+        </div>
+    </div>
+
+    <!-- Main chart area -->
+    <div class="main-charts">
+
+        <!-- B. Training Loss Chart -->
+        <div class="card">
+            <div class="card-header">
+                <span>Training Loss</span>
+                <div class="chart-controls">
+                    <button class="chart-toggle active" id="btnTrainLoss" onclick="toggleLossSeries('train')">Train</button>
+                    <button class="chart-toggle" id="btnValLoss" onclick="toggleLossSeries('val')">Val</button>
+                    <button class="chart-toggle" id="btnLogScale" onclick="toggleLogScale()">Log</button>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="chart-container tall">
+                    <canvas id="lossChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- E. Throughput Chart -->
+        <div class="card">
+            <div class="card-header">
+                <span>Throughput (tokens/s)</span>
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="throughputChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- F. Experiment History Table -->
+        <div class="card experiment-table-wrapper">
+            <div class="card-header">
+                <span>Experiment History</span>
+            </div>
+            <div class="card-body" style="overflow-x:auto">
+                <table class="exp-table" id="expTable">
+                    <thead>
+                        <tr>
+                            <th data-col="id" onclick="sortExperiments('id')">#</th>
+                            <th data-col="name" onclick="sortExperiments('name')">Name</th>
+                            <th data-col="val_loss" onclick="sortExperiments('val_loss')">Val Loss</th>
+                            <th data-col="improvement_pct" onclick="sortExperiments('improvement_pct')">Improvement</th>
+                            <th data-col="steps" onclick="sortExperiments('steps')">Steps</th>
+                            <th data-col="duration_secs" onclick="sortExperiments('duration_secs')">Duration</th>
+                            <th data-col="status" onclick="sortExperiments('status')">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="expBody">
+                        <tr><td colspan="7" class="empty-state">No experiments recorded yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+
+        <!-- C. Timing Breakdown -->
+        <div class="card">
+            <div class="card-header"><span>Step Timing Breakdown</span></div>
+            <div class="card-body">
+                <div class="stacked-bar" id="stackedBar">
+                    <div class="stacked-segment ane-seg" id="segANE" style="width:25%"><span></span></div>
+                    <div class="stacked-segment cpu-seg" id="segCPU" style="width:25%"><span></span></div>
+                    <div class="stacked-segment adam-seg" id="segAdam" style="width:25%"><span></span></div>
+                    <div class="stacked-segment other-seg" id="segOther" style="width:25%"><span></span></div>
+                </div>
+                <div class="stacked-legend">
+                    <div class="legend-item"><div class="legend-dot ane"></div>ANE</div>
+                    <div class="legend-item"><div class="legend-dot cpu"></div>CPU</div>
+                    <div class="legend-item"><div class="legend-dot adam"></div>Adam</div>
+                    <div class="legend-item"><div class="legend-dot other"></div>Other</div>
+                </div>
+                <div class="timing-bars" id="timingBars" style="margin-top:16px">
+                    <!-- Filled dynamically -->
+                </div>
+            </div>
+        </div>
+
+        <!-- D. Component Timing Waterfall -->
+        <div class="card">
+            <div class="card-header"><span>Component Timings</span></div>
+            <div class="card-body">
+                <div class="chart-container waterfall-chart" style="height:240px">
+                    <canvas id="waterfallChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- G. System Info -->
+        <div class="card">
+            <div class="card-header"><span>System</span></div>
+            <div class="card-body">
+                <div class="sys-info" id="sysInfo">
+                    <div class="sys-row"><span class="sys-label">Chip</span><span class="sys-value" id="sysChip">—</span></div>
+                    <div class="sys-row"><span class="sys-label">Memory</span><span class="sys-value" id="sysMem">—</span></div>
+                    <div class="sys-row"><span class="sys-label">ANE Cores</span><span class="sys-value" id="sysANE">—</span></div>
+                    <div class="sys-row"><span class="sys-label">OS</span><span class="sys-value" id="sysOS">—</span></div>
+                    <div class="sys-row"><span class="sys-label">Go</span><span class="sys-value" id="sysGo">—</span></div>
+                    <div class="sys-divider"></div>
+                    <div class="sys-row"><span class="sys-label">Total Steps</span><span class="sys-value" id="sysTotalSteps">0</span></div>
+                    <div class="sys-row"><span class="sys-label">Uptime</span><span class="sys-value" id="sysUptime">—</span></div>
+                    <div class="sys-divider"></div>
+                    <div class="sys-row"><span class="sys-label" style="font-weight:600">Hyperparams</span><span></span></div>
+                    <div class="hyperparam-list" id="hyperparamList">
+                        <!-- Filled dynamically -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Tooltip container (created by chart engine) -->
+
+<script src="charts.js"></script>
+<script>
+'use strict';
+
+const C = window.AnperfCharts;
+
+// ─── State ───
+
+let lossData = [];
+let valLossData = [];
+let throughputData = [];
+let stepMsData = [];
+let aneData = [];
+let logScale = false;
+let showTrainLoss = true;
+let showValLoss = false;
+let expSortCol = 'id';
+let expSortDir = 'desc';
+let experimentsCache = [];
+let sparkLossValues = [];
+let sparkTokenValues = [];
+let sparkStepValues = [];
+let sparkANEValues = [];
+
+// ─── Chart Instances ───
+
+const lossChart = new C.LineChart(document.getElementById('lossChart'), {
+    lineColor: '#00d4ff',
+    lineWidth: 2,
+    smoothing: 0.18,
+    padding: { top: 20, right: 20, bottom: 40, left: 70 },
+});
+
+const throughputChart = new C.AreaChart(document.getElementById('throughputChart'), {
+    lineColor: '#39ff14',
+    fillOpacity: 0.18,
+    lineWidth: 2,
+    smoothing: 0.18,
+    padding: { top: 20, right: 20, bottom: 40, left: 70 },
+});
+
+const waterfallChart = new C.WaterfallChart(document.getElementById('waterfallChart'), {
+    padding: { top: 6, right: 20, bottom: 6, left: 120 },
+    barHeight: 18,
+    barGap: 3,
+});
+
+const sparkLoss = new C.Sparkline(document.getElementById('sparkLoss'), { color: '#00d4ff' });
+const sparkTokens = new C.Sparkline(document.getElementById('sparkTokens'), { color: '#39ff14' });
+const sparkStep = new C.Sparkline(document.getElementById('sparkStep'), { color: '#ffbe0b' });
+const sparkANE = new C.Sparkline(document.getElementById('sparkANE'), { color: '#ff006e' });
+
+// ─── Chart update helpers ───
+
+function updateLossChart() {
+    const series = [];
+    if (showTrainLoss && lossData.length > 0) {
+        series.push({ data: lossData, color: '#00d4ff', label: 'train_loss' });
+    }
+    if (showValLoss && valLossData.length > 0) {
+        series.push({ data: valLossData, color: '#ff006e', label: 'val_loss' });
+    }
+    lossChart.options.logScale = logScale;
+    lossChart.setData(series);
+}
+
+function updateThroughputChart() {
+    if (throughputData.length < 2) return;
+    // Add moving average.
+    const ma = movingAverage(throughputData, 20);
+    throughputChart.setData([
+        { data: throughputData, color: '#39ff14', label: 'tokens/s' },
+        { data: ma, color: '#ffbe0b', label: 'MA(20)' },
+    ]);
+}
+
+function movingAverage(data, window) {
+    if (data.length < window) return [];
+    const result = [];
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+        sum += data[i].y;
+        if (i >= window) sum -= data[i - window].y;
+        if (i >= window - 1) {
+            result.push({ x: data[i].x, y: sum / window });
+        }
+    }
+    return result;
+}
+
+// ─── Toggle handlers ───
+
+window.toggleLossSeries = function(which) {
+    if (which === 'train') {
+        showTrainLoss = !showTrainLoss;
+        document.getElementById('btnTrainLoss').classList.toggle('active', showTrainLoss);
+    } else {
+        showValLoss = !showValLoss;
+        document.getElementById('btnValLoss').classList.toggle('active', showValLoss);
+    }
+    updateLossChart();
+};
+
+window.toggleLogScale = function() {
+    logScale = !logScale;
+    document.getElementById('btnLogScale').classList.toggle('active', logScale);
+    updateLossChart();
+};
+
+// ─── Hero stat updates ───
+
+function animateValue(el, newVal, format) {
+    el.classList.add('updated');
+    el.innerHTML = format(newVal);
+    setTimeout(() => el.classList.remove('updated'), 300);
+}
+
+function updateHeroStats(metrics) {
+    const cur = metrics.current || {};
+    animateValue(document.getElementById('valLoss'), cur.loss,
+        v => C.formatNum(v, 4));
+    document.getElementById('valLossAvg').textContent = 'avg: ' + C.formatNum(metrics.avg_loss, 4);
+
+    animateValue(document.getElementById('valTokens'), cur.tokens_per_sec,
+        v => C.formatNum(v, 0) + '<span class="hero-stat-unit">tok/s</span>');
+    document.getElementById('valTokensAvg').textContent = 'avg: ' + C.formatNum(metrics.avg_tokens_per_sec, 0);
+
+    animateValue(document.getElementById('valStepMs'), cur.step_ms,
+        v => C.formatNum(v, 1) + '<span class="hero-stat-unit">ms</span>');
+    document.getElementById('valStepAvg').textContent = 'avg: ' + C.formatNum(metrics.avg_step_ms, 1) + ' ms';
+
+    animateValue(document.getElementById('valANE'), metrics.ane_utilization,
+        v => C.formatNum(v, 1) + '<span class="hero-stat-unit">%</span>');
+    document.getElementById('valANESub').textContent = C.formatNum(metrics.avg_ane_ms, 1) + ' ms / step';
+}
+
+// ─── Timing breakdown ───
+
+function updateTimingBreakdown(metrics) {
+    const cur = metrics.current || {};
+    const total = (cur.ane_ms || 0) + (cur.cpu_ms || 0) + (cur.adam_ms || 0);
+    const other = Math.max(0, (cur.step_ms || 0) - total);
+    const denom = (cur.step_ms || 1);
+
+    const pANE = ((cur.ane_ms || 0) / denom * 100);
+    const pCPU = ((cur.cpu_ms || 0) / denom * 100);
+    const pAdam = ((cur.adam_ms || 0) / denom * 100);
+    const pOther = (other / denom * 100);
+
+    document.getElementById('segANE').style.width = pANE + '%';
+    document.getElementById('segANE').querySelector('span').textContent = pANE > 8 ? C.formatNum(pANE, 0) + '%' : '';
+    document.getElementById('segCPU').style.width = pCPU + '%';
+    document.getElementById('segCPU').querySelector('span').textContent = pCPU > 8 ? C.formatNum(pCPU, 0) + '%' : '';
+    document.getElementById('segAdam').style.width = pAdam + '%';
+    document.getElementById('segAdam').querySelector('span').textContent = pAdam > 8 ? C.formatNum(pAdam, 0) + '%' : '';
+    document.getElementById('segOther').style.width = pOther + '%';
+    document.getElementById('segOther').querySelector('span').textContent = pOther > 8 ? C.formatNum(pOther, 0) + '%' : '';
+
+    // Individual bars.
+    const bars = [
+        { label: 'ANE', value: cur.ane_ms || 0, cls: 'ane' },
+        { label: 'CPU Work', value: cur.cpu_ms || 0, cls: 'cpu' },
+        { label: 'Adam', value: cur.adam_ms || 0, cls: 'adam' },
+        { label: 'Other', value: other, cls: 'other' },
+    ];
+
+    const barsEl = document.getElementById('timingBars');
+    barsEl.innerHTML = bars.map(b => `
+        <div class="timing-row">
+            <div class="timing-row-header">
+                <span class="timing-row-label">${b.label}</span>
+                <span class="timing-row-value">${C.formatMs(b.value)} (${C.formatNum(b.value / denom * 100, 0)}%)</span>
+            </div>
+            <div class="timing-bar-track">
+                <div class="timing-bar-fill ${b.cls}" style="width:${b.value / denom * 100}%"></div>
+            </div>
+        </div>
+    `).join('');
+}
+
+// ─── Component waterfall ───
+
+function updateComponentWaterfall(current) {
+    if (!current || !current.components) return;
+    const data = Object.entries(current.components)
+        .filter(([_, v]) => v > 0)
+        .map(([label, value]) => ({ label, value }));
+    if (data.length > 0) {
+        waterfallChart.setData(data);
+    }
+}
+
+// ─── Experiments table ───
+
+window.sortExperiments = function(col) {
+    if (expSortCol === col) {
+        expSortDir = expSortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+        expSortCol = col;
+        expSortDir = 'desc';
+    }
+    renderExperiments(experimentsCache);
+};
+
+function renderExperiments(exps) {
+    experimentsCache = exps;
+    const body = document.getElementById('expBody');
+
+    // Update sort indicators.
+    document.querySelectorAll('.exp-table th').forEach(th => {
+        th.classList.remove('sorted-asc', 'sorted-desc');
+        if (th.dataset.col === expSortCol) {
+            th.classList.add('sorted-' + expSortDir);
+        }
+    });
+
+    if (!exps || exps.length === 0) {
+        body.innerHTML = '<tr><td colspan="7" class="empty-state">No experiments recorded yet</td></tr>';
+        return;
+    }
+
+    const sorted = exps.slice().sort((a, b) => {
+        let va = a[expSortCol], vb = b[expSortCol];
+        if (typeof va === 'string') {
+            va = va.toLowerCase(); vb = (vb || '').toLowerCase();
+        }
+        const cmp = va < vb ? -1 : va > vb ? 1 : 0;
+        return expSortDir === 'asc' ? cmp : -cmp;
+    });
+
+    body.innerHTML = sorted.map(e => {
+        const impClass = e.improvement_pct > 0 ? 'improvement-pos' : e.improvement_pct < 0 ? 'improvement-neg' : '';
+        const impSign = e.improvement_pct > 0 ? '+' : '';
+        const statusClass = e.status === 'ok' ? 'status-ok' : 'status-error';
+        const durStr = e.duration_secs >= 60
+            ? C.formatNum(e.duration_secs / 60, 1) + ' min'
+            : C.formatNum(e.duration_secs, 1) + 's';
+        const paramsHTML = e.params ? Object.entries(e.params).map(([k, v]) =>
+            `<span class="exp-param-tag">${k}: ${v}</span>`
+        ).join('') : '';
+
+        return `
+            <tr onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? '' : 'none'" style="cursor:pointer">
+                <td>${e.id}</td>
+                <td><span class="exp-name">${e.name}</span></td>
+                <td>${C.formatNum(e.val_loss, 4)}</td>
+                <td class="${impClass}">${impSign}${C.formatNum(e.improvement_pct, 2)}%</td>
+                <td>${e.steps}</td>
+                <td>${durStr}</td>
+                <td class="${statusClass}">${e.status}</td>
+            </tr>
+            <tr class="exp-detail-row" style="display:none">
+                <td colspan="7">
+                    <div class="exp-params">${paramsHTML || '<span style="color:var(--text-muted)">No parameters recorded</span>'}</div>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+// ─── System info ───
+
+function updateSystemInfo(info) {
+    document.getElementById('sysChip').textContent = info.chip || '—';
+    document.getElementById('sysMem').textContent = info.memory || '—';
+    document.getElementById('sysANE').textContent = info.ane_cores || '—';
+    document.getElementById('sysOS').textContent = info.os || '—';
+    document.getElementById('sysGo').textContent = info.go_version || '—';
+    document.getElementById('sysTotalSteps').textContent = C.formatNum(info.total_steps, 0);
+
+    const upSec = info.uptime_seconds || 0;
+    if (upSec >= 3600) {
+        document.getElementById('sysUptime').textContent = C.formatNum(upSec / 3600, 1) + ' h';
+    } else if (upSec >= 60) {
+        document.getElementById('sysUptime').textContent = C.formatNum(upSec / 60, 1) + ' min';
+    } else {
+        document.getElementById('sysUptime').textContent = C.formatNum(upSec, 0) + ' s';
+    }
+
+    const hpList = document.getElementById('hyperparamList');
+    if (info.hyperparams && Object.keys(info.hyperparams).length > 0) {
+        hpList.innerHTML = Object.entries(info.hyperparams).map(([k, v]) => `
+            <div class="hyperparam-row">
+                <span class="hyperparam-key">${k}</span>
+                <span class="hyperparam-val">${v}</span>
+            </div>
+        `).join('');
+    }
+}
+
+// ─── Process step data ───
+
+function processStepData(step) {
+    lossData.push({ x: step.step, y: step.loss });
+    if (step.val_loss > 0) {
+        valLossData.push({ x: step.step, y: step.val_loss });
+    }
+    throughputData.push({ x: step.step, y: step.tokens_per_sec });
+    stepMsData.push(step.step_ms);
+    aneData.push(step.ane_ms);
+
+    sparkLossValues.push(step.loss);
+    sparkTokenValues.push(step.tokens_per_sec);
+    sparkStepValues.push(step.step_ms);
+    sparkANEValues.push(step.step_ms > 0 ? (step.ane_ms / step.step_ms * 100) : 0);
+
+    // Cap sparkline arrays.
+    const maxSpark = 100;
+    if (sparkLossValues.length > maxSpark) sparkLossValues.shift();
+    if (sparkTokenValues.length > maxSpark) sparkTokenValues.shift();
+    if (sparkStepValues.length > maxSpark) sparkStepValues.shift();
+    if (sparkANEValues.length > maxSpark) sparkANEValues.shift();
+}
+
+// ─── Data fetching ───
+
+function getBasePath() {
+    // Detect the prefix from the current page URL.
+    const path = window.location.pathname;
+    const idx = path.lastIndexOf('/');
+    return idx > 0 ? path.substring(0, idx + 1) : '/';
+}
+
+const BASE = getBasePath();
+
+async function fetchMetrics() {
+    try {
+        const resp = await fetch(BASE + 'api/metrics');
+        const data = await resp.json();
+        if (data.status === 'waiting') return;
+        updateHeroStats(data);
+        updateTimingBreakdown(data);
+        updateComponentWaterfall(data.current);
+    } catch (e) {
+        console.warn('metrics fetch error:', e);
+    }
+}
+
+async function fetchTimeseries() {
+    try {
+        const resp = await fetch(BASE + 'api/timeseries?max=5000');
+        const data = await resp.json();
+        if (!data || data.length === 0) return;
+
+        lossData = [];
+        valLossData = [];
+        throughputData = [];
+        sparkLossValues = [];
+        sparkTokenValues = [];
+        sparkStepValues = [];
+        sparkANEValues = [];
+
+        for (const s of data) {
+            processStepData(s);
+        }
+
+        updateLossChart();
+        updateThroughputChart();
+        sparkLoss.setData(sparkLossValues);
+        sparkTokens.setData(sparkTokenValues);
+        sparkStep.setData(sparkStepValues);
+        sparkANE.setData(sparkANEValues);
+    } catch (e) {
+        console.warn('timeseries fetch error:', e);
+    }
+}
+
+async function fetchExperiments() {
+    try {
+        const resp = await fetch(BASE + 'api/experiments');
+        const data = await resp.json();
+        renderExperiments(data);
+    } catch (e) {
+        console.warn('experiments fetch error:', e);
+    }
+}
+
+async function fetchSystem() {
+    try {
+        const resp = await fetch(BASE + 'api/system');
+        const data = await resp.json();
+        updateSystemInfo(data);
+    } catch (e) {
+        console.warn('system fetch error:', e);
+    }
+}
+
+// ─── SSE ───
+
+let sseRetryDelay = 1000;
+let sseUpdateCounter = 0;
+
+function connectSSE() {
+    const evtSource = new EventSource(BASE + 'api/stream');
+
+    evtSource.onopen = () => {
+        document.getElementById('statusDot').classList.add('connected');
+        document.getElementById('statusText').textContent = 'live';
+        sseRetryDelay = 1000;
+    };
+
+    evtSource.onmessage = (event) => {
+        try {
+            const step = JSON.parse(event.data);
+            processStepData(step);
+            sseUpdateCounter++;
+
+            // Debounce chart updates (every 5 steps or every 500ms).
+            if (sseUpdateCounter % 5 === 0) {
+                updateLossChart();
+                updateThroughputChart();
+                sparkLoss.setData(sparkLossValues);
+                sparkTokens.setData(sparkTokenValues);
+                sparkStep.setData(sparkStepValues);
+                sparkANE.setData(sparkANEValues);
+            }
+
+            // Update hero stats on every step.
+            updateHeroFromStep(step);
+            updateTimingFromStep(step);
+            updateComponentWaterfall(step);
+        } catch (e) {
+            console.warn('SSE parse error:', e);
+        }
+    };
+
+    evtSource.onerror = () => {
+        document.getElementById('statusDot').classList.remove('connected');
+        document.getElementById('statusText').textContent = 'disconnected';
+        evtSource.close();
+        setTimeout(connectSSE, sseRetryDelay);
+        sseRetryDelay = Math.min(sseRetryDelay * 2, 30000);
+    };
+}
+
+function updateHeroFromStep(step) {
+    const lossEl = document.getElementById('valLoss');
+    lossEl.classList.add('updated');
+    lossEl.textContent = C.formatNum(step.loss, 4);
+    setTimeout(() => lossEl.classList.remove('updated'), 300);
+
+    document.getElementById('valTokens').innerHTML = C.formatNum(step.tokens_per_sec, 0) + '<span class="hero-stat-unit">tok/s</span>';
+    document.getElementById('valStepMs').innerHTML = C.formatNum(step.step_ms, 1) + '<span class="hero-stat-unit">ms</span>';
+
+    const aneUtil = step.step_ms > 0 ? (step.ane_ms / step.step_ms * 100) : 0;
+    document.getElementById('valANE').innerHTML = C.formatNum(aneUtil, 1) + '<span class="hero-stat-unit">%</span>';
+    document.getElementById('valANESub').textContent = C.formatNum(step.ane_ms, 1) + ' ms / step';
+}
+
+function updateTimingFromStep(step) {
+    const total = (step.ane_ms || 0) + (step.cpu_ms || 0) + (step.adam_ms || 0);
+    const other = Math.max(0, (step.step_ms || 0) - total);
+    const denom = (step.step_ms || 1);
+
+    document.getElementById('segANE').style.width = ((step.ane_ms || 0) / denom * 100) + '%';
+    document.getElementById('segCPU').style.width = ((step.cpu_ms || 0) / denom * 100) + '%';
+    document.getElementById('segAdam').style.width = ((step.adam_ms || 0) / denom * 100) + '%';
+    document.getElementById('segOther').style.width = (other / denom * 100) + '%';
+}
+
+// ─── Init ───
+
+async function init() {
+    // Initial data load.
+    await Promise.all([
+        fetchTimeseries(),
+        fetchMetrics(),
+        fetchExperiments(),
+        fetchSystem(),
+    ]);
+
+    // Connect SSE for live updates.
+    connectSSE();
+
+    // Periodic refresh for non-SSE data.
+    setInterval(fetchMetrics, 3000);
+    setInterval(fetchExperiments, 10000);
+    setInterval(fetchSystem, 10000);
+}
+
+init();
+</script>
+</body>
+</html>

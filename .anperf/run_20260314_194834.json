@@ -1,0 +1,41 @@
+{
+  "id": "run_20260314_194834",
+  "name": "e1f14fb",
+  "timestamp": "2026-03-14T19:48:34.510616-07:00",
+  "chip": "Apple Silicon",
+  "git_commit": "e1f14fb",
+  "params": {
+    "accum_steps": 4,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "grad_clip": 1,
+    "hybrid_backward": true,
+    "learning_rate": 0.0003,
+    "loss_scale": 256,
+    "seed": 42,
+    "seq_length": 256,
+    "use_ane": true,
+    "weight_decay": 0.01
+  },
+  "total_steps": 4072,
+  "duration_secs": 623.9,
+  "avg_step_ms": 147.7,
+  "avg_ane_ms": 36.38,
+  "avg_cpu_ms": 111.16,
+  "avg_adam_ms": 2.39,
+  "avg_tokens_sec": 1749.2,
+  "ane_utilization": 24.6,
+  "final_loss": 6.679411,
+  "components": {
+    "ANEEval": 36.379,
+    "Adam": 2.389,
+    "Compile": 0.155,
+    "DWGEMM": 111.168,
+    "DWWait": 4.922,
+    "EmbedGrad": 12.384,
+    "FinalHead": 46.969,
+    "RMSDW": 3.944,
+    "StartupCompile": 0.155,
+    "WeightRefresh": 0
+  }
+}

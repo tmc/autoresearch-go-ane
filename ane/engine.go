@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tmc/apple/x/ane/dynamicmatmul"
+	"github.com/tmc/apple/x/ane/model"
 	"github.com/tmc/autoresearch-go-ane/ane/stories"
 )
 
@@ -862,6 +863,7 @@ func (e *Engine) evalLogitsInto(tokens []int32, logits []float32) error {
 			if err == nil {
 				return nil
 			}
+			fmt.Fprintf(os.Stderr, "ANE: evalLogitsANEInto (infer) failed: %v\n", err)
 		}
 		// Fallback to taps layers.
 		if e.ensureLayers() == nil {
@@ -869,6 +871,7 @@ func (e *Engine) evalLogitsInto(tokens []int32, logits []float32) error {
 			if err == nil {
 				return nil
 			}
+			fmt.Fprintf(os.Stderr, "ANE: evalLogitsANEInto (taps) failed: %v\n", err)
 			e.disableLayerForward(err)
 		}
 	}
@@ -918,17 +921,26 @@ func (e *Engine) ensureInferLayers() error {
 		// Try monolithic inference kernel first (legacy MHA path).
 		lf, err := compileStoriesLayerForwardInference(e.mw.Layers[i], e.seq)
 		if err == nil {
+			if i == 0 {
+				fmt.Fprintf(os.Stderr, "ANE: layer 0 using monolithic MHA path\n")
+			}
 			return lf, nil
 		}
 		// Try GQA monolithic path (handles qDim != dim).
 		lf, gqaErr := compileGQALayerForwardInference(cfg, e.mw.Layers[i], e.seq)
 		if gqaErr == nil {
+			if i == 0 {
+				fmt.Fprintf(os.Stderr, "ANE: layer 0 using GQA monolithic path\n")
+			}
 			return lf, nil
 		}
 		// Fall back to tiled compilation for large models.
 		lf, tiledErr := compileStoriesLayerForwardTiled(cfg, e.mw.Layers[i], e.seq)
 		if tiledErr != nil {
 			return nil, fmt.Errorf("storiesane eval logits: compile infer layer %d: monolithic: %v, gqa: %v, tiled: %w", i, err, gqaErr, tiledErr)
+		}
+		if i == 0 {
+			fmt.Fprintf(os.Stderr, "ANE: layer 0 using tiled path (monolithic: %v, gqa: %v)\n", err, gqaErr)
 		}
 		return lf, nil
 	}, func(lf *layerForward) {
@@ -959,8 +971,43 @@ func (e *Engine) evalLogitsANEInto(tokens []int32, logits []float32) error {
 	next := e.tmpHidden
 	for i := range useLayers {
 		lf := useLayers[i]
-		if lf.inferScaled && lf.dynamic && i+1 < len(useLayers) {
-			if err := lf.runDynamicInferPipelined(next, cur, i, useLayers); err != nil {
+		if lf.dynamic && lf.inferScaled {
+			// Direct ANE dispatch: bypass writeStoriesAttentionForwardActs
+			// which hardcodes stories.Dim=768. Use config-aware writer.
+			if err := writeANEActivations(lf.att, e.seq, cur); err != nil {
+				return fmt.Errorf("storiesane eval logits: layer %d: write att input: %w", i, err)
+			}
+			if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
+				return fmt.Errorf("storiesane eval logits: layer %d: eval att: %w", i, err)
+			}
+			// Try surface copy att→FFN to skip CPU roundtrip.
+			if err := model.CopyOutputRangeToInput(lf.ffn, 0, 0, 0, lf.att, 0, 0, 0, dim, e.seq); err != nil {
+				// Fallback: read att output, write to FFN input.
+				if lf.x2 == nil {
+					lf.x2 = make([]float32, dim*e.seq)
+				}
+				if err := readOutputFP16ChannelsFast(lf.att, 0, 0, e.seq, lf.x2); err != nil {
+					return fmt.Errorf("storiesane eval logits: layer %d: read att output: %w", i, err)
+				}
+				if err := writeANEFFNActivations(lf.ffn, e.seq, lf.x2); err != nil {
+					return fmt.Errorf("storiesane eval logits: layer %d: write ffn input: %w", i, err)
+				}
+			}
+			if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
+				return fmt.Errorf("storiesane eval logits: layer %d: eval ffn: %w", i, err)
+			}
+			// Try surface copy FFN→next att.
+			if i+1 < len(useLayers) && useLayers[i+1].dynamic && useLayers[i+1].att != nil {
+				if err := model.CopyOutputRangeToInput(useLayers[i+1].att, 0, 0, 0, lf.ffn, 0, 0, 0, dim, e.seq); err == nil {
+					// Next layer's att input is ready via surface copy.
+					// Still need to read to CPU for cur buffer.
+				}
+			}
+			if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, e.seq, next); err != nil {
+				return fmt.Errorf("storiesane eval logits: layer %d: read ffn output: %w", i, err)
+			}
+		} else if lf.tiled != nil {
+			if err := lf.runTiled(next, cur); err != nil {
 				return fmt.Errorf("storiesane eval logits: layer %d: %w", i, err)
 			}
 		} else if err := lf.run(next, cur); err != nil {
@@ -968,26 +1015,9 @@ func (e *Engine) evalLogitsANEInto(tokens []int32, logits []float32) error {
 		}
 		cur, next = next, cur
 	}
-	// Try direct surface copy from last FFN to RMS norm.
-	lastLF := useLayers[len(useLayers)-1]
-	rmsOK := false
-	if e.off != nil && e.off.hasRMSForward() && lastLF != nil && lastLF.ffn != nil {
-		if err := e.off.runRMSForwardFromSurface(e.xNorm, lastLF.ffn, dim, e.seq); err == nil {
-			rmsOK = true
-		}
-	}
-	if !rmsOK {
-		if e.off == nil || !e.off.hasRMSForward() {
-			stories.RMSNorm(e.xNorm, cur, e.mw.RMSFinal, dim, e.seq)
-		} else if err := e.off.runRMSForward(e.xNorm, cur); err != nil {
-			return fmt.Errorf("storiesane eval logits: final rmsnorm: %w", err)
-		}
-	}
-	if e.off == nil || !e.off.hasClassifierForward() {
-		stories.MatMulVocabSeq(logits, e.mw.Embed, e.xNorm, vocab, dim, e.seq)
-	} else if err := e.off.runClassifierForward(logits, e.xNorm); err != nil {
-		return fmt.Errorf("storiesane eval logits: classifier: %w", err)
-	}
+	// Final RMSNorm + classifier on CPU.
+	stories.RMSNorm(e.xNorm, cur, e.mw.RMSFinal, dim, e.seq)
+	stories.MatMulVocabSeq(logits, e.mw.Embed, e.xNorm, vocab, dim, e.seq)
 	return nil
 }
 
