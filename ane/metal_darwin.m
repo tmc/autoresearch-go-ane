@@ -88,3 +88,128 @@ void metalGEMV_cleanup(void) {
     _mtlQueue = nil;
     _mtlDevice = nil;
 }
+
+// ---- FP16 compute shader GEMV for decode ----
+
+static id<MTLComputePipelineState> _fp16Pipeline = nil;
+
+static const char *fp16GemvShader =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "kernel void gemv_f16(\n"
+    "    device const half *weights [[buffer(0)]],\n"
+    "    device const float *x      [[buffer(1)]],\n"
+    "    device float *out          [[buffer(2)]],\n"
+    "    constant uint &inDim       [[buffer(3)]],\n"
+    "    uint tid [[thread_position_in_grid]]\n"
+    ") {\n"
+    "    uint row = tid;\n"
+    "    device const half *w_row = weights + (uint64_t)row * inDim;\n"
+    "    float sum = 0.0f;\n"
+    "    for (uint d = 0; d < inDim; d += 4) {\n"
+    "        half4 wv = *((device const half4 *)(w_row + d));\n"
+    "        float4 xv = *((device const float4 *)(x + d));\n"
+    "        sum += dot(float4(wv), xv);\n"
+    "    }\n"
+    "    out[row] = sum;\n"
+    "}\n";
+
+static int ensureFP16Pipeline(void) {
+    if (_fp16Pipeline != nil) return 0;
+    if (_mtlDevice == nil) return -1;
+    @autoreleasepool {
+        NSError *error = nil;
+        id<MTLLibrary> lib = [_mtlDevice newLibraryWithSource:
+            [NSString stringWithUTF8String:fp16GemvShader] options:nil error:&error];
+        if (lib == nil) return -2;
+        id<MTLFunction> fn = [lib newFunctionWithName:@"gemv_f16"];
+        if (fn == nil) return -3;
+        _fp16Pipeline = [_mtlDevice newComputePipelineStateWithFunction:fn error:&error];
+        if (_fp16Pipeline == nil) return -4;
+        return 0;
+    }
+}
+
+typedef struct {
+    void *wBuf;   // id<MTLBuffer> — persistent fp16 weights on GPU
+    int outDim;
+    int inDim;
+} MetalFP16Handle;
+
+// Create a cached fp16 weight buffer on GPU.
+MetalFP16Handle* metalFP16GemvCreate(const uint16_t *weights_f16, int outDim, int inDim) {
+    @autoreleasepool {
+        if (_mtlDevice == nil || ensureFP16Pipeline() != 0) return NULL;
+        size_t wBytes = (size_t)outDim * inDim * sizeof(uint16_t);
+        id<MTLBuffer> wBuf = [_mtlDevice newBufferWithBytes:weights_f16
+                                                       length:wBytes
+                                                      options:MTLResourceStorageModeShared];
+        if (wBuf == nil) return NULL;
+        MetalFP16Handle *h = (MetalFP16Handle *)calloc(1, sizeof(MetalFP16Handle));
+        h->wBuf = (__bridge_retained void *)wBuf;
+        h->outDim = outDim;
+        h->inDim = inDim;
+        return h;
+    }
+}
+
+// Execute fp16 GEMV: out = weights_fp16 @ x_fp32
+int metalFP16GemvExec(MetalFP16Handle *h, float *out, const float *x) {
+    @autoreleasepool {
+        if (h == NULL || _fp16Pipeline == nil || _mtlQueue == nil) return -1;
+        int outDim = h->outDim;
+        int inDim = h->inDim;
+        uint32_t inDimU = (uint32_t)inDim;
+
+        // Use no-copy buffers for unified memory (Apple Silicon).
+        size_t xBytes = (size_t)inDim * sizeof(float);
+        size_t oBytes = (size_t)outDim * sizeof(float);
+
+        id<MTLBuffer> xBuf = [_mtlDevice newBufferWithBytesNoCopy:(void *)x
+                                                           length:xBytes
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+        if (xBuf == nil) {
+            xBuf = [_mtlDevice newBufferWithBytes:x length:xBytes
+                                          options:MTLResourceStorageModeShared];
+        }
+        id<MTLBuffer> oBuf = [_mtlDevice newBufferWithBytesNoCopy:(void *)out
+                                                           length:oBytes
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+        if (oBuf == nil) {
+            oBuf = [_mtlDevice newBufferWithLength:oBytes options:MTLResourceStorageModeShared];
+        }
+
+        id<MTLBuffer> dimBuf = [_mtlDevice newBufferWithBytes:&inDimU
+                                                       length:sizeof(uint32_t)
+                                                      options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmdBuf = [_mtlQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+        [enc setComputePipelineState:_fp16Pipeline];
+        [enc setBuffer:(__bridge id<MTLBuffer>)h->wBuf offset:0 atIndex:0];
+        [enc setBuffer:xBuf offset:0 atIndex:1];
+        [enc setBuffer:oBuf offset:0 atIndex:2];
+        [enc setBuffer:dimBuf offset:0 atIndex:3];
+
+        MTLSize gridSize = MTLSizeMake(outDim, 1, 1);
+        NSUInteger tgSize = _fp16Pipeline.maxTotalThreadsPerThreadgroup;
+        if (tgSize > (NSUInteger)outDim) tgSize = outDim;
+        [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        [enc endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.error != nil) return -1;
+        // If no-copy worked, data is already in `out`. Otherwise, copy.
+        if (oBuf.contents != out) {
+            memcpy(out, oBuf.contents, oBytes);
+        }
+        return 0;
+    }
+}
+
+void metalFP16GemvDestroy(MetalFP16Handle *h) {
+    if (h != NULL) free(h);
+}
