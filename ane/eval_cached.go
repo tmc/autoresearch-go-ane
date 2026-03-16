@@ -102,15 +102,30 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 	}
 
 	// Lazily create Metal fp16 GEMV handles for large FFN matmuls.
-	// Convert fp32 weights to fp16 on-the-fly (only for Metal, keep fp32 for CPU BLAS).
+	// Convert ALL layer weights to fp16 for Metal GPU decode.
 	if e.metalW1 == nil {
 		nLayers := cfg.NLayers
+		e.metalWq = make([]*MetalFP16Gemv, nLayers)
+		e.metalWk = make([]*MetalFP16Gemv, nLayers)
+		e.metalWv = make([]*MetalFP16Gemv, nLayers)
+		e.metalWo = make([]*MetalFP16Gemv, nLayers)
 		e.metalW1 = make([]*MetalFP16Gemv, nLayers)
 		e.metalW3 = make([]*MetalFP16Gemv, nLayers)
 		e.metalW2 = make([]*MetalFP16Gemv, nLayers)
 		for i := 0; i < nLayers; i++ {
 			layer := e.mw.Layers[i]
-			// Convert fp32 → fp16 for Metal handles.
+			wqf16 := make([]uint16, len(layer.Wq))
+			convertF32ToFP16(wqf16, layer.Wq)
+			e.metalWq[i] = NewMetalFP16Gemv(wqf16, qDim, dim)
+			wkf16 := make([]uint16, len(layer.Wk))
+			convertF32ToFP16(wkf16, layer.Wk)
+			e.metalWk[i] = NewMetalFP16Gemv(wkf16, kvDim, dim)
+			wvf16 := make([]uint16, len(layer.Wv))
+			convertF32ToFP16(wvf16, layer.Wv)
+			e.metalWv[i] = NewMetalFP16Gemv(wvf16, kvDim, dim)
+			wof16 := make([]uint16, len(layer.Wo))
+			convertF32ToFP16(wof16, layer.Wo)
+			e.metalWo[i] = NewMetalFP16Gemv(wof16, dim, qDim)
 			w1f16 := make([]uint16, len(layer.W1))
 			convertF32ToFP16(w1f16, layer.W1)
 			e.metalW1[i] = NewMetalFP16Gemv(w1f16, hidden, dim)
@@ -180,19 +195,20 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		}
 		timings.RMSNorm += time.Since(tRMS)
 
-		// Unfused QKV: CPU BLAS (Metal dispatch overhead too high for small Wk/Wv).
+		// Unfused QKV: all on Metal fp16 (pre-allocated buffers minimize overhead).
 		tQKV := time.Now()
-		{
+		if e.metalWq[li] != nil {
 			var qkvWG sync.WaitGroup
 			qkvWG.Add(2)
-			go func() {
-				linearSingle(e.cacheQKV[qDim:qDim+kvDim], layer.Wk, e.cacheXNorm, kvDim, dim)
-				qkvWG.Done()
-			}()
-			go func() {
-				linearSingle(e.cacheQKV[qDim+kvDim:], layer.Wv, e.cacheXNorm, kvDim, dim)
-				qkvWG.Done()
-			}()
+			go func() { e.metalWk[li].Exec(e.cacheQKV[qDim:qDim+kvDim], e.cacheXNorm); qkvWG.Done() }()
+			go func() { e.metalWv[li].Exec(e.cacheQKV[qDim+kvDim:], e.cacheXNorm); qkvWG.Done() }()
+			e.metalWq[li].Exec(e.cacheQKV[:qDim], e.cacheXNorm)
+			qkvWG.Wait()
+		} else {
+			var qkvWG sync.WaitGroup
+			qkvWG.Add(2)
+			go func() { linearSingle(e.cacheQKV[qDim:qDim+kvDim], layer.Wk, e.cacheXNorm, kvDim, dim); qkvWG.Done() }()
+			go func() { linearSingle(e.cacheQKV[qDim+kvDim:], layer.Wv, e.cacheXNorm, kvDim, dim); qkvWG.Done() }()
 			linearSingle(e.cacheQKV[:qDim], layer.Wq, e.cacheXNorm, qDim, dim)
 			qkvWG.Wait()
 		}
@@ -218,14 +234,10 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 			heads, kvHeads, headDim, pos+1, e.kvc.maxSeq)
 		timings.Attention += time.Since(tAttn)
 
-		// Wo projection: CPU BLAS (Metal dispatch overhead too high for dim=2560).
+		// Wo projection: Metal fp16.
 		tWo := time.Now()
-		if useFP16 {
-			woSize := dim * qDim
-			tFP16 := time.Now()
-			convertFP16ToF32(e.fp16Scratch[:woSize], e.mw.FP16Layers[li].Wo)
-			timings.FP16Conv += time.Since(tFP16)
-			linearSingle(e.cacheX2, e.fp16Scratch[:woSize], e.cacheAttOut, dim, qDim)
+		if e.metalWo[li] != nil {
+			e.metalWo[li].Exec(e.cacheX2, e.cacheAttOut)
 		} else {
 			linearSingle(e.cacheX2, layer.Wo, e.cacheAttOut, dim, qDim)
 		}
