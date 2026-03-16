@@ -386,9 +386,7 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         // KV caches are in pre-allocated GPU buffers — no copy needed.
 
         NSArray<MPSGraphTensorData*> *inputs = (__bridge NSArray<MPSGraphTensorData*> *)t->cachedInputsArray;
-        NSMutableArray<MPSGraphTensorData*> *resultsArr = (logits != NULL)
-            ? (__bridge NSMutableArray<MPSGraphTensorData*> *)t->cachedResultsArray
-            : nil;
+        NSMutableArray<MPSGraphTensorData*> *resultsArr = (__bridge NSMutableArray<MPSGraphTensorData*> *)t->cachedResultsArray;
 
         NSArray<MPSGraphTensorData *> *results = [executable runWithMTLCommandQueue:queue
                                                                          inputsArray:inputs
