@@ -20,7 +20,9 @@ extern MPSGraphTransformer* mpsGraphTransformerCreate(
     float residualScale
 );
 extern int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *x,
-                                   const float *ropeCosRow, const float *ropeSinRow);
+                                   const float *ropeCosRow, const float *ropeSinRow,
+                                   const float *mask,
+                                   const float **kCachesAll, const float **vCachesAll);
 extern void mpsGraphTransformerDestroy(MPSGraphTransformer *t);
 */
 import "C"
@@ -165,16 +167,37 @@ func NewMPSGraphDecoder(cfg stories.ModelConfig, mw *stories.ModelWeights) (*MPS
 	return d, nil
 }
 
-// Exec runs the compiled graph: x[dim] + ropeCos/Sin[headDim/2] -> logits[vocab].
-func (d *MPSGraphDecoder) Exec(logits, x, ropeCosRow, ropeSinRow []float32) error {
+// Exec runs the compiled graph with KV caches.
+// kCaches/vCaches: per-layer KV cache buffers [kvHeads * maxSeq * headDim].
+// mask: [maxSeq] attention mask (0 valid, -1e9 padding).
+func (d *MPSGraphDecoder) Exec(logits, x, ropeCosRow, ropeSinRow, mask []float32,
+	kCaches, vCaches [][]float32) error {
 	if d == nil || d.handle == nil {
 		return fmt.Errorf("MPSGraph decoder not initialized")
 	}
+	nLayers := len(kCaches)
+	kPtrs := make([]*C.float, nLayers)
+	vPtrs := make([]*C.float, nLayers)
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+	for i := 0; i < nLayers; i++ {
+		pinner.Pin(&kCaches[i][0])
+		pinner.Pin(&vCaches[i][0])
+		kPtrs[i] = (*C.float)(unsafe.Pointer(&kCaches[i][0]))
+		vPtrs[i] = (*C.float)(unsafe.Pointer(&vCaches[i][0]))
+	}
+	pinner.Pin(&kPtrs[0])
+	pinner.Pin(&vPtrs[0])
+	pinner.Pin(&mask[0])
+
 	if C.mpsGraphTransformerExec(d.handle,
 		(*C.float)(unsafe.Pointer(&logits[0])),
 		(*C.float)(unsafe.Pointer(&x[0])),
 		(*C.float)(unsafe.Pointer(&ropeCosRow[0])),
 		(*C.float)(unsafe.Pointer(&ropeSinRow[0])),
+		(*C.float)(unsafe.Pointer(&mask[0])),
+		(**C.float)(unsafe.Pointer(&kPtrs[0])),
+		(**C.float)(unsafe.Pointer(&vPtrs[0])),
 	) != 0 {
 		return fmt.Errorf("MPSGraph execution failed")
 	}

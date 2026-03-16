@@ -2,6 +2,7 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #import <Foundation/Foundation.h>
+#include <math.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -144,8 +145,22 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
 
         // RoPE cos/sin for current position: [1, headDim/2] fp32
         int ropeHalf = headDim / 2;
+        int maxSeq = 256; // fixed max sequence length for KV cache
         MPSGraphTensor *ropeCos = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32 name:@"rope_cos"];
         MPSGraphTensor *ropeSin = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32 name:@"rope_sin"];
+
+        // Attention mask: [1, 1, 1, maxSeq] — 0 for valid positions, -inf for padding
+        MPSGraphTensor *attnMask = [graph placeholderWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32 name:@"attn_mask"];
+
+        // Per-layer KV cache placeholders
+        NSMutableArray<MPSGraphTensor*> *kCaches = [NSMutableArray arrayWithCapacity:nLayers];
+        NSMutableArray<MPSGraphTensor*> *vCaches = [NSMutableArray arrayWithCapacity:nLayers];
+        for (int li = 0; li < nLayers; li++) {
+            NSString *kName = [NSString stringWithFormat:@"k_cache_%d", li];
+            NSString *vName = [NSString stringWithFormat:@"v_cache_%d", li];
+            [kCaches addObject:[graph placeholderWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat32 name:kName]];
+            [vCaches addObject:[graph placeholderWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat32 name:vName]];
+        }
 
         MPSGraphTensor *cur = x;
         MPSGraphTensor *rsConst = [graph constantWithScalar:residualScale dataType:MPSDataTypeFloat32];
@@ -171,12 +186,39 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
             MPSGraphTensor *qRoped = graphRoPE(graph, q, heads, headDim, ropeCos, ropeSin, [lp stringByAppendingString:@"rope_q"]);
             MPSGraphTensor *kRoped = graphRoPE(graph, k, kvHeads, headDim, ropeCos, ropeSin, [lp stringByAppendingString:@"rope_k"]);
 
-            // TODO: KV cache attention. For now, use qRoped as attention output placeholder.
-            // Full attention needs per-layer KV cache inputs which makes the graph much larger.
+            // Reshape Q for attention: [1, heads, 1, headDim]
+            MPSGraphTensor *qAttn = [graph reshapeTensor:qRoped withShape:@[@1, @(heads), @1, @(headDim)] name:[lp stringByAppendingString:@"q_attn"]];
+
+            // KV cache attention
+            // kRoped: [1, kvDim] -> [1, kvHeads, 1, headDim] (current K to be added to cache)
+            // v: [1, kvDim] -> [1, kvHeads, 1, headDim] (current V to be added to cache)
+            // For now, just use the cache directly (caller updates cache externally).
+            int kvRepeat = heads / kvHeads;
+            MPSGraphTensor *kCache = kCaches[li]; // [1, kvHeads, maxSeq, headDim]
+            MPSGraphTensor *vCache = vCaches[li];
+
+            // Tile KV heads to match Q heads for GQA
+            MPSGraphTensor *kTiled = kCache;
+            MPSGraphTensor *vTiled = vCache;
+            if (kvRepeat > 1) {
+                kTiled = [graph tileTensor:kCache withMultiplier:@[@1, @(kvRepeat), @1, @1] name:[lp stringByAppendingString:@"k_tile"]];
+                vTiled = [graph tileTensor:vCache withMultiplier:@[@1, @(kvRepeat), @1, @1] name:[lp stringByAppendingString:@"v_tile"]];
+            }
+
+            // SDPA: softmax(Q @ K^T / sqrt(headDim) + mask) @ V
+            float attnScale = 1.0f / sqrtf((float)headDim);
+            MPSGraphTensor *attnOut4d = [graph scaledDotProductAttentionWithQueryTensor:qAttn
+                                                                             keyTensor:kTiled
+                                                                           valueTensor:vTiled
+                                                                            maskTensor:attnMask
+                                                                                 scale:attnScale
+                                                                                  name:[lp stringByAppendingString:@"sdpa"]];
+            // [1, heads, 1, headDim] -> [1, qDim]
+            MPSGraphTensor *attnFlat = [graph reshapeTensor:attnOut4d withShape:@[@1, @(qDim)] name:[lp stringByAppendingString:@"attn_flat"]];
 
             // Wo projection
             MPSGraphTensor *Wo = constantFP16(graph, woAll[li], dim, qDim, [lp stringByAppendingString:@"Wo"]);
-            MPSGraphTensor *attOut = graphGEMV(graph, qRoped, Wo, [lp stringByAppendingString:@"wo"]);
+            MPSGraphTensor *attOut = graphGEMV(graph, attnFlat, Wo, [lp stringByAppendingString:@"wo"]);
 
             // Residual
             MPSGraphTensor *diff = [graph subtractionWithPrimaryTensor:attOut secondaryTensor:cur name:[lp stringByAppendingString:@"att_diff"]];
@@ -221,11 +263,18 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         // Build feeds dictionary: map placeholder tensors to their shapes+types.
         MPSGraphShapedType *xType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(dim)] dataType:MPSDataTypeFloat32];
         MPSGraphShapedType *ropeType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32];
-        NSDictionary<MPSGraphTensor*, MPSGraphShapedType*> *feeds = @{
-            x: xType,
-            ropeCos: ropeType,
-            ropeSin: ropeType,
-        };
+        MPSGraphShapedType *maskType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32];
+        MPSGraphShapedType *kvType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat32];
+
+        NSMutableDictionary<MPSGraphTensor*, MPSGraphShapedType*> *feeds = [NSMutableDictionary dictionary];
+        feeds[x] = xType;
+        feeds[ropeCos] = ropeType;
+        feeds[ropeSin] = ropeType;
+        feeds[attnMask] = maskType;
+        for (int li = 0; li < nLayers; li++) {
+            feeds[kCaches[li]] = kvType;
+            feeds[vCaches[li]] = kvType;
+        }
 
         NSArray<MPSGraphTensor*> *targets = @[logits];
 
@@ -261,9 +310,13 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
     }
 }
 
-// Execute the compiled graph: input x[dim] + rope cos/sin -> output logits[vocab]
+// Execute the compiled graph with KV caches.
+// kCaches/vCaches: arrays of nLayers pointers to [kvHeads * maxSeq * headDim] float buffers.
+// mask: [maxSeq] float (0 for valid, -1e9 for padding).
 int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *x,
-                            const float *ropeCosRow, const float *ropeSinRow) {
+                            const float *ropeCosRow, const float *ropeSinRow,
+                            const float *mask,
+                            const float **kCachesAll, const float **vCachesAll) {
     if (t == NULL || t->executable == NULL) return -1;
     @autoreleasepool {
         id<MTLDevice> device = (__bridge id<MTLDevice>)t->device;
@@ -271,29 +324,44 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)t->executable;
 
         int ropeHalf = t->headDim / 2;
+        int maxSeq = 256;
         size_t xBytes = (size_t)t->dim * sizeof(float);
         size_t ropeBytes = (size_t)ropeHalf * sizeof(float);
+        size_t maskBytes = (size_t)maxSeq * sizeof(float);
+        size_t kvBytes = (size_t)t->kvHeads * maxSeq * t->headDim * sizeof(float);
 
-        // Create input tensor data
-        MPSGraphTensorData *xTD = [[MPSGraphTensorData alloc] initWithMTLBuffer:
+        // Build input array: x, ropeCos, ropeSin, mask, then per-layer kCache, vCache
+        NSMutableArray<MPSGraphTensorData*> *inputs = [NSMutableArray array];
+
+        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
             [device newBufferWithBytes:x length:xBytes options:MTLResourceStorageModeShared]
-            shape:@[@1, @(t->dim)] dataType:MPSDataTypeFloat32];
-        MPSGraphTensorData *cosTD = [[MPSGraphTensorData alloc] initWithMTLBuffer:
+            shape:@[@1, @(t->dim)] dataType:MPSDataTypeFloat32]];
+        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
             [device newBufferWithBytes:ropeCosRow length:ropeBytes options:MTLResourceStorageModeShared]
-            shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32];
-        MPSGraphTensorData *sinTD = [[MPSGraphTensorData alloc] initWithMTLBuffer:
+            shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32]];
+        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
             [device newBufferWithBytes:ropeSinRow length:ropeBytes options:MTLResourceStorageModeShared]
-            shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32];
+            shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32]];
+        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
+            [device newBufferWithBytes:mask length:maskBytes options:MTLResourceStorageModeShared]
+            shape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32]];
 
-        // Execute — feeds must match the order of placeholders in the graph.
+        for (int li = 0; li < t->nLayers; li++) {
+            [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
+                [device newBufferWithBytes:kCachesAll[li] length:kvBytes options:MTLResourceStorageModeShared]
+                shape:@[@1, @(t->kvHeads), @(maxSeq), @(t->headDim)] dataType:MPSDataTypeFloat32]];
+            [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
+                [device newBufferWithBytes:vCachesAll[li] length:kvBytes options:MTLResourceStorageModeShared]
+                shape:@[@1, @(t->kvHeads), @(maxSeq), @(t->headDim)] dataType:MPSDataTypeFloat32]];
+        }
+
         NSArray<MPSGraphTensorData *> *results = [executable runWithMTLCommandQueue:queue
-                                                                         inputsArray:@[xTD, cosTD, sinTD]
+                                                                         inputsArray:inputs
                                                                         resultsArray:nil
                                                                executionDescriptor:nil];
 
         if (results.count == 0) return -1;
 
-        // Copy output
         MPSGraphTensorData *outTD = results[0];
         MPSNDArray *outArr = outTD.mpsndarray;
         [outArr readBytes:logits strideBytes:nil];

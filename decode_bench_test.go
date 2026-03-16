@@ -72,10 +72,14 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 	b.Logf("MPSGraph compiled in %v", time.Since(start))
 
 	headDim := cfg.HeadDim()
+	kvHeads := cfg.EffectiveKVHeads()
+	nLayers := cfg.NLayers
+	maxSeq := 256
 	x := make([]float32, dim)
 	logits := make([]float32, vocab)
 	ropeCos := make([]float32, headDim/2)
 	ropeSin := make([]float32, headDim/2)
+	mask := make([]float32, maxSeq)
 	// Fill with test data.
 	for i := range x {
 		x[i] = 0.01
@@ -83,17 +87,28 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 	for i := range ropeCos {
 		ropeCos[i] = 1.0
 	}
+	// Mask: first 10 positions valid, rest masked
+	for i := 10; i < maxSeq; i++ {
+		mask[i] = -1e9
+	}
+	// Dummy KV caches
+	kCaches := make([][]float32, nLayers)
+	vCaches := make([][]float32, nLayers)
+	for i := 0; i < nLayers; i++ {
+		kCaches[i] = make([]float32, kvHeads*maxSeq*headDim)
+		vCaches[i] = make([]float32, kvHeads*maxSeq*headDim)
+	}
 
 	// Warmup
 	for range 3 {
-		if err := decoder.Exec(logits, x, ropeCos, ropeSin); err != nil {
+		if err := decoder.Exec(logits, x, ropeCos, ropeSin, mask, kCaches, vCaches); err != nil {
 			b.Fatalf("warmup: %v", err)
 		}
 	}
 
 	b.ResetTimer()
 	for b.Loop() {
-		if err := decoder.Exec(logits, x, ropeCos, ropeSin); err != nil {
+		if err := decoder.Exec(logits, x, ropeCos, ropeSin, mask, kCaches, vCaches); err != nil {
 			b.Fatal(err)
 		}
 	}
