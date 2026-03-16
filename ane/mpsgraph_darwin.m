@@ -17,6 +17,13 @@ typedef struct {
     void *inputTensor; // MPSGraphTensor* placeholder for x
     void *ropeCosTensor; // MPSGraphTensor* placeholder for rope_cos
     void *ropeSinTensor; // MPSGraphTensor* placeholder for rope_sin
+    // Pre-allocated Metal buffers for exec inputs.
+    void *xBuf;        // id<MTLBuffer>
+    void *cosBuf;      // id<MTLBuffer>
+    void *sinBuf;      // id<MTLBuffer>
+    void *maskBuf;     // id<MTLBuffer>
+    void **kBufs;      // id<MTLBuffer>[] per-layer
+    void **vBufs;      // id<MTLBuffer>[] per-layer
     // Weight tensors (persistent on GPU in fp16)
     void **wq;         // per-layer Wq [dim, qDim] fp16
     void **wk;         // per-layer Wk [dim, kvDim] fp16
@@ -297,6 +304,18 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         t->inputTensor = (__bridge_retained void *)x;
         t->ropeCosTensor = (__bridge_retained void *)ropeCos;
         t->ropeSinTensor = (__bridge_retained void *)ropeSin;
+        // Pre-allocate reusable exec buffers.
+        t->xBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)dim * sizeof(float) options:MTLResourceStorageModeShared];
+        t->cosBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(float) options:MTLResourceStorageModeShared];
+        t->sinBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(float) options:MTLResourceStorageModeShared];
+        t->maskBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)maxSeq * sizeof(float) options:MTLResourceStorageModeShared];
+        size_t kvBufSize = (size_t)kvHeads * maxSeq * headDim * sizeof(float);
+        t->kBufs = (void **)calloc(nLayers, sizeof(void *));
+        t->vBufs = (void **)calloc(nLayers, sizeof(void *));
+        for (int i = 0; i < nLayers; i++) {
+            t->kBufs[i] = (__bridge_retained void *)[device newBufferWithLength:kvBufSize options:MTLResourceStorageModeShared];
+            t->vBufs[i] = (__bridge_retained void *)[device newBufferWithLength:kvBufSize options:MTLResourceStorageModeShared];
+        }
         t->nLayers = nLayers;
         t->dim = dim;
         t->qDim = qDim;
@@ -330,28 +349,35 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         size_t maskBytes = (size_t)maxSeq * sizeof(float);
         size_t kvBytes = (size_t)t->kvHeads * maxSeq * t->headDim * sizeof(float);
 
-        // Build input array: x, ropeCos, ropeSin, mask, then per-layer kCache, vCache
-        NSMutableArray<MPSGraphTensorData*> *inputs = [NSMutableArray array];
-
-        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
-            [device newBufferWithBytes:x length:xBytes options:MTLResourceStorageModeShared]
-            shape:@[@1, @(t->dim)] dataType:MPSDataTypeFloat32]];
-        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
-            [device newBufferWithBytes:ropeCosRow length:ropeBytes options:MTLResourceStorageModeShared]
-            shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32]];
-        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
-            [device newBufferWithBytes:ropeSinRow length:ropeBytes options:MTLResourceStorageModeShared]
-            shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32]];
-        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
-            [device newBufferWithBytes:mask length:maskBytes options:MTLResourceStorageModeShared]
-            shape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32]];
+        // Copy data into pre-allocated buffers.
+        id<MTLBuffer> xBuf = (__bridge id<MTLBuffer>)t->xBuf;
+        id<MTLBuffer> cosBuf = (__bridge id<MTLBuffer>)t->cosBuf;
+        id<MTLBuffer> sinBuf = (__bridge id<MTLBuffer>)t->sinBuf;
+        id<MTLBuffer> maskBuf = (__bridge id<MTLBuffer>)t->maskBuf;
+        memcpy(xBuf.contents, x, xBytes);
+        memcpy(cosBuf.contents, ropeCosRow, ropeBytes);
+        memcpy(sinBuf.contents, ropeSinRow, ropeBytes);
+        memcpy(maskBuf.contents, mask, maskBytes);
 
         for (int li = 0; li < t->nLayers; li++) {
-            [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
-                [device newBufferWithBytes:kCachesAll[li] length:kvBytes options:MTLResourceStorageModeShared]
+            id<MTLBuffer> kb = (__bridge id<MTLBuffer>)t->kBufs[li];
+            id<MTLBuffer> vb = (__bridge id<MTLBuffer>)t->vBufs[li];
+            memcpy(kb.contents, kCachesAll[li], kvBytes);
+            memcpy(vb.contents, vCachesAll[li], kvBytes);
+        }
+
+        // Build input array using pre-allocated buffers.
+        NSMutableArray<MPSGraphTensorData*> *inputs = [NSMutableArray arrayWithCapacity:4 + 2 * t->nLayers];
+
+        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:xBuf shape:@[@1, @(t->dim)] dataType:MPSDataTypeFloat32]];
+        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:cosBuf shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32]];
+        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:sinBuf shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32]];
+        [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:maskBuf shape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32]];
+
+        for (int li = 0; li < t->nLayers; li++) {
+            [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->kBufs[li]
                 shape:@[@1, @(t->kvHeads), @(maxSeq), @(t->headDim)] dataType:MPSDataTypeFloat32]];
-            [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:
-                [device newBufferWithBytes:vCachesAll[li] length:kvBytes options:MTLResourceStorageModeShared]
+            [inputs addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->vBufs[li]
                 shape:@[@1, @(t->kvHeads), @(maxSeq), @(t->headDim)] dataType:MPSDataTypeFloat32]];
         }
 
