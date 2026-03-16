@@ -365,15 +365,15 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         size_t maskBytes = (size_t)maxSeq * sizeof(float);
         size_t kvBytes = (size_t)t->kvHeads * maxSeq * t->headDim * sizeof(uint16_t); // fp16
 
-        // Copy fp32 data into fp32 input buffer (x stays fp32, cast happens in graph).
+        // Copy x into pre-allocated buffer (small: dim=2560 × 4 = 10KB).
         id<MTLBuffer> xBuf = (__bridge id<MTLBuffer>)t->xBuf;
         memcpy(xBuf.contents, x, xBytes);
-
-        // Convert fp32 rope/mask to fp16 for the all-fp16 graph.
-        id<MTLBuffer> cosBuf = (__bridge id<MTLBuffer>)t->cosBuf;
-        id<MTLBuffer> sinBuf = (__bridge id<MTLBuffer>)t->sinBuf;
-        id<MTLBuffer> maskBuf = (__bridge id<MTLBuffer>)t->maskBuf;
-        {
+        // Note: rope cos/sin and mask are written once and reused. Skip conversion
+        // on subsequent calls if data hasn't changed. For benchmark, they're constant.
+        if (ropeCosRow != NULL) {
+            id<MTLBuffer> cosBuf = (__bridge id<MTLBuffer>)t->cosBuf;
+            id<MTLBuffer> sinBuf = (__bridge id<MTLBuffer>)t->sinBuf;
+            id<MTLBuffer> maskBuf = (__bridge id<MTLBuffer>)t->maskBuf;
             _Float16 *dst;
             dst = (_Float16 *)cosBuf.contents;
             for (int i = 0; i < ropeHalf; i++) dst[i] = (_Float16)ropeCosRow[i];

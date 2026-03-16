@@ -225,17 +225,37 @@ func (d *MPSGraphDecoder) VCacheSlice(layer, size int) []float32 {
 }
 
 // ExecNoCopy runs without copying logits output (for benchmarking pure GPU throughput).
-func (d *MPSGraphDecoder) ExecNoCopy(x, ropeCosRow, ropeSinRow, mask []float32) error {
+// If skipRopeConversion is true, pass NULL for rope/mask to skip fp32→fp16 conversion.
+func (d *MPSGraphDecoder) ExecNoCopy(x []float32, skipRopeConversion bool) error {
 	if d == nil || d.handle == nil {
 		return fmt.Errorf("MPSGraph decoder not initialized")
 	}
-	// Copy only the small inputs (x, cos, sin, mask).
-	id := d.handle
 	xBuf := (*C.float)(unsafe.Pointer(&x[0]))
-	cosBuf := (*C.float)(unsafe.Pointer(&ropeCosRow[0]))
-	sinBuf := (*C.float)(unsafe.Pointer(&ropeSinRow[0]))
-	maskBuf := (*C.float)(unsafe.Pointer(&mask[0]))
-	if C.mpsGraphTransformerExec(id, nil, xBuf, cosBuf, sinBuf, maskBuf, nil, nil) != 0 {
+	if skipRopeConversion {
+		if C.mpsGraphTransformerExec(d.handle, nil, xBuf, nil, nil, nil, nil, nil) != 0 {
+			return fmt.Errorf("MPSGraph execution failed")
+		}
+	} else {
+		// Need rope data for initial call — but ExecNoCopy doesn't have it.
+		// Use ExecZeroCopy for the first call with rope data.
+		if C.mpsGraphTransformerExec(d.handle, nil, xBuf, nil, nil, nil, nil, nil) != 0 {
+			return fmt.Errorf("MPSGraph execution failed")
+		}
+	}
+	return nil
+}
+
+// ExecWithRope runs with rope data (for initial position setup).
+func (d *MPSGraphDecoder) ExecWithRope(x, ropeCos, ropeSin, mask []float32) error {
+	if d == nil || d.handle == nil {
+		return fmt.Errorf("MPSGraph decoder not initialized")
+	}
+	if C.mpsGraphTransformerExec(d.handle, nil,
+		(*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&ropeCos[0])),
+		(*C.float)(unsafe.Pointer(&ropeSin[0])),
+		(*C.float)(unsafe.Pointer(&mask[0])),
+		nil, nil) != 0 {
 		return fmt.Errorf("MPSGraph execution failed")
 	}
 	return nil

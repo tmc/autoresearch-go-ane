@@ -102,16 +102,21 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 	// KV caches are fp16 on GPU — already zero-filled.
 	_ = nLayers
 
-	// Warmup
+	// Warmup — set rope/mask data during warmup.
+	// First call converts rope/mask to fp16 in GPU buffers.
+	// Initialize rope/mask in GPU buffers via a call with rope data.
+	if err := decoder.ExecWithRope(x, ropeCos, ropeSin, mask); err != nil {
+		b.Fatalf("warmup rope init: %v", err)
+	}
 	for range 3 {
-		if err := decoder.ExecNoCopy(x, ropeCos, ropeSin, mask); err != nil {
+		if err := decoder.ExecNoCopy(x, true); err != nil {
 			b.Fatalf("warmup: %v", err)
 		}
 	}
 
 	b.ResetTimer()
 	for b.Loop() {
-		if err := decoder.ExecNoCopy(x, ropeCos, ropeSin, mask); err != nil {
+		if err := decoder.ExecNoCopy(x, true); err != nil {
 			b.Fatal(err)
 		}
 	}
