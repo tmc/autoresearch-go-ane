@@ -180,22 +180,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		}
 		timings.RMSNorm += time.Since(tRMS)
 
-		// Unfused QKV: run concurrently. Use Metal fp16 when available.
+		// Unfused QKV: CPU BLAS (Metal dispatch overhead too high for small Wk/Wv).
 		tQKV := time.Now()
-		if useFP16 && e.metalWq[li] != nil {
-			var qkvWG sync.WaitGroup
-			qkvWG.Add(2)
-			go func() {
-				e.metalWk[li].Exec(e.cacheQKV[qDim:qDim+kvDim], e.cacheXNorm)
-				qkvWG.Done()
-			}()
-			go func() {
-				e.metalWv[li].Exec(e.cacheQKV[qDim+kvDim:], e.cacheXNorm)
-				qkvWG.Done()
-			}()
-			e.metalWq[li].Exec(e.cacheQKV[:qDim], e.cacheXNorm)
-			qkvWG.Wait()
-		} else {
+		{
 			var qkvWG sync.WaitGroup
 			qkvWG.Add(2)
 			go func() {
@@ -231,11 +218,9 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 			heads, kvHeads, headDim, pos+1, e.kvc.maxSeq)
 		timings.Attention += time.Since(tAttn)
 
-		// Wo projection: [dim, qDim] @ attOut[qDim] → x2[dim]
+		// Wo projection: CPU BLAS (Metal dispatch overhead too high for dim=2560).
 		tWo := time.Now()
-		if useFP16 && e.metalWo[li] != nil {
-			e.metalWo[li].Exec(e.cacheX2, e.cacheAttOut)
-		} else if useFP16 {
+		if useFP16 {
 			woSize := dim * qDim
 			tFP16 := time.Now()
 			convertFP16ToF32(e.fp16Scratch[:woSize], e.mw.FP16Layers[li].Wo)
