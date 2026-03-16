@@ -13,6 +13,9 @@ typedef struct {
     void *executable;  // MPSGraphExecutable* (compiled)
     void *device;      // id<MTLDevice>
     void *cmdQueue;    // id<MTLCommandQueue>
+    void *inputTensor; // MPSGraphTensor* placeholder for x
+    void *ropeCosTensor; // MPSGraphTensor* placeholder for rope_cos
+    void *ropeSinTensor; // MPSGraphTensor* placeholder for rope_sin
     // Weight tensors (persistent on GPU in fp16)
     void **wq;         // per-layer Wq [dim, qDim] fp16
     void **wk;         // per-layer Wk [dim, kvDim] fp16
@@ -79,6 +82,42 @@ static MPSGraphTensor* graphSiLU(MPSGraph *graph, MPSGraphTensor *x, NSString *n
     return [graph multiplicationWithPrimaryTensor:x secondaryTensor:sig name:name];
 }
 
+// RoPE: apply rotary embeddings to q or k [1, nHeads*headDim] at a given position.
+// ropeCosBuf/ropeCosBuf are [maxSeq, headDim/2] tables.
+// For single-token decode, we index row `pos` from the table.
+static MPSGraphTensor* graphRoPE(MPSGraph *graph, MPSGraphTensor *x, int nHeads, int headDim,
+                                  MPSGraphTensor *cosRow, MPSGraphTensor *sinRow, NSString *prefix) {
+    int totalDim = nHeads * headDim;
+    int half = headDim / 2;
+
+    // Reshape x to [1, nHeads, headDim] then split even/odd pairs
+    MPSGraphTensor *xr = [graph reshapeTensor:x withShape:@[@1, @(nHeads), @(headDim)] name:[prefix stringByAppendingString:@"_reshape"]];
+    // Split into pairs: [1, nHeads, half, 2]
+    MPSGraphTensor *xp = [graph reshapeTensor:xr withShape:@[@1, @(nHeads), @(half), @2] name:[prefix stringByAppendingString:@"_pairs"]];
+
+    // Slice even and odd
+    MPSGraphTensor *xe = [graph sliceTensor:xp dimension:3 start:0 length:1 name:[prefix stringByAppendingString:@"_even"]];
+    MPSGraphTensor *xo = [graph sliceTensor:xp dimension:3 start:1 length:1 name:[prefix stringByAppendingString:@"_odd"]];
+
+    // cosRow: [1, half] -> broadcast to [1, nHeads, half, 1]
+    MPSGraphTensor *cosR = [graph reshapeTensor:cosRow withShape:@[@1, @1, @(half), @1] name:[prefix stringByAppendingString:@"_cos_r"]];
+    MPSGraphTensor *sinR = [graph reshapeTensor:sinRow withShape:@[@1, @1, @(half), @1] name:[prefix stringByAppendingString:@"_sin_r"]];
+
+    // Apply rotation: new_even = even*cos - odd*sin, new_odd = odd*cos + even*sin
+    MPSGraphTensor *ec = [graph multiplicationWithPrimaryTensor:xe secondaryTensor:cosR name:[prefix stringByAppendingString:@"_ec"]];
+    MPSGraphTensor *os = [graph multiplicationWithPrimaryTensor:xo secondaryTensor:sinR name:[prefix stringByAppendingString:@"_os"]];
+    MPSGraphTensor *newE = [graph subtractionWithPrimaryTensor:ec secondaryTensor:os name:[prefix stringByAppendingString:@"_ne"]];
+
+    MPSGraphTensor *oc = [graph multiplicationWithPrimaryTensor:xo secondaryTensor:cosR name:[prefix stringByAppendingString:@"_oc"]];
+    MPSGraphTensor *es = [graph multiplicationWithPrimaryTensor:xe secondaryTensor:sinR name:[prefix stringByAppendingString:@"_es"]];
+    MPSGraphTensor *newO = [graph additionWithPrimaryTensor:oc secondaryTensor:es name:[prefix stringByAppendingString:@"_no"]];
+
+    // Interleave back: [1, nHeads, half, 2]
+    MPSGraphTensor *pairs = [graph concatTensors:@[newE, newO] dimension:3 name:[prefix stringByAppendingString:@"_concat"]];
+    // Reshape back to [1, totalDim]
+    return [graph reshapeTensor:pairs withShape:@[@1, @(totalDim)] name:[prefix stringByAppendingString:@"_out"]];
+}
+
 // Build and compile the full transformer decode graph.
 // Returns NULL on failure.
 MPSGraphTransformer* mpsGraphTransformerCreate(
@@ -103,6 +142,11 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         // Input: x [1, dim] fp32
         MPSGraphTensor *x = [graph placeholderWithShape:@[@1, @(dim)] dataType:MPSDataTypeFloat32 name:@"input"];
 
+        // RoPE cos/sin for current position: [1, headDim/2] fp32
+        int ropeHalf = headDim / 2;
+        MPSGraphTensor *ropeCos = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32 name:@"rope_cos"];
+        MPSGraphTensor *ropeSin = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32 name:@"rope_sin"];
+
         MPSGraphTensor *cur = x;
         MPSGraphTensor *rsConst = [graph constantWithScalar:residualScale dataType:MPSDataTypeFloat32];
 
@@ -123,18 +167,16 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
             MPSGraphTensor *k = graphGEMV(graph, xn, Wk, [lp stringByAppendingString:@"k"]);
             MPSGraphTensor *v = graphGEMV(graph, xn, Wv, [lp stringByAppendingString:@"v"]);
 
-            // NOTE: RoPE and attention against KV cache are done on CPU.
-            // This graph only handles the matmul portions.
-            // For now, output Q, K, V for CPU processing.
-            // TODO: Add RoPE and attention to graph for full GPU decode.
+            // Apply RoPE to Q and K
+            MPSGraphTensor *qRoped = graphRoPE(graph, q, heads, headDim, ropeCos, ropeSin, [lp stringByAppendingString:@"rope_q"]);
+            MPSGraphTensor *kRoped = graphRoPE(graph, k, kvHeads, headDim, ropeCos, ropeSin, [lp stringByAppendingString:@"rope_k"]);
 
-            // For the initial version, we'll just do the matmul graph to
-            // measure the overhead elimination. The full graph needs
-            // RoPE + KV cache attention which requires more work.
+            // TODO: KV cache attention. For now, use qRoped as attention output placeholder.
+            // Full attention needs per-layer KV cache inputs which makes the graph much larger.
 
-            // Wo projection (using Q as placeholder for attention output)
+            // Wo projection
             MPSGraphTensor *Wo = constantFP16(graph, woAll[li], dim, qDim, [lp stringByAppendingString:@"Wo"]);
-            MPSGraphTensor *attOut = graphGEMV(graph, q, Wo, [lp stringByAppendingString:@"wo"]); // placeholder
+            MPSGraphTensor *attOut = graphGEMV(graph, qRoped, Wo, [lp stringByAppendingString:@"wo"]);
 
             // Residual
             MPSGraphTensor *diff = [graph subtractionWithPrimaryTensor:attOut secondaryTensor:cur name:[lp stringByAppendingString:@"att_diff"]];
@@ -176,9 +218,14 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         // Compile the graph
         MPSGraphCompilationDescriptor *compDesc = [[MPSGraphCompilationDescriptor alloc] init];
 
-        // Build feeds dictionary: map placeholder tensor to its shape+type.
+        // Build feeds dictionary: map placeholder tensors to their shapes+types.
         MPSGraphShapedType *xType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(dim)] dataType:MPSDataTypeFloat32];
-        NSDictionary<MPSGraphTensor*, MPSGraphShapedType*> *feeds = @{x: xType};
+        MPSGraphShapedType *ropeType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32];
+        NSDictionary<MPSGraphTensor*, MPSGraphShapedType*> *feeds = @{
+            x: xType,
+            ropeCos: ropeType,
+            ropeSin: ropeType,
+        };
 
         NSArray<MPSGraphTensor*> *targets = @[logits];
 
@@ -198,6 +245,9 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         t->executable = (__bridge_retained void *)executable;
         t->device = (__bridge_retained void *)device;
         t->cmdQueue = (__bridge_retained void *)queue;
+        t->inputTensor = (__bridge_retained void *)x;
+        t->ropeCosTensor = (__bridge_retained void *)ropeCos;
+        t->ropeSinTensor = (__bridge_retained void *)ropeSin;
         t->nLayers = nLayers;
         t->dim = dim;
         t->qDim = qDim;
@@ -211,23 +261,33 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
     }
 }
 
-// Execute the compiled graph: input x[dim] -> output logits[vocab]
-int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *x) {
+// Execute the compiled graph: input x[dim] + rope cos/sin -> output logits[vocab]
+int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *x,
+                            const float *ropeCosRow, const float *ropeSinRow) {
     if (t == NULL || t->executable == NULL) return -1;
     @autoreleasepool {
         id<MTLDevice> device = (__bridge id<MTLDevice>)t->device;
         id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)t->cmdQueue;
         MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)t->executable;
 
-        // Create input tensor data
-        NSData *xData = [NSData dataWithBytes:x length:(NSUInteger)t->dim * sizeof(float)];
-        MPSGraphTensorData *xTD = [[MPSGraphTensorData alloc] initWithMTLBuffer:
-            [device newBufferWithBytes:x length:(NSUInteger)t->dim * sizeof(float) options:MTLResourceStorageModeShared]
-            shape:@[@1, @(t->dim)] dataType:MPSDataTypeFloat32];
+        int ropeHalf = t->headDim / 2;
+        size_t xBytes = (size_t)t->dim * sizeof(float);
+        size_t ropeBytes = (size_t)ropeHalf * sizeof(float);
 
-        // Execute
+        // Create input tensor data
+        MPSGraphTensorData *xTD = [[MPSGraphTensorData alloc] initWithMTLBuffer:
+            [device newBufferWithBytes:x length:xBytes options:MTLResourceStorageModeShared]
+            shape:@[@1, @(t->dim)] dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *cosTD = [[MPSGraphTensorData alloc] initWithMTLBuffer:
+            [device newBufferWithBytes:ropeCosRow length:ropeBytes options:MTLResourceStorageModeShared]
+            shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *sinTD = [[MPSGraphTensorData alloc] initWithMTLBuffer:
+            [device newBufferWithBytes:ropeSinRow length:ropeBytes options:MTLResourceStorageModeShared]
+            shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32];
+
+        // Execute — feeds must match the order of placeholders in the graph.
         NSArray<MPSGraphTensorData *> *results = [executable runWithMTLCommandQueue:queue
-                                                                         inputsArray:@[xTD]
+                                                                         inputsArray:@[xTD, cosTD, sinTD]
                                                                         resultsArray:nil
                                                                executionDescriptor:nil];
 

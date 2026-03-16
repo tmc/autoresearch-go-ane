@@ -71,23 +71,29 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 	defer decoder.Close()
 	b.Logf("MPSGraph compiled in %v", time.Since(start))
 
+	headDim := cfg.HeadDim()
 	x := make([]float32, dim)
 	logits := make([]float32, vocab)
-	// Fill x with test data.
+	ropeCos := make([]float32, headDim/2)
+	ropeSin := make([]float32, headDim/2)
+	// Fill with test data.
 	for i := range x {
 		x[i] = 0.01
+	}
+	for i := range ropeCos {
+		ropeCos[i] = 1.0
 	}
 
 	// Warmup
 	for range 3 {
-		if err := decoder.Exec(logits, x); err != nil {
+		if err := decoder.Exec(logits, x, ropeCos, ropeSin); err != nil {
 			b.Fatalf("warmup: %v", err)
 		}
 	}
 
 	b.ResetTimer()
 	for b.Loop() {
-		if err := decoder.Exec(logits, x); err != nil {
+		if err := decoder.Exec(logits, x, ropeCos, ropeSin); err != nil {
 			b.Fatal(err)
 		}
 	}

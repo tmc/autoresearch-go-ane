@@ -19,7 +19,8 @@ extern MPSGraphTransformer* mpsGraphTransformerCreate(
     const uint16_t *embedWeights,
     float residualScale
 );
-extern int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *x);
+extern int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *x,
+                                   const float *ropeCosRow, const float *ropeSinRow);
 extern void mpsGraphTransformerDestroy(MPSGraphTransformer *t);
 */
 import "C"
@@ -164,12 +165,17 @@ func NewMPSGraphDecoder(cfg stories.ModelConfig, mw *stories.ModelWeights) (*MPS
 	return d, nil
 }
 
-// Exec runs the compiled graph: x[dim] -> logits[vocab].
-func (d *MPSGraphDecoder) Exec(logits, x []float32) error {
+// Exec runs the compiled graph: x[dim] + ropeCos/Sin[headDim/2] -> logits[vocab].
+func (d *MPSGraphDecoder) Exec(logits, x, ropeCosRow, ropeSinRow []float32) error {
 	if d == nil || d.handle == nil {
 		return fmt.Errorf("MPSGraph decoder not initialized")
 	}
-	if C.mpsGraphTransformerExec(d.handle, (*C.float)(unsafe.Pointer(&logits[0])), (*C.float)(unsafe.Pointer(&x[0]))) != 0 {
+	if C.mpsGraphTransformerExec(d.handle,
+		(*C.float)(unsafe.Pointer(&logits[0])),
+		(*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&ropeCosRow[0])),
+		(*C.float)(unsafe.Pointer(&ropeSinRow[0])),
+	) != 0 {
 		return fmt.Errorf("MPSGraph execution failed")
 	}
 	return nil
