@@ -158,15 +158,10 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         // Attention mask: [1, 1, 1, maxSeq] — 0 for valid positions, -inf for padding (fp16)
         MPSGraphTensor *attnMask = [graph placeholderWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat16 name:@"attn_mask"];
 
-        // Per-layer KV cache placeholders (fp16 to halve SDPA bandwidth).
-        NSMutableArray<MPSGraphTensor*> *kCaches = [NSMutableArray arrayWithCapacity:nLayers];
-        NSMutableArray<MPSGraphTensor*> *vCaches = [NSMutableArray arrayWithCapacity:nLayers];
-        for (int li = 0; li < nLayers; li++) {
-            NSString *kName = [NSString stringWithFormat:@"k_cache_%d", li];
-            NSString *vName = [NSString stringWithFormat:@"v_cache_%d", li];
-            [kCaches addObject:[graph placeholderWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16 name:kName]];
-            [vCaches addObject:[graph placeholderWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16 name:vName]];
-        }
+        // All-layer KV cache as TWO big tensors [nLayers, kvHeads, maxSeq, headDim].
+        // Reduces placeholder count from 72 to 2.
+        MPSGraphTensor *allKCache = [graph placeholderWithShape:@[@(nLayers), @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16 name:@"all_k_cache"];
+        MPSGraphTensor *allVCache = [graph placeholderWithShape:@[@(nLayers), @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16 name:@"all_v_cache"];
 
         // Cast input to fp16 — run entire graph in fp16 like MLX.
         MPSGraphTensor *cur = [graph castTensor:x toType:MPSDataTypeFloat16 name:@"x_f16"];
@@ -200,9 +195,10 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
             // kRoped: [1, kvDim] -> [1, kvHeads, 1, headDim] (current K to be added to cache)
             // v: [1, kvDim] -> [1, kvHeads, 1, headDim] (current V to be added to cache)
             // For now, just use the cache directly (caller updates cache externally).
+            // Slice this layer's KV cache from the big tensor.
             int kvRepeat = heads / kvHeads;
-            MPSGraphTensor *kCache = kCaches[li]; // [1, kvHeads, maxSeq, headDim]
-            MPSGraphTensor *vCache = vCaches[li];
+            MPSGraphTensor *kCache = [graph sliceTensor:allKCache dimension:0 start:li length:1 name:[lp stringByAppendingString:@"k_slice"]];
+            MPSGraphTensor *vCache = [graph sliceTensor:allVCache dimension:0 start:li length:1 name:[lp stringByAppendingString:@"v_slice"]];
 
             // Tile KV heads to match Q heads for GQA
             MPSGraphTensor *kTiled = kCache;
@@ -276,15 +272,14 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         MPSGraphShapedType *maskType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat16];
         MPSGraphShapedType *kvType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16];
 
+        MPSGraphShapedType *allKVType = [[MPSGraphShapedType alloc] initWithShape:@[@(nLayers), @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16];
         NSMutableDictionary<MPSGraphTensor*, MPSGraphShapedType*> *feeds = [NSMutableDictionary dictionary];
         feeds[x] = xType;
         feeds[ropeCos] = ropeType;
         feeds[ropeSin] = ropeType;
         feeds[attnMask] = maskType;
-        for (int li = 0; li < nLayers; li++) {
-            feeds[kCaches[li]] = kvType;
-            feeds[vCaches[li]] = kvType;
-        }
+        feeds[allKCache] = allKVType;
+        feeds[allVCache] = allKVType;
 
         NSArray<MPSGraphTensor*> *targets = @[logits];
 
@@ -312,24 +307,21 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         t->cosBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(uint16_t) options:MTLResourceStorageModeShared]; // fp16
         t->sinBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(uint16_t) options:MTLResourceStorageModeShared]; // fp16
         t->maskBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)maxSeq * sizeof(uint16_t) options:MTLResourceStorageModeShared]; // fp16
-        size_t kvBufSize = (size_t)kvHeads * maxSeq * headDim * sizeof(uint16_t); // fp16
-        t->kBufs = (void **)calloc(nLayers, sizeof(void *));
-        t->vBufs = (void **)calloc(nLayers, sizeof(void *));
-        for (int i = 0; i < nLayers; i++) {
-            t->kBufs[i] = (__bridge_retained void *)[device newBufferWithLength:kvBufSize options:MTLResourceStorageModeShared];
-            t->vBufs[i] = (__bridge_retained void *)[device newBufferWithLength:kvBufSize options:MTLResourceStorageModeShared];
-        }
-        // Build cached inputs array (retained with CFRetain to survive @autoreleasepool).
+        // Two big KV cache buffers instead of 72 small ones.
+        size_t allKVBufSize = (size_t)nLayers * kvHeads * maxSeq * headDim * sizeof(uint16_t);
+        t->kBufs = (void **)calloc(1, sizeof(void *));
+        t->vBufs = (void **)calloc(1, sizeof(void *));
+        t->kBufs[0] = (__bridge_retained void *)[device newBufferWithLength:allKVBufSize options:MTLResourceStorageModeShared];
+        t->vBufs[0] = (__bridge_retained void *)[device newBufferWithLength:allKVBufSize options:MTLResourceStorageModeShared];
+        // Build cached inputs array: x, cos, sin, mask, allK, allV = 6 entries.
         {
-            NSMutableArray<MPSGraphTensorData*> *arr = [NSMutableArray arrayWithCapacity:4 + 2 * nLayers];
+            NSMutableArray<MPSGraphTensorData*> *arr = [NSMutableArray arrayWithCapacity:6];
             [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->xBuf shape:@[@1, @(dim)] dataType:MPSDataTypeFloat32]];
             [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->cosBuf shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat16]];
             [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->sinBuf shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat16]];
             [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->maskBuf shape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat16]];
-            for (int i = 0; i < nLayers; i++) {
-                [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->kBufs[i] shape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16]];
-                [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->vBufs[i] shape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16]];
-            }
+            [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->kBufs[0] shape:@[@(nLayers), @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16]];
+            [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->vBufs[0] shape:@[@(nLayers), @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16]];
             t->cachedInputsArray = (void *)CFRetain((__bridge CFTypeRef)arr);
         }
         // Pre-allocate output buffer and cached results array.
@@ -391,16 +383,7 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
             for (int i = 0; i < maxSeq; i++) dst[i] = (_Float16)mask[i];
         }
 
-        // Only copy KV caches if external pointers differ from pre-allocated buffers.
-        // In a real decode loop, the KV caches would be updated in-place on the GPU.
-        if (kCachesAll != NULL && vCachesAll != NULL) {
-            for (int li = 0; li < t->nLayers; li++) {
-                id<MTLBuffer> kb = (__bridge id<MTLBuffer>)t->kBufs[li];
-                id<MTLBuffer> vb = (__bridge id<MTLBuffer>)t->vBufs[li];
-                if (kCachesAll[li] != kb.contents) memcpy(kb.contents, kCachesAll[li], kvBytes);
-                if (vCachesAll[li] != vb.contents) memcpy(vb.contents, vCachesAll[li], kvBytes);
-            }
-        }
+        // KV caches are in pre-allocated GPU buffers — no copy needed.
 
         // Use cached MPSGraphTensorData array (pre-built at init, CFRetained).
         // The underlying Metal buffers are the same pre-allocated ones we memcpy'd into above.
