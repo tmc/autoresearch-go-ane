@@ -5,6 +5,7 @@ package ane
 import (
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	xane "github.com/tmc/apple/x/ane"
@@ -157,39 +158,22 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		}
 		timings.RMSNorm += time.Since(tRMS)
 
-		// Fused QKV: one BLAS call instead of 3.
+		// Unfused QKV: run 3 smaller GEMVs concurrently for better core utilization.
 		tQKV := time.Now()
-		qkvSize := (qDim + 2*kvDim) * dim
-		if useFP16 {
-			if e.fusedQKVFP16[li] == nil {
-				fp16L := e.mw.FP16Layers[li]
-				fused := make([]uint16, qkvSize)
-				copy(fused[0:], fp16L.Wq)
-				copy(fused[qDim*dim:], fp16L.Wk)
-				copy(fused[(qDim+kvDim)*dim:], fp16L.Wv)
-				e.fusedQKVFP16[li] = fused
-			}
-			tFP16 := time.Now()
-			convertFP16ToF32(e.fp16Scratch[:qkvSize], e.fusedQKVFP16[li])
-			timings.FP16Conv += time.Since(tFP16)
-			linearSingle(e.cacheQKV, e.fp16Scratch[:qkvSize], e.cacheXNorm, qDim+2*kvDim, dim)
-		} else {
-			if e.fusedQKVW == nil {
-				e.fusedQKVW = make([][]float32, cfg.NLayers)
-				e.fusedW1W3 = make([][]float32, cfg.NLayers)
-			}
-			if e.fusedQKVW[li] == nil {
-				fused := make([]float32, qkvSize)
-				copy(fused[0:], layer.Wq)
-				copy(fused[qDim*dim:], layer.Wk)
-				copy(fused[(qDim+kvDim)*dim:], layer.Wv)
-				e.fusedQKVW[li] = fused
-			}
-			linearSingle(e.cacheQKV, e.fusedQKVW[li], e.cacheXNorm, qDim+2*kvDim, dim)
-		}
+		var qkvWG sync.WaitGroup
+		qkvWG.Add(2)
+		go func() {
+			linearSingle(e.cacheQKV[qDim:qDim+kvDim], layer.Wk, e.cacheXNorm, kvDim, dim)
+			qkvWG.Done()
+		}()
+		go func() {
+			linearSingle(e.cacheQKV[qDim+kvDim:], layer.Wv, e.cacheXNorm, kvDim, dim)
+			qkvWG.Done()
+		}()
+		linearSingle(e.cacheQKV[:qDim], layer.Wq, e.cacheXNorm, qDim, dim)
+		qkvWG.Wait()
 		timings.QKV += time.Since(tQKV)
 
-		// Use slices directly from fused output to avoid copies.
 		fusedQ := e.cacheQKV[:qDim]
 		fusedK := e.cacheQKV[qDim : qDim+kvDim]
 		fusedV := e.cacheQKV[qDim+kvDim:]
@@ -237,32 +221,16 @@ func (e *Engine) EvalNextToken(token int32) ([]float32, error) {
 		}
 		timings.RMSNorm += time.Since(tRMS)
 
+		// Unfused W1+W3: run concurrently for better core utilization at batch=1.
 		tFFN := time.Now()
-		w1w3Size := 2 * hidden * dim
-		if useFP16 {
-			if e.fusedW1W3FP16[li] == nil {
-				fp16L := e.mw.FP16Layers[li]
-				fused := make([]uint16, w1w3Size)
-				copy(fused[0:], fp16L.W1)
-				copy(fused[hidden*dim:], fp16L.W3)
-				e.fusedW1W3FP16[li] = fused
-			}
-			tFP16 := time.Now()
-			convertFP16ToF32(e.fp16Scratch[:w1w3Size], e.fusedW1W3FP16[li])
-			timings.FP16Conv += time.Since(tFP16)
-			linearSingle(e.cacheH1H3, e.fp16Scratch[:w1w3Size], e.cacheXNorm, 2*hidden, dim)
-		} else {
-			if e.fusedW1W3 == nil {
-				e.fusedW1W3 = make([][]float32, cfg.NLayers)
-			}
-			if e.fusedW1W3[li] == nil {
-				fused := make([]float32, w1w3Size)
-				copy(fused[0:], layer.W1)
-				copy(fused[hidden*dim:], layer.W3)
-				e.fusedW1W3[li] = fused
-			}
-			linearSingle(e.cacheH1H3, e.fusedW1W3[li], e.cacheXNorm, 2*hidden, dim)
-		}
+		var ffnWG sync.WaitGroup
+		ffnWG.Add(1)
+		go func() {
+			linearSingle(e.cacheH1H3[hidden:], layer.W3, e.cacheXNorm, hidden, dim)
+			ffnWG.Done()
+		}()
+		linearSingle(e.cacheH1H3[:hidden], layer.W1, e.cacheXNorm, hidden, dim)
+		ffnWG.Wait()
 		siluMulAccel(e.cacheGate, e.cacheH1H3[:hidden], e.cacheH1H3[hidden:])
 
 		if useFP16 {
@@ -506,8 +474,6 @@ func rmsNormSingle(out, x, w []float32, dim int) {
 // linearSingle computes out = W @ x for a single position.
 // W is [outDim, inDim] row-major, x is [inDim], out is [outDim].
 func linearSingle(out, w, x []float32, outDim, inDim int) {
-	// Use BLAS via linearCF with seq=1 — the CF layout with seq=1
-	// is equivalent to a flat vector.
 	linearCF(out, w, x, outDim, inDim, 1)
 }
 
