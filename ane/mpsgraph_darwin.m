@@ -189,12 +189,12 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
             MPSGraphTensor *k = graphGEMV(graph, xn, Wk, [lp stringByAppendingString:@"k"]);
             MPSGraphTensor *v = graphGEMV(graph, xn, Wv, [lp stringByAppendingString:@"v"]);
 
-            // Skip RoPE for speed test — use Q/K directly.
-            // MPSGraphTensor *qRoped = graphRoPE(graph, q, heads, headDim, ropeCos, ropeSin, [lp stringByAppendingString:@"rope_q"]);
-            // MPSGraphTensor *kRoped = graphRoPE(graph, k, kvHeads, headDim, ropeCos, ropeSin, [lp stringByAppendingString:@"rope_k"]);
+            // Apply RoPE to Q and K
+            MPSGraphTensor *qRoped = graphRoPE(graph, q, heads, headDim, ropeCos, ropeSin, [lp stringByAppendingString:@"rope_q"]);
+            MPSGraphTensor *kRoped = graphRoPE(graph, k, kvHeads, headDim, ropeCos, ropeSin, [lp stringByAppendingString:@"rope_k"]);
 
             // Reshape Q for attention: [1, heads, 1, headDim]
-            MPSGraphTensor *qAttn = [graph reshapeTensor:q withShape:@[@1, @(heads), @1, @(headDim)] name:[lp stringByAppendingString:@"q_attn"]];
+            MPSGraphTensor *qAttn = [graph reshapeTensor:qRoped withShape:@[@1, @(heads), @1, @(headDim)] name:[lp stringByAppendingString:@"q_attn"]];
 
             // KV cache attention
             // kRoped: [1, kvDim] -> [1, kvHeads, 1, headDim] (current K to be added to cache)
