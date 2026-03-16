@@ -365,6 +365,14 @@ func Open(opts Options) (*Engine, error) {
 	}, nil
 }
 
+// Weights returns the model weights for external use (e.g., MPSGraph compilation).
+func (e *Engine) Weights() *stories.ModelWeights {
+	if e == nil {
+		return nil
+	}
+	return e.mw
+}
+
 // Config returns the model architecture config.
 func (e *Engine) Config() stories.ModelConfig {
 	if e == nil {

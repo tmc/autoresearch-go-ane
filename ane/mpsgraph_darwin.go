@@ -26,6 +26,7 @@ import "C"
 
 import (
 	"fmt"
+	"runtime"
 	"unsafe"
 
 	"github.com/tmc/autoresearch-go-ane/ane/stories"
@@ -113,6 +114,32 @@ func NewMPSGraphDecoder(cfg stories.ModelConfig, mw *stories.ModelWeights) (*MPS
 
 	d.embedFP16 = make([]uint16, len(mw.Embed))
 	convertF32ToFP16(d.embedFP16, mw.Embed)
+
+	// Pin all Go pointers for CGo.
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+	for i := 0; i < nLayers; i++ {
+		pinner.Pin(&d.wq[i][0])
+		pinner.Pin(&d.wk[i][0])
+		pinner.Pin(&d.wv[i][0])
+		pinner.Pin(&d.wo[i][0])
+		pinner.Pin(&d.w1[i][0])
+		pinner.Pin(&d.w3[i][0])
+		pinner.Pin(&d.w2[i][0])
+		pinner.Pin(&mw.Layers[i].RMSAtt[0])
+		pinner.Pin(&mw.Layers[i].RMSFFN[0])
+	}
+	pinner.Pin(&wqPtrs[0])
+	pinner.Pin(&wkPtrs[0])
+	pinner.Pin(&wvPtrs[0])
+	pinner.Pin(&woPtrs[0])
+	pinner.Pin(&w1Ptrs[0])
+	pinner.Pin(&w3Ptrs[0])
+	pinner.Pin(&w2Ptrs[0])
+	pinner.Pin(&rmsAttPtrs[0])
+	pinner.Pin(&rmsFFNPtrs[0])
+	pinner.Pin(&d.embedFP16[0])
+	pinner.Pin(&mw.RMSFinal[0])
 
 	h := C.mpsGraphTransformerCreate(
 		C.int(nLayers), C.int(dim), C.int(qDim), C.int(kvDim), C.int(hidden),
