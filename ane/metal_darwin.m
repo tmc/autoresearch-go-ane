@@ -131,81 +131,85 @@ static int ensureFP16Pipeline(void) {
 }
 
 typedef struct {
-    void *wBuf;   // id<MTLBuffer> — persistent fp16 weights on GPU
+    void *wBuf;    // id<MTLBuffer> — persistent fp16 weights on GPU
+    void *xBuf;    // id<MTLBuffer> — reusable input buffer
+    void *oBuf;    // id<MTLBuffer> — reusable output buffer
+    void *dimBuf;  // id<MTLBuffer> — cached inDim constant
     int outDim;
     int inDim;
+    NSUInteger tgSize; // cached threadgroup size
 } MetalFP16Handle;
 
-// Create a cached fp16 weight buffer on GPU.
+// Create a cached fp16 weight buffer on GPU with pre-allocated I/O buffers.
 MetalFP16Handle* metalFP16GemvCreate(const uint16_t *weights_f16, int outDim, int inDim) {
     @autoreleasepool {
         if (_mtlDevice == nil || ensureFP16Pipeline() != 0) return NULL;
         size_t wBytes = (size_t)outDim * inDim * sizeof(uint16_t);
+        size_t xBytes = (size_t)inDim * sizeof(float);
+        size_t oBytes = (size_t)outDim * sizeof(float);
+
         id<MTLBuffer> wBuf = [_mtlDevice newBufferWithBytes:weights_f16
                                                        length:wBytes
                                                       options:MTLResourceStorageModeShared];
         if (wBuf == nil) return NULL;
+
+        // Pre-allocate reusable I/O buffers.
+        id<MTLBuffer> xBuf = [_mtlDevice newBufferWithLength:xBytes
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> oBuf = [_mtlDevice newBufferWithLength:oBytes
+                                                     options:MTLResourceStorageModeShared];
+        uint32_t inDimU = (uint32_t)inDim;
+        id<MTLBuffer> dimBuf = [_mtlDevice newBufferWithBytes:&inDimU
+                                                       length:sizeof(uint32_t)
+                                                      options:MTLResourceStorageModeShared];
+
+        if (xBuf == nil || oBuf == nil || dimBuf == nil) return NULL;
+
+        NSUInteger tgSize = _fp16Pipeline.maxTotalThreadsPerThreadgroup;
+        if (tgSize > (NSUInteger)outDim) tgSize = outDim;
+
         MetalFP16Handle *h = (MetalFP16Handle *)calloc(1, sizeof(MetalFP16Handle));
         h->wBuf = (__bridge_retained void *)wBuf;
+        h->xBuf = (__bridge_retained void *)xBuf;
+        h->oBuf = (__bridge_retained void *)oBuf;
+        h->dimBuf = (__bridge_retained void *)dimBuf;
         h->outDim = outDim;
         h->inDim = inDim;
+        h->tgSize = tgSize;
         return h;
     }
 }
 
 // Execute fp16 GEMV: out = weights_fp16 @ x_fp32
+// Uses pre-allocated buffers — only copies input, dispatches, copies output.
 int metalFP16GemvExec(MetalFP16Handle *h, float *out, const float *x) {
+    if (h == NULL || _fp16Pipeline == nil || _mtlQueue == nil) return -1;
     @autoreleasepool {
-        if (h == NULL || _fp16Pipeline == nil || _mtlQueue == nil) return -1;
         int outDim = h->outDim;
         int inDim = h->inDim;
-        uint32_t inDimU = (uint32_t)inDim;
 
-        // Use no-copy buffers for unified memory (Apple Silicon).
-        size_t xBytes = (size_t)inDim * sizeof(float);
-        size_t oBytes = (size_t)outDim * sizeof(float);
-
-        id<MTLBuffer> xBuf = [_mtlDevice newBufferWithBytesNoCopy:(void *)x
-                                                           length:xBytes
-                                                          options:MTLResourceStorageModeShared
-                                                      deallocator:nil];
-        if (xBuf == nil) {
-            xBuf = [_mtlDevice newBufferWithBytes:x length:xBytes
-                                          options:MTLResourceStorageModeShared];
-        }
-        id<MTLBuffer> oBuf = [_mtlDevice newBufferWithBytesNoCopy:(void *)out
-                                                           length:oBytes
-                                                          options:MTLResourceStorageModeShared
-                                                      deallocator:nil];
-        if (oBuf == nil) {
-            oBuf = [_mtlDevice newBufferWithLength:oBytes options:MTLResourceStorageModeShared];
-        }
-
-        id<MTLBuffer> dimBuf = [_mtlDevice newBufferWithBytes:&inDimU
-                                                       length:sizeof(uint32_t)
-                                                      options:MTLResourceStorageModeShared];
+        // Copy input to pre-allocated GPU buffer.
+        id<MTLBuffer> xBuf = (__bridge id<MTLBuffer>)h->xBuf;
+        memcpy(xBuf.contents, x, (size_t)inDim * sizeof(float));
 
         id<MTLCommandBuffer> cmdBuf = [_mtlQueue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
         [enc setComputePipelineState:_fp16Pipeline];
         [enc setBuffer:(__bridge id<MTLBuffer>)h->wBuf offset:0 atIndex:0];
         [enc setBuffer:xBuf offset:0 atIndex:1];
-        [enc setBuffer:oBuf offset:0 atIndex:2];
-        [enc setBuffer:dimBuf offset:0 atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>)h->oBuf offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)h->dimBuf offset:0 atIndex:3];
 
-        MTLSize gridSize = MTLSizeMake(outDim, 1, 1);
-        NSUInteger tgSize = _fp16Pipeline.maxTotalThreadsPerThreadgroup;
-        if (tgSize > (NSUInteger)outDim) tgSize = outDim;
-        [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        [enc dispatchThreads:MTLSizeMake(outDim, 1, 1) threadsPerThreadgroup:MTLSizeMake(h->tgSize, 1, 1)];
         [enc endEncoding];
         [cmdBuf commit];
         [cmdBuf waitUntilCompleted];
 
         if (cmdBuf.error != nil) return -1;
-        // If no-copy worked, data is already in `out`. Otherwise, copy.
-        if (oBuf.contents != out) {
-            memcpy(out, oBuf.contents, oBytes);
-        }
+
+        // Copy output from GPU buffer.
+        id<MTLBuffer> oBuf = (__bridge id<MTLBuffer>)h->oBuf;
+        memcpy(out, oBuf.contents, (size_t)outDim * sizeof(float));
         return 0;
     }
 }
