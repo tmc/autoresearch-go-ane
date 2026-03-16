@@ -361,7 +361,7 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
                             const float *mask,
                             const float **kCachesAll, const float **vCachesAll) {
     if (t == NULL || t->executable == NULL) return -1;
-    @autoreleasepool {
+    {  // Removed @autoreleasepool for performance — all objects are pre-allocated.
         id<MTLDevice> device = (__bridge id<MTLDevice>)t->device;
         id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)t->cmdQueue;
         MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)t->executable;
