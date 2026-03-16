@@ -56,10 +56,11 @@ static MPSGraphTensor* constantFP16(MPSGraph *graph, const uint16_t *data, int r
     return [graph constantWithData:nsdata shape:@[@(rows), @(cols)] dataType:MPSDataTypeFloat16];
 }
 
-// Helper: create an MPSGraphTensor from fp32 weight data.
+// Helper: create an MPSGraphTensor from fp32 weight data, cast to fp16 for the all-fp16 graph.
 static MPSGraphTensor* constantFP32(MPSGraph *graph, const float *data, int size, NSString *name) {
     NSData *nsdata = [NSData dataWithBytes:data length:(NSUInteger)size * sizeof(float)];
-    return [graph constantWithData:nsdata shape:@[@1, @(size)] dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *fp32 = [graph constantWithData:nsdata shape:@[@1, @(size)] dataType:MPSDataTypeFloat32];
+    return [graph castTensor:fp32 toType:MPSDataTypeFloat16 name:name];
 }
 
 // RMSNorm as graph operations: out = x * rsqrt(mean(x^2) + eps) * w
@@ -67,7 +68,7 @@ static MPSGraphTensor* graphRMSNorm(MPSGraph *graph, MPSGraphTensor *x, MPSGraph
     // x: [1, dim], w: [1, dim]
     MPSGraphTensor *x2 = [graph multiplicationWithPrimaryTensor:x secondaryTensor:x name:[prefix stringByAppendingString:@"_sq"]];
     MPSGraphTensor *mean = [graph meanOfTensor:x2 axes:@[@1] name:[prefix stringByAppendingString:@"_mean"]];
-    MPSGraphTensor *eps = [graph constantWithScalar:1e-5 dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *eps = [graph constantWithScalar:1e-5 dataType:MPSDataTypeFloat16];
     MPSGraphTensor *meanEps = [graph additionWithPrimaryTensor:mean secondaryTensor:eps name:[prefix stringByAppendingString:@"_me"]];
     MPSGraphTensor *rsqrt = [graph reciprocalSquareRootWithTensor:meanEps name:[prefix stringByAppendingString:@"_rsqrt"]];
     MPSGraphTensor *normed = [graph multiplicationWithPrimaryTensor:x secondaryTensor:rsqrt name:[prefix stringByAppendingString:@"_norm"]];
@@ -76,15 +77,10 @@ static MPSGraphTensor* graphRMSNorm(MPSGraph *graph, MPSGraphTensor *x, MPSGraph
 
 // GEMV via matmul: out = x @ W^T where W is [outDim, inDim] in fp16
 // x: [1, inDim] fp32, W: [outDim, inDim] fp16, out: [1, outDim] fp32
+// GEMV in fp16: out = x @ W^T, all tensors in fp16.
 static MPSGraphTensor* graphGEMV(MPSGraph *graph, MPSGraphTensor *x, MPSGraphTensor *W, NSString *name) {
-    // Cast x to fp16 for the matmul
-    MPSGraphTensor *x16 = [graph castTensor:x toType:MPSDataTypeFloat16 name:[name stringByAppendingString:@"_xf16"]];
-    // W is [outDim, inDim], x16 is [1, inDim]. We want [1, inDim] @ [inDim, outDim] = [1, outDim]
-    // So transpose W: [outDim, inDim] -> [inDim, outDim]
     MPSGraphTensor *Wt = [graph transposeTensor:W dimension:0 withDimension:1 name:[name stringByAppendingString:@"_wt"]];
-    MPSGraphTensor *y16 = [graph matrixMultiplicationWithPrimaryTensor:x16 secondaryTensor:Wt name:name];
-    // Cast back to fp32
-    return [graph castTensor:y16 toType:MPSDataTypeFloat32 name:[name stringByAppendingString:@"_f32"]];
+    return [graph matrixMultiplicationWithPrimaryTensor:x secondaryTensor:Wt name:name];
 }
 
 // SiLU: x * sigmoid(x)
@@ -156,11 +152,11 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         // RoPE cos/sin for current position: [1, headDim/2] fp32
         int ropeHalf = headDim / 2;
         int maxSeq = 256; // fixed max sequence length for KV cache
-        MPSGraphTensor *ropeCos = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32 name:@"rope_cos"];
-        MPSGraphTensor *ropeSin = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32 name:@"rope_sin"];
+        MPSGraphTensor *ropeCos = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat16 name:@"rope_cos"];
+        MPSGraphTensor *ropeSin = [graph placeholderWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat16 name:@"rope_sin"];
 
-        // Attention mask: [1, 1, 1, maxSeq] — 0 for valid positions, -inf for padding
-        MPSGraphTensor *attnMask = [graph placeholderWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32 name:@"attn_mask"];
+        // Attention mask: [1, 1, 1, maxSeq] — 0 for valid positions, -inf for padding (fp16)
+        MPSGraphTensor *attnMask = [graph placeholderWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat16 name:@"attn_mask"];
 
         // Per-layer KV cache placeholders (fp16 to halve SDPA bandwidth).
         NSMutableArray<MPSGraphTensor*> *kCaches = [NSMutableArray arrayWithCapacity:nLayers];
@@ -172,8 +168,9 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
             [vCaches addObject:[graph placeholderWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16 name:vName]];
         }
 
-        MPSGraphTensor *cur = x;
-        MPSGraphTensor *rsConst = [graph constantWithScalar:residualScale dataType:MPSDataTypeFloat32];
+        // Cast input to fp16 — run entire graph in fp16 like MLX.
+        MPSGraphTensor *cur = [graph castTensor:x toType:MPSDataTypeFloat16 name:@"x_f16"];
+        MPSGraphTensor *rsConst = [graph constantWithScalar:residualScale dataType:MPSDataTypeFloat16];
 
         for (int li = 0; li < nLayers; li++) {
             NSString *lp = [NSString stringWithFormat:@"l%d_", li]; // layer prefix
@@ -215,15 +212,16 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
                 vTiled = [graph tileTensor:vCache withMultiplier:@[@1, @(kvRepeat), @1, @1] name:[lp stringByAppendingString:@"v_tile"]];
             }
 
-            // SDPA: softmax(Q @ K^T / sqrt(headDim) + mask) @ V
+            // SDPA — everything already in fp16.
             float attnScale = 1.0f / sqrtf((float)headDim);
-            MPSGraphTensor *attnOut4d = [graph scaledDotProductAttentionWithQueryTensor:qAttn
+            MPSGraphTensor *attnOut4d16 = [graph scaledDotProductAttentionWithQueryTensor:qAttn
                                                                              keyTensor:kTiled
                                                                            valueTensor:vTiled
                                                                             maskTensor:attnMask
                                                                                  scale:attnScale
                                                                                   name:[lp stringByAppendingString:@"sdpa"]];
-            // [1, heads, 1, headDim] -> [1, qDim]
+            // [1, heads, 1, headDim] -> [1, qDim] (stay in fp16)
+            MPSGraphTensor *attnOut4d = attnOut4d16;
             MPSGraphTensor *attnFlat = [graph reshapeTensor:attnOut4d withShape:@[@1, @(qDim)] name:[lp stringByAppendingString:@"attn_flat"]];
 
             // Wo projection
@@ -265,15 +263,17 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
 
         // Classifier
         MPSGraphTensor *embedW = constantFP16(graph, embedWeights, vocab, dim, @"embed");
-        MPSGraphTensor *logits = graphGEMV(graph, finalNorm, embedW, @"logits");
+        MPSGraphTensor *logits16 = graphGEMV(graph, finalNorm, embedW, @"logits");
+        // Cast output back to fp32 for CPU consumption.
+        MPSGraphTensor *logits = [graph castTensor:logits16 toType:MPSDataTypeFloat32 name:@"logits_f32"];
 
         // Compile the graph
         MPSGraphCompilationDescriptor *compDesc = [[MPSGraphCompilationDescriptor alloc] init];
 
         // Build feeds dictionary: map placeholder tensors to their shapes+types.
         MPSGraphShapedType *xType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(dim)] dataType:MPSDataTypeFloat32];
-        MPSGraphShapedType *ropeType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32];
-        MPSGraphShapedType *maskType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32];
+        MPSGraphShapedType *ropeType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat16];
+        MPSGraphShapedType *maskType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat16];
         MPSGraphShapedType *kvType = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16];
 
         NSMutableDictionary<MPSGraphTensor*, MPSGraphShapedType*> *feeds = [NSMutableDictionary dictionary];
@@ -309,9 +309,9 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         t->ropeSinTensor = (__bridge_retained void *)ropeSin;
         // Pre-allocate reusable exec buffers.
         t->xBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)dim * sizeof(float) options:MTLResourceStorageModeShared];
-        t->cosBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(float) options:MTLResourceStorageModeShared];
-        t->sinBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(float) options:MTLResourceStorageModeShared];
-        t->maskBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)maxSeq * sizeof(float) options:MTLResourceStorageModeShared];
+        t->cosBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(uint16_t) options:MTLResourceStorageModeShared]; // fp16
+        t->sinBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)ropeHalf * sizeof(uint16_t) options:MTLResourceStorageModeShared]; // fp16
+        t->maskBuf = (__bridge_retained void *)[device newBufferWithLength:(NSUInteger)maxSeq * sizeof(uint16_t) options:MTLResourceStorageModeShared]; // fp16
         size_t kvBufSize = (size_t)kvHeads * maxSeq * headDim * sizeof(uint16_t); // fp16
         t->kBufs = (void **)calloc(nLayers, sizeof(void *));
         t->vBufs = (void **)calloc(nLayers, sizeof(void *));
@@ -323,9 +323,9 @@ MPSGraphTransformer* mpsGraphTransformerCreate(
         {
             NSMutableArray<MPSGraphTensorData*> *arr = [NSMutableArray arrayWithCapacity:4 + 2 * nLayers];
             [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->xBuf shape:@[@1, @(dim)] dataType:MPSDataTypeFloat32]];
-            [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->cosBuf shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32]];
-            [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->sinBuf shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat32]];
-            [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->maskBuf shape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat32]];
+            [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->cosBuf shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat16]];
+            [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->sinBuf shape:@[@1, @(ropeHalf)] dataType:MPSDataTypeFloat16]];
+            [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->maskBuf shape:@[@1, @1, @1, @(maxSeq)] dataType:MPSDataTypeFloat16]];
             for (int i = 0; i < nLayers; i++) {
                 [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->kBufs[i] shape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16]];
                 [arr addObject:[[MPSGraphTensorData alloc] initWithMTLBuffer:(__bridge id<MTLBuffer>)t->vBufs[i] shape:@[@1, @(kvHeads), @(maxSeq), @(headDim)] dataType:MPSDataTypeFloat16]];
@@ -373,15 +373,23 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         size_t maskBytes = (size_t)maxSeq * sizeof(float);
         size_t kvBytes = (size_t)t->kvHeads * maxSeq * t->headDim * sizeof(uint16_t); // fp16
 
-        // Copy data into pre-allocated buffers.
+        // Copy fp32 data into fp32 input buffer (x stays fp32, cast happens in graph).
         id<MTLBuffer> xBuf = (__bridge id<MTLBuffer>)t->xBuf;
+        memcpy(xBuf.contents, x, xBytes);
+
+        // Convert fp32 rope/mask to fp16 for the all-fp16 graph.
         id<MTLBuffer> cosBuf = (__bridge id<MTLBuffer>)t->cosBuf;
         id<MTLBuffer> sinBuf = (__bridge id<MTLBuffer>)t->sinBuf;
         id<MTLBuffer> maskBuf = (__bridge id<MTLBuffer>)t->maskBuf;
-        memcpy(xBuf.contents, x, xBytes);
-        memcpy(cosBuf.contents, ropeCosRow, ropeBytes);
-        memcpy(sinBuf.contents, ropeSinRow, ropeBytes);
-        memcpy(maskBuf.contents, mask, maskBytes);
+        {
+            _Float16 *dst;
+            dst = (_Float16 *)cosBuf.contents;
+            for (int i = 0; i < ropeHalf; i++) dst[i] = (_Float16)ropeCosRow[i];
+            dst = (_Float16 *)sinBuf.contents;
+            for (int i = 0; i < ropeHalf; i++) dst[i] = (_Float16)ropeSinRow[i];
+            dst = (_Float16 *)maskBuf.contents;
+            for (int i = 0; i < maxSeq; i++) dst[i] = (_Float16)mask[i];
+        }
 
         // Only copy KV caches if external pointers differ from pre-allocated buffers.
         // In a real decode loop, the KV caches would be updated in-place on the GPU.
