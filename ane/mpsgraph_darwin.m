@@ -5,6 +5,10 @@
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+#include <mach/mach_time.h>
+
+static double _lastExecMs = 0.0;
+double mpsGraphGetLastExecMs(void) { return _lastExecMs; }
 
 // MPSGraph-based transformer decode: entire model in ONE compiled graph.
 // Eliminates per-layer Metal dispatch overhead.
@@ -354,7 +358,7 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
                             const float *mask,
                             const float **kCachesAll, const float **vCachesAll) {
     if (t == NULL || t->executable == NULL) return -1;
-    {  // Removed @autoreleasepool for performance — all objects are pre-allocated.
+    {
         id<MTLDevice> device = (__bridge id<MTLDevice>)t->device;
         id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)t->cmdQueue;
         MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)t->executable;
@@ -389,10 +393,15 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
         NSArray<MPSGraphTensorData*> *inputs = (__bridge NSArray<MPSGraphTensorData*> *)t->cachedInputsArray;
         NSMutableArray<MPSGraphTensorData*> *resultsArr = (__bridge NSMutableArray<MPSGraphTensorData*> *)t->cachedResultsArray;
 
+        uint64_t t0 = mach_absolute_time();
         NSArray<MPSGraphTensorData *> *results = [executable runWithMTLCommandQueue:queue
                                                                          inputsArray:inputs
                                                                         resultsArray:resultsArr
                                                                executionDescriptor:nil];
+        uint64_t t1 = mach_absolute_time();
+        mach_timebase_info_data_t tbi;
+        mach_timebase_info(&tbi);
+        _lastExecMs = (double)(t1 - t0) * tbi.numer / tbi.denom / 1e6;
         if (logits != NULL) {
             if (results.count == 0) return -1;
             id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)t->outputBuf;

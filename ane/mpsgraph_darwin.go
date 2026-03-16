@@ -25,6 +25,7 @@ extern int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const 
                                    const float **kCachesAll, const float **vCachesAll);
 extern float* mpsGraphGetKCachePtr(MPSGraphTransformer *t, int layer);
 extern float* mpsGraphGetVCachePtr(MPSGraphTransformer *t, int layer);
+extern double mpsGraphGetLastExecMs(void);
 extern void mpsGraphTransformerDestroy(MPSGraphTransformer *t);
 */
 import "C"
@@ -281,6 +282,11 @@ func (d *MPSGraphDecoder) ExecZeroCopy(logits, x, ropeCosRow, ropeSinRow, mask [
 		return fmt.Errorf("MPSGraph execution failed")
 	}
 	return nil
+}
+
+// LastExecMs returns the C-side measured execution time of the last graph run in milliseconds.
+func (d *MPSGraphDecoder) LastExecMs() float64 {
+	return float64(C.mpsGraphGetLastExecMs())
 }
 
 // Close releases GPU resources.

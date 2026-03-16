@@ -121,4 +121,5 @@ func BenchmarkMPSGraphDecode(b *testing.B) {
 		}
 	}
 	b.StopTimer()
+	b.ReportMetric(decoder.LastExecMs(), "c_exec_ms")
 }
