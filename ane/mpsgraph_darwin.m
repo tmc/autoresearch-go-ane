@@ -385,26 +385,17 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
 
         // KV caches are in pre-allocated GPU buffers — no copy needed.
 
-        // Use cached MPSGraphTensorData array (pre-built at init, CFRetained).
-        // The underlying Metal buffers are the same pre-allocated ones we memcpy'd into above.
         NSArray<MPSGraphTensorData*> *inputs = (__bridge NSArray<MPSGraphTensorData*> *)t->cachedInputsArray;
+        NSMutableArray<MPSGraphTensorData*> *resultsArr = (logits != NULL)
+            ? (__bridge NSMutableArray<MPSGraphTensorData*> *)t->cachedResultsArray
+            : nil;
 
-        // Use cached results array with pre-allocated output buffer.
-        NSMutableArray<MPSGraphTensorData*> *resultsArr = (__bridge NSMutableArray<MPSGraphTensorData*> *)t->cachedResultsArray;
         NSArray<MPSGraphTensorData *> *results = [executable runWithMTLCommandQueue:queue
                                                                          inputsArray:inputs
                                                                         resultsArray:resultsArr
                                                                executionDescriptor:nil];
-
-        if (results.count == 0) return -1;
-
-        // For async: need to wait for GPU completion before reading output.
-        // The runAsync call commits the command buffer but doesn't wait.
-        // We need to synchronize before reading results.
-        // MPSGraphTensorData from runAsync with resultsArray should be synced.
-
-        // Read from pre-allocated output buffer.
         if (logits != NULL) {
+            if (results.count == 0) return -1;
             id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)t->outputBuf;
             memcpy(logits, outBuf.contents, (size_t)t->vocab * sizeof(float));
         }
