@@ -408,11 +408,10 @@ int mpsGraphTransformerExec(MPSGraphTransformer *t, float *logits, const float *
 
         // Use cached results array with pre-allocated output buffer.
         NSMutableArray<MPSGraphTensorData*> *resultsArr = (__bridge NSMutableArray<MPSGraphTensorData*> *)t->cachedResultsArray;
-        // Use runAsync + waitUntilCompleted for lower dispatch latency.
-        NSArray<MPSGraphTensorData *> *results = [executable runAsyncWithMTLCommandQueue:queue
-                                                                            inputsArray:inputs
-                                                                           resultsArray:resultsArr
-                                                                  executionDescriptor:nil];
+        NSArray<MPSGraphTensorData *> *results = [executable runWithMTLCommandQueue:queue
+                                                                         inputsArray:inputs
+                                                                        resultsArray:resultsArr
+                                                               executionDescriptor:nil];
 
         if (results.count == 0) return -1;
 
