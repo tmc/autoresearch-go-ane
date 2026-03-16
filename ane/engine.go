@@ -974,9 +974,13 @@ func (e *Engine) evalLogitsANEInto(tokens []int32, logits []float32) error {
 		if lf.dynamic && lf.inferScaled {
 			// Direct ANE dispatch: bypass writeStoriesAttentionForwardActs
 			// which hardcodes stories.Dim=768. Use config-aware writer.
-			if err := writeANEActivations(lf.att, e.seq, cur); err != nil {
-				return fmt.Errorf("storiesane eval logits: layer %d: write att input: %w", i, err)
+			// Skip write if previous layer already did a surface copy.
+			if !lf.attInputReady {
+				if err := writeANEActivations(lf.att, e.seq, cur); err != nil {
+					return fmt.Errorf("storiesane eval logits: layer %d: write att input: %w", i, err)
+				}
 			}
+			lf.attInputReady = false
 			if err := evalKernelTracked(lf.metrics, lf.att); err != nil {
 				return fmt.Errorf("storiesane eval logits: layer %d: eval att: %w", i, err)
 			}
@@ -996,15 +1000,21 @@ func (e *Engine) evalLogitsANEInto(tokens []int32, logits []float32) error {
 			if err := evalKernelTracked(lf.metrics, lf.ffn); err != nil {
 				return fmt.Errorf("storiesane eval logits: layer %d: eval ffn: %w", i, err)
 			}
-			// Try surface copy FFN→next att.
+			// Try surface copy FFN→next att to skip next layer's CPU write.
+			nextSurfaceCopied := false
 			if i+1 < len(useLayers) && useLayers[i+1].dynamic && useLayers[i+1].att != nil {
 				if err := model.CopyOutputRangeToInput(useLayers[i+1].att, 0, 0, 0, lf.ffn, 0, 0, 0, dim, e.seq); err == nil {
-					// Next layer's att input is ready via surface copy.
-					// Still need to read to CPU for cur buffer.
+					nextSurfaceCopied = true
+					useLayers[i+1].attInputReady = true
 				}
 			}
-			if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, e.seq, next); err != nil {
-				return fmt.Errorf("storiesane eval logits: layer %d: read ffn output: %w", i, err)
+			// Only read FFN output to CPU if:
+			// - This is the last layer (need cur for final RMSNorm/classifier)
+			// - Next layer's surface copy failed (need cur for next write)
+			if !nextSurfaceCopied || i+1 >= len(useLayers) {
+				if err := readOutputFP16ChannelsFast(lf.ffn, 0, 0, e.seq, next); err != nil {
+					return fmt.Errorf("storiesane eval logits: layer %d: read ffn output: %w", i, err)
+				}
 			}
 		} else if lf.tiled != nil {
 			if err := lf.runTiled(next, cur); err != nil {
