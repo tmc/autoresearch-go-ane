@@ -863,7 +863,6 @@ func (e *Engine) evalLogitsInto(tokens []int32, logits []float32) error {
 			if err == nil {
 				return nil
 			}
-			fmt.Fprintf(os.Stderr, "ANE: evalLogitsANEInto (infer) failed: %v\n", err)
 		}
 		// Fallback to taps layers.
 		if e.ensureLayers() == nil {
@@ -871,7 +870,6 @@ func (e *Engine) evalLogitsInto(tokens []int32, logits []float32) error {
 			if err == nil {
 				return nil
 			}
-			fmt.Fprintf(os.Stderr, "ANE: evalLogitsANEInto (taps) failed: %v\n", err)
 			e.disableLayerForward(err)
 		}
 	}
@@ -921,26 +919,17 @@ func (e *Engine) ensureInferLayers() error {
 		// Try monolithic inference kernel first (legacy MHA path).
 		lf, err := compileStoriesLayerForwardInference(e.mw.Layers[i], e.seq)
 		if err == nil {
-			if i == 0 {
-				fmt.Fprintf(os.Stderr, "ANE: layer 0 using monolithic MHA path\n")
-			}
 			return lf, nil
 		}
 		// Try GQA monolithic path (handles qDim != dim).
 		lf, gqaErr := compileGQALayerForwardInference(cfg, e.mw.Layers[i], e.seq)
 		if gqaErr == nil {
-			if i == 0 {
-				fmt.Fprintf(os.Stderr, "ANE: layer 0 using GQA monolithic path\n")
-			}
 			return lf, nil
 		}
 		// Fall back to tiled compilation for large models.
 		lf, tiledErr := compileStoriesLayerForwardTiled(cfg, e.mw.Layers[i], e.seq)
 		if tiledErr != nil {
 			return nil, fmt.Errorf("storiesane eval logits: compile infer layer %d: monolithic: %v, gqa: %v, tiled: %w", i, err, gqaErr, tiledErr)
-		}
-		if i == 0 {
-			fmt.Fprintf(os.Stderr, "ANE: layer 0 using tiled path (monolithic: %v, gqa: %v)\n", err, gqaErr)
 		}
 		return lf, nil
 	}, func(lf *layerForward) {
