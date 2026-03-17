@@ -104,3 +104,24 @@ func TestClassifyTier(t *testing.T) {
 		})
 	}
 }
+
+func TestPfx(t *testing.T) {
+	tests := []struct {
+		name     string
+		workload string
+		parts    []string
+		want     string
+	}{
+		{"infer default", "infer", []string{"results", "key"}, "@travis_cline/infer/results/key"},
+		{"train", "train", []string{"results", "key"}, "@travis_cline/train/results/key"},
+		{"best metadata", "infer", []string{"best", "metadata"}, "@travis_cline/infer/best/metadata"},
+		{"tier best", "train", []string{"best", "tier", "ultra", "metadata"}, "@travis_cline/train/best/tier/ultra/metadata"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Pfx(tt.workload, tt.parts...); got != tt.want {
+				t.Errorf("Pfx(%q, %v) = %q, want %q", tt.workload, tt.parts, got, tt.want)
+			}
+		})
+	}
+}

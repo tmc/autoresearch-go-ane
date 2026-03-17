@@ -1,13 +1,21 @@
-// Package coordinator provides hardware detection and stable experiment
-// identifiers for autoresearch agents.
+// Package coordinator provides hardware detection, key generation, and
+// constants for autoresearch agents. All Ensue API interaction happens
+// via the Ensue MCP server; see collab.md for the protocol.
 package coordinator
 
 import (
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+)
+
+const (
+	HubOrg  = "travis_cline"
+	APIURL  = "https://api.ensue-network.ai/"
+	KeyFile = ".autoresearch-key"
 )
 
 // ChipInfo holds Apple Silicon hardware detection results.
@@ -85,4 +93,23 @@ func ExperimentKey(agent, desc string) string {
 func ExperimentHash(desc string) string {
 	h := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(desc))))
 	return fmt.Sprintf("%x", h)[:12]
+}
+
+// Pfx builds a hub key path: @<org>/<workload>/<parts...>
+func Pfx(workload string, parts ...string) string {
+	all := make([]string, 0, 1+len(parts))
+	all = append(all, workload)
+	all = append(all, parts...)
+	return "@" + HubOrg + "/" + strings.Join(all, "/")
+}
+
+// GetAPIKey returns the Ensue API key from env or key file.
+func GetAPIKey() string {
+	if k := os.Getenv("ENSUE_API_KEY"); k != "" {
+		return strings.TrimSpace(k)
+	}
+	if d, err := os.ReadFile(KeyFile); err == nil {
+		return strings.TrimSpace(string(d))
+	}
+	return ""
 }

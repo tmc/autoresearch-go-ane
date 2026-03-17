@@ -314,3 +314,7 @@ The model is a 110M-parameter nanochat-style transformer (based on karpathy/nano
 - **Backout**: Subtract `backout_lambda * mid_layer_residual` before final norm
 - **Logit softcap**: `15 * tanh(logits/15)` before loss and eval
 - **Checkpoint format**: V4 (backward compatible with V3 for loading old weights)
+
+## Collaborative mode
+
+For multi-agent swarm optimization via Ensue, see `.skills/autoresearch/SKILL.md` and `collab.md`.
