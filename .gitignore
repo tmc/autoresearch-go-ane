@@ -1,5 +1,5 @@
 # Binaries
-autoresearch
+/autoresearch
 *.test
 
 # Data and model files
@@ -15,3 +15,7 @@ bench_*.txt
 go.work
 go.work.sum
 /bench-note
+
+# Autoresearch collaboration
+.autoresearch-key
+/setup-hub
